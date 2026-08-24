@@ -1,0 +1,27 @@
+{
+  "version": 2,
+  "profile": "real_v2",
+  "intercept": -3.07918280680754,
+  "weights": {
+    "depth": 0.0,
+    "var_freq": 5.3865836431932745,
+    "mean_bq": -0.11968641245965002,
+    "mean_mapq": 1.307190973274553,
+    "strand_bias": 1.9013920660928545,
+    "homopolymer": -1.6577486391570546,
+    "junction": -0.046241074273280294,
+    "gnomad_af": -3.0
+  },
+  "fit": {
+    "method": "sklearn LogisticRegression C=1e6 lbfgs",
+    "positives": "v02 RE(sites_test)",
+    "negatives": "v02 DM + depth-matched random decoys",
+    "donors": [
+      "HG00101",
+      "HG00123",
+      "NA19117"
+    ],
+    "features": "count.rs semantics via pysam port(production-exact)",
+    "seed": 20260730
+  }
+}

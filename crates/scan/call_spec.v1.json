@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "intercept": -2.0,
+  "weights": {
+    "depth": 2.0,
+    "var_freq": 3.0,
+    "mean_bq": 1.0,
+    "mean_mapq": 0.5,
+    "strand_bias": 0.5,
+    "gnomad_af": -3.0,
+    "homopolymer": -1.5,
+    "junction": -1.0
+  }
+}

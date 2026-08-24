@@ -1,0 +1,11 @@
+[package]
+name = "esperanto-bamio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+noodles.workspace = true
+noodles-bgzf.workspace = true
+rust-htslib.workspace = true
