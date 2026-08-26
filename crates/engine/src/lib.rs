@@ -38,7 +38,6 @@ pub mod placement;
 pub mod repeat;
 
 use std::collections::{BTreeMap, BTreeSet};
-
 use thiserror::Error;
 
 pub use crate::extend::{extend_ea, Extension};
@@ -227,6 +226,14 @@ pub struct ReadStats {
     pub branch: Branch,
     /// Number of distinct transcripts that received an extension.
     pub extension_tx_count: u32,
+    /// Full-extension candidates (dist-0 incl. EA-free edits).
+    pub fulls_count: u32,
+    /// Partial-extension candidates (broken by indels/non-EA mismatches).
+    pub parts_count: u32,
+    /// Best verified partial distance (u32::MAX when none verified).
+    pub best_part_dist: u32,
+    /// Best verified partial projects to a different locus than the winner.
+    pub part_conflict: bool,
 }
 
 impl Default for ReadStats {
@@ -236,6 +243,10 @@ impl Default for ReadStats {
             extension_bases: 0,
             branch: Branch::NoHit,
             extension_tx_count: 0,
+            fulls_count: 0,
+            parts_count: 0,
+            best_part_dist: u32::MAX,
+            part_conflict: false,
         }
     }
 }
@@ -481,6 +492,38 @@ pub fn align_read(
             parts.push(e);
         }
     }
+    parts.sort_by(|a, b| {
+        b.ext
+            .read_cov()
+            .cmp(&a.ext.read_cov())
+            .then(a.tx_id.cmp(&b.tx_id))
+            .then(a.diagonal.cmp(&b.diagonal))
+    });
+
+    // EA-Myers infix distance of one candidate against its anchored
+    // transcript window (None when the window is empty).
+    let verify = |e: &ExtEntry| -> Option<u32> {
+        let tx_seq = txseqs.seq(e.tx_id);
+        let anchor = e.ext.tx_lo as i64 - e.ext.read_lo as i64;
+        let wlo = (anchor - cfg.flank as i64).max(0) as usize;
+        let whi = ((anchor + read_len as i64 + cfg.flank as i64).max(0) as usize).min(tx_seq.len());
+        if whi <= wlo {
+            return None;
+        }
+        let oriented: &[u8] = if e.strand == Strand::Plus {
+            read
+        } else {
+            &read_rc
+        };
+        Some(if read_len <= 128 {
+            myers::infix(oriented, &tx_seq[wlo..whi])
+        } else {
+            myers::long::infix(oriented, &tx_seq[wlo..whi])
+        })
+    };
+    stats.fulls_count = fulls.len() as u32;
+    stats.parts_count = parts.len() as u32;
+
     // ---- branch 2: full extensions --------------------------------------
     if !fulls.is_empty() {
         stats.branch = Branch::Full;
@@ -502,6 +545,26 @@ pub fn align_read(
             stats.branch = Branch::GateFail;
             return L1Outcome::Fallback;
         };
+        // Cross-branch competition probe: a full (dist-0) winner can be a
+        // repeat decoy when the read's true transcript sits in the PARTIAL
+        // list (indel-broken extension). Verify the top partials; a verified
+        // partial at a different locus within the dist gate contests the win.
+        let max_dist = (read_len / 33).max(1) as u32;
+        for entry in parts.iter().take(3) {
+            let Some(dist) = verify(entry) else {
+                continue;
+            };
+            if dist < stats.best_part_dist {
+                stats.best_part_dist = dist;
+            }
+            if dist <= max_dist {
+                if let Some((c, p)) = placement::partial_locus(txmap, entry, read_len) {
+                    if c != best.contig || p.abs_diff(best.pos) > 1_000 {
+                        stats.part_conflict = true;
+                    }
+                }
+            }
+        }
         stats.extension_bases = read_len as u32;
         return L1Outcome::Aligned {
             contig: best.contig,
@@ -515,35 +578,6 @@ pub fn align_read(
 
     // ---- branch 3: partials, verification --------------------------------
     stats.branch = Branch::Interrupted;
-    parts.sort_by(|a, b| {
-        b.ext
-            .read_cov()
-            .cmp(&a.ext.read_cov())
-            .then(a.tx_id.cmp(&b.tx_id))
-            .then(a.diagonal.cmp(&b.diagonal))
-    });
-
-    // EA-Myers infix distance of one candidate against its anchored
-    // transcript window (None when the window is empty).
-    let verify = |e: &ExtEntry| -> Option<u32> {
-        let tx_seq = txseqs.seq(e.tx_id);
-        let anchor = e.ext.tx_lo as i64 - e.ext.read_lo as i64;
-        let wlo = (anchor - cfg.flank as i64).max(0) as usize;
-            let whi = ((anchor + read_len as i64 + cfg.flank as i64).max(0) as usize).min(tx_seq.len());
-        if whi <= wlo {
-            return None;
-        }
-        let oriented: &[u8] = if e.strand == Strand::Plus {
-            read
-        } else {
-            &read_rc
-        };
-        Some(if read_len <= 128 {
-            myers::infix(oriented, &tx_seq[wlo..whi])
-        } else {
-            myers::long::infix(oriented, &tx_seq[wlo..whi])
-        })
-    };
 
     // Winner: the FIRST candidate in parts order (read_cov DESC, tx_id
     // ASC, diagonal ASC) whose dist is strictly smaller than every
@@ -568,6 +602,7 @@ pub fn align_read(
         stats.branch = Branch::GateFail;
         return L1Outcome::Fallback;
     };
+    stats.best_part_dist = winner_dist;
 
     // ---- branch 4: gates ---------------------------------------------------
     let cov = (read_len - winner_dist as usize) as f64 / read_len as f64;

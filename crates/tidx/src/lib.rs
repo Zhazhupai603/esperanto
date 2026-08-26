@@ -239,10 +239,41 @@ pub struct Tidx {
 impl Tidx {
     /// Open and fully parse a `.tidx` file.
     ///
-    /// Crate-level failures (bad magic, unsupported version, truncated or
-    /// inconsistent segments) are reported as `io::ErrorKind::InvalidData`.
+    /// Read a file into memory, splitting large files across threads for
+    /// faster I/O on high-bandwidth disks.
+    fn read_parallel(path: &Path) -> io::Result<Vec<u8>> {
+        let meta = fs::metadata(path)?;
+        let len = meta.len() as usize;
+        const MIN_PARALLEL: usize = 256 * 1024 * 1024; // only parallelize large files
+        if len < MIN_PARALLEL {
+            return fs::read(path);
+        }
+        let nthreads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(8);
+        let chunk = len.div_ceil(nthreads);
+        let mut out = vec![0u8; len];
+        std::thread::scope(|s| -> io::Result<()> {
+            let mut handles = Vec::new();
+            for (i, dst) in out.chunks_mut(chunk).enumerate() {
+                let start = (i * chunk) as u64;
+                let mut f = File::open(path)?;
+                handles.push(s.spawn(move || {
+                    f.seek(SeekFrom::Start(start))?;
+                    f.read_exact(dst)
+                }));
+            }
+            for h in handles {
+                h.join().map_err(|_| io::Error::other("read thread panicked"))??;
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     pub fn open(path: &Path) -> io::Result<Self> {
-        let data = fs::read(path)?;
+        let data = Self::read_parallel(path)?;
         parse_index(&data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
@@ -1113,14 +1144,14 @@ fn parse_index(data: &[u8]) -> Result<Tidx> {
     // ---- keys & payloads -----------------------------------------------------
     let keys: Vec<u64> = if version == 2 {
         keys_seg
-            .chunks_exact(4)
+            .par_chunks_exact(4)
             .map(|c| u64::from(le32(c)))
             .collect()
     } else {
-        keys_seg.chunks_exact(8).map(le64).collect()
+        keys_seg.par_chunks_exact(8).map(le64).collect()
     };
     let payloads: Vec<(u32, u32)> = pay_seg
-        .chunks_exact(8)
+        .par_chunks_exact(8)
         .map(|c| {
             let v = le64(c);
             (v as u32, (v >> 32) as u32)

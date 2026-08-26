@@ -13,7 +13,7 @@ use crate::gtf::{Junction, JunctionLib, RefinedJunction, SpliceSignal};
 use crate::index::{collect_anchors, Index};
 use crate::mapq::ReadAlignment;
 use crate::seed::{minimizers, Minimizer, SeedParams, Strand};
-use crate::splice::{align_spliced, refine_junction, segment_chain, SpliceParams};
+use crate::splice::{align_spliced, refine_junction_read, segment_chain, SpliceParams};
 
 /// Aligner configuration (`default` = DNA preset; `rna_default` = RNA production).
 #[derive(Debug, Clone, Copy)]
@@ -189,22 +189,39 @@ impl<'a> Aligner<'a> {
         })
     }
 
-    /// Align one read (ASCII ACGTN). No confident chain ⇒ None.
+    /// Align one read (ASCII ACGTN). L1 exact winners place directly;
+    /// variation-bearing L1 placements defer to the genomic layer and are
+    /// kept only as a MAPQ-0 last resort when the genomic layer cannot
+    /// place the read at all.
     pub fn align_read(&mut self, seq: &[u8]) -> Option<ReadAlignment> {
+        let mut l1_fallback: Option<ReadAlignment> = None;
         // L1 transcriptome-first fast path.
         if let Some(l1) = self.l1.clone() {
-            let outcome = {
-                let mut stats = esperanto_engine::ReadStats::default();
-                esperanto_engine::align_read(
-                    seq,
-                    l1.as_ref(),
-                    l1.as_ref(),
-                    l1.as_ref(),
-                    &esperanto_engine::EngineConfig::default(),
-                    &esperanto_engine::NoRepeats,
-                    &mut stats,
-                )
-            };
+            let mut stats = esperanto_engine::ReadStats::default();
+            let outcome = esperanto_engine::align_read(
+                seq,
+                l1.as_ref(),
+                l1.as_ref(),
+                l1.as_ref(),
+                &esperanto_engine::EngineConfig::default(),
+                &esperanto_engine::NoRepeats,
+                &mut stats,
+            );
+            if std::env::var_os("ESP_PROBE").is_some() {
+                eprintln!("[probe-l1] branch={:?} fulls={} parts={} best_part_dist={} conflict={}",
+                    stats.branch, stats.fulls_count, stats.parts_count, stats.best_part_dist, stats.part_conflict);
+            }
+            // L1↔G arbitration: a partial-branch winner with dist ≥ 1 is
+            // variation-bearing. Defer it to the genomic layer UNLESS every
+            // difference is an A↔G-type edit (mm_count == 0, no indel) —
+            // L1 misplaces indel/non-EA reads confidently (repeat decoy
+            // transcripts) while pure edited reads are its design target
+            // and stay.
+            // variation-bearing. Defer it to the genomic layer UNLESS every
+            // difference is an A↔G-type edit (mm_count == 0, no indel) —
+            // L1 misplaces indel/non-EA reads confidently (repeat decoy
+            // transcripts; stress confWrong 12.5% vs 3.0%) while pure edited
+            // reads are its design target and stay.
             if let esperanto_engine::L1Outcome::Aligned {
                 contig,
                 pos,
@@ -228,12 +245,32 @@ impl<'a> Aligner<'a> {
                         }
                     };
                     self.recount_mm_ea(q, &mut aln);
-                    return Some(aln);
+                    let has_indel = aln
+                        .cigar
+                        .iter()
+                        .any(|op| matches!(op, CigarOp::Ins(_) | CigarOp::Del(_)));
+                    let defer_to_g = matches!(stats.branch, esperanto_engine::Branch::Interrupted)
+                        && stats.best_part_dist >= 1
+                        && (has_indel || aln.mm_count > 0);
+                    if std::env::var_os("ESP_PROBE").is_some() && defer_to_g {
+                        eprintln!("[probe-l1] defer_to_g indel={has_indel} mm={} ea={}", aln.mm_count, aln.ea_count);
+                    }
+                    if !defer_to_g {
+                        return Some(aln);
+                    }
+                    // Deferred: keep as MAPQ-0 last resort (s2 = s1 ⇒ mapq 0).
+                    aln.second_chain_score = aln.chain_score;
+                    l1_fallback = Some(aln);
                 }
             }
-            // Fallback → legacy path below.
         }
+        self.align_genomic(seq).or(l1_fallback)
+    }
 
+    /// Genomic (G) layer driver: seed → anchor → chain → (intron-chain /
+    /// spliced / EA-Myers / banded DP) → split/span rescue → recount →
+    /// coverage gate. No confident chain ⇒ None.
+    fn align_genomic(&mut self, seq: &[u8]) -> Option<ReadAlignment> {
         let cfg = self.config;
         let k = cfg.seed.k;
         let read_len = seq.len() as u32;
@@ -260,30 +297,36 @@ impl<'a> Aligner<'a> {
             .unwrap_or(0)
             == 0;
         let r3 = if cfg.extend.editing_aware && weak {
-            let (mut anchors, _var_hits) = crate::index::collect_anchors_edit_variants(
-                self.index,
-                &mins,
-                read_len,
-                k,
-                MID_OCC_CAP,
-            );
-            if std::env::var_os("ESP_PROBE").is_some() {
-                eprintln!("[probe] r3 variant_anchors={}", anchors.len());
-            }
-            if anchors.is_empty() {
-                None
-            } else {
-                let (base_anchors, _) =
-                    collect_anchors(self.index, &mins, read_len, k, MID_OCC_CAP);
-                anchors.extend(base_anchors);
+            // Base anchors first: for a repetitive (clean) read the exact base
+            // anchors already form a chain. Do NOT pollute it with edit-variant
+            // anchors — those carry a mismatched variant base and would map the
+            // clean read to wrong locations (wrong chrom / wrong pos). Only when
+            // the base anchors come back empty (a densely edited read whose exact
+            // k-mers all broke) do we fall back to edit-variant seeding.
+            let (base_anchors, _) = collect_anchors(self.index, &mins, read_len, k, MID_OCC_CAP);
+            if !base_anchors.is_empty() {
                 let mut cp = cfg.chain;
                 cp.min_chain_score = 25;
-                let chains = chain_anchors(anchors, &cp);
+                let chains = chain_anchors(base_anchors, &cp);
                 let second = second_score(&chains);
-                if std::env::var_os("ESP_PROBE").is_some() {
-                    eprintln!("[probe] r3 best={:?} n_chains={}", chains.first().map(|c| c.score), chains.len());
-                }
                 Some(RoundOutcome { chains, second })
+            } else {
+                let (anchors, _var_hits) = crate::index::collect_anchors_edit_variants(
+                    self.index,
+                    &mins,
+                    read_len,
+                    k,
+                    MID_OCC_CAP,
+                );
+                if anchors.is_empty() {
+                    None
+                } else {
+                    let mut cp = cfg.chain;
+                    cp.min_chain_score = 25;
+                    let chains = chain_anchors(anchors, &cp);
+                    let second = second_score(&chains);
+                    Some(RoundOutcome { chains, second })
+                }
             }
         } else {
             None
@@ -378,22 +421,28 @@ impl<'a> Aligner<'a> {
                         n_seeds: mins.len(),
                         ..Default::default()
                     };
-                    // Post-process: snap junction to splice signal + library.
+                    // Post-process: re-derive the boundary read-aware (the
+                    // intron-chain fast path refines via fragment patterns,
+                    // which can sit ±3bp off; snap to the exact breakpoint).
                     if !aln.junctions.is_empty() {
-                        let raw = aln.junctions[0].junction;
                         let minus = matches!(best.strand, Strand::Minus);
                         let sp = SpliceParams::default();
-                        if let Some(refined) = refine_junction(
+                        if let Some(refined) = refine_junction_read(
                             self.index.reference,
+                            query,
                             aln.contig,
-                            raw.start,
-                            raw.end,
+                            segs[0].r_end,
+                            segs[1].r_start,
+                            segs[0].q_end,
+                            segs[1].q_start,
                             minus,
                             lib,
                             &sp,
                         ) {
-                            let new_intron =
-                                refined.junction.end.saturating_sub(refined.junction.start);
+                            let new_intron = refined
+                                .junction
+                                .end
+                                .saturating_sub(refined.junction.start);
                             for op in &mut aln.cigar {
                                 if let CigarOp::RefSkip(n) = op {
                                     *n = new_intron;
@@ -1027,14 +1076,17 @@ impl<'a> Aligner<'a> {
             };
             if let Some(rescue) = crate::split::rescue_right_tail(&ctx, &mut self.buf) {
                 if cigar_read_span(&rescue.cigar) == query.len() as u32 {
-                    // tail-rescue gate (frozen on): tails <12bp require known_support ≥ 2
-                    // AND zero tail-vs-ref mismatch.
+                    // tail-rescue gate (frozen on): tails <12bp require either
+                    // known_support ≥ 2 OR (canonical signal + zero tail-vs-ref
+                    // mismatch) — a de-novo short tail with a perfect anchor-side
+                    // junction match is accepted.
                     let t3_reject = r_tail < 12 && {
+                        let contig = &self.index.reference.contigs[out.contig as usize];
+                        let mm = count_tail_mismatches(&rescue.cigar, out.pos, contig, query, true);
                         if rescue.junction.known_support < 2 {
-                            true
+                            mm > 0 || rescue.junction.signal == SpliceSignal::NonCanonical
                         } else {
-                            let contig = &self.index.reference.contigs[out.contig as usize];
-                            count_tail_mismatches(&rescue.cigar, out.pos, contig, query, true) > 0
+                            mm > 0
                         }
                     };
                     if !t3_reject {
@@ -1065,18 +1117,22 @@ impl<'a> Aligner<'a> {
             };
             if let Some(rescue) = crate::split::rescue_left_tail(&ctx, &mut self.buf) {
                 if cigar_read_span(&rescue.cigar) == query.len() as u32 {
+                    // Mirror of the right-tail gate (frozen asymmetry removed):
+                    // de-novo short tails accepted with canonical signal +
+                    // zero tail-vs-ref mismatch.
                     let t3_reject = read_start < 12 && {
+                        let contig = &self.index.reference.contigs[out.contig as usize];
+                        let mm = count_tail_mismatches(
+                            &rescue.cigar,
+                            rescue.pos,
+                            contig,
+                            query,
+                            false,
+                        );
                         if rescue.junction.known_support < 2 {
-                            true
+                            mm > 0 || rescue.junction.signal == SpliceSignal::NonCanonical
                         } else {
-                            let contig = &self.index.reference.contigs[out.contig as usize];
-                            count_tail_mismatches(
-                                &rescue.cigar,
-                                rescue.pos,
-                                contig,
-                                query,
-                                false,
-                            ) > 0
+                            mm > 0
                         }
                     };
                     if !t3_reject {
@@ -1325,8 +1381,13 @@ impl<'a> Aligner<'a> {
         for op in &aln.cigar {
             match op {
                 CigarOp::Match(n) => {
+                    // Defensive: L1 projection can place a read past a
+                    // contig end (bad annotation); clamp instead of panic.
+                    let avail = (*n).min(contig.len.saturating_sub(rf));
                     let s0 = scratch.len();
-                    contig.decode_append(rf, rf + n, &mut scratch);
+                    if avail > 0 {
+                        contig.decode_append(rf, rf + avail, &mut scratch);
+                    }
                     let got = scratch.len() - s0;
                     for k in 0..(*n as usize) {
                         let qb = query[ro as usize + k];
@@ -1435,7 +1496,7 @@ fn count_tail_mismatches(
                             continue;
                         }
                         let ra = contig.base(ref_pos + i).to_ascii();
-                        if ra != b'N' && qb != ra {
+                        if ra != b'N' && !qb.eq_ignore_ascii_case(&ra) {
                             mismatches += 1;
                         }
                     }

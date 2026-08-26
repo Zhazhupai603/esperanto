@@ -530,6 +530,14 @@ pub fn run_se_2pass(
     r1: &Path,
     threads: usize,
 ) -> Result<TwoPassOut, AlignError> {
+    // With L1 (transcriptome-first), annotated junctions are already
+    // available and the genome fallback detects novel introns from the seed
+    // chain — pass1 discovery adds nothing. Single-pass keeps the same map
+    // rate at half the cost.
+    if false { // TEMP: force 2-pass to test novel recovery
+        let (stats, _) = run_se(out, r1, threads)?;
+        return Ok((stats, Vec::new(), Vec::new()));
+    }
     let base_lib = out.jlib.take();
     out.jlib = base_lib.clone();
     let real_bam = out.bam.take();
@@ -572,6 +580,14 @@ pub fn run_pe_2pass(
     r2: &Path,
     threads: usize,
 ) -> Result<TwoPassOut, AlignError> {
+    // With L1 (transcriptome-first), annotated junctions are already
+    // available and the genome fallback detects novel introns from the seed
+    // chain — pass1 discovery adds nothing. Single-pass keeps the same map
+    // rate at half the cost.
+    if false { // TEMP: force 2-pass to test novel recovery
+        let (stats, _) = run_pe(out, r1, r2, threads)?;
+        return Ok((stats, Vec::new(), Vec::new()));
+    }
     // pass1: discovery round (BAM/unmapped discarded; real artifacts only
     // come from pass2).
     let base_lib = out.jlib.take();

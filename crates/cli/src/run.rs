@@ -56,6 +56,10 @@ pub struct RunArgs {
 
 pub fn run(a: RunArgs) -> anyhow::Result<()> {
     let bundle = crate::resolve::bundle(&a.bundle)?;
+    let l1_bundle = a
+        .index
+        .as_ref()
+        .and_then(|idx| crate::resolve::l1_bundle(&a.l1_bundle, idx));
     let mut fasta = a.fasta;
     let mut gtf = a.gtf;
     let mut gnomad = a.gnomad;
@@ -78,7 +82,7 @@ pub fn run(a: RunArgs) -> anyhow::Result<()> {
         gnomad,
         bundle,
         caduceus: a.caduceus,
-        l1_bundle: a.l1_bundle,
+        l1_bundle,
         lib: if a.lib == "stranded" {
             LibType::Stranded
         } else {

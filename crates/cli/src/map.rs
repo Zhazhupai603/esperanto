@@ -31,10 +31,11 @@ pub struct MapArgs {
 }
 
 pub fn run(a: MapArgs) -> anyhow::Result<()> {
+    let l1 = crate::resolve::l1_bundle(&a.l1_bundle, &a.index);
     let raw = esperanto_flow::map_stage(
         &a.index,
         a.gtf.as_deref(),
-        a.l1_bundle.as_deref(),
+        l1.as_deref(),
         &a.r1,
         a.r2.as_deref(),
         &a.out,

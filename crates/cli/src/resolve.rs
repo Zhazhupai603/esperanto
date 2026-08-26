@@ -166,3 +166,28 @@ pub fn require_fasta(fasta: Option<PathBuf>) -> anyhow::Result<PathBuf> {
         anyhow!("--fasta not given and no refs directory found (set ESPERANTO_REFS)")
     })
 }
+
+/// Resolve the L1 engine bundle (default-on): explicit `--l1-bundle` wins,
+/// else `ESPERANTO_L1_BUNDLE`, else `<index stem>.bndl` next to the index.
+/// Returns None (with a stderr note) when nothing is found — the pipeline
+/// then runs the pure genomic (G) layer.
+pub fn l1_bundle(explicit: &Option<PathBuf>, index: &Path) -> Option<PathBuf> {
+    if let Some(b) = explicit {
+        return Some(b.clone());
+    }
+    if let Ok(env) = std::env::var("ESPERANTO_L1_BUNDLE") {
+        let p = PathBuf::from(env);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let sibling = index.with_extension("bndl");
+    if sibling.is_file() {
+        return Some(sibling);
+    }
+    eprintln!(
+        "[resolve] L1 bundle not found (tried ESPERANTO_L1_BUNDLE, {}); running pure G layer",
+        sibling.display()
+    );
+    None
+}

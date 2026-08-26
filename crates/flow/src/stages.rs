@@ -61,11 +61,19 @@ pub fn run(params: &RunParams) -> Result<(), FlowError> {
     let mut current_bam: PathBuf;
     let mut baln: Option<PathBuf> = None;
     match entry {
-        Entry::FastqSe | Entry::FastqPe => {
+        Entry::FastqSe => {
+            let (clean1, _) = stage_qc(params, entry)?;
+            current_bam = stage_map(params, entry, &clean1, None)?;
+            current_bam = stage_sort(&current_bam, params)?;
+            // The SE mapper writes .baln; use it as the scan fast channel.
+            baln = Some(params.out_dir.join("map").join("align.baln"));
+        }
+        Entry::FastqPe => {
             let (clean1, clean2) = stage_qc(params, entry)?;
             current_bam = stage_map(params, entry, &clean1, clean2.as_deref())?;
             current_bam = stage_sort(&current_bam, params)?;
-            baln = Some(params.out_dir.join("map").join("align.baln"));
+            // The PE mapper does not write .baln (legacy parity); scan reads the BAM.
+            baln = None;
         }
         Entry::Bam | Entry::BamSites => {
             if let Some(bam) = &params.bam {
@@ -83,6 +91,11 @@ pub fn run(params: &RunParams) -> Result<(), FlowError> {
         },
         _ => {
             let bed = stage_scan(params, entry, &current_bam, baln)?;
+            let fstats = crate::filter::CallFilter::default().apply_to_bed(&bed)?;
+            eprintln!(
+                "[filter] {} candidates -> {} kept (low_depth {} no_signal {})",
+                fstats.input, fstats.kept, fstats.low_depth, fstats.no_signal
+            );
             bed_to_sites(&bed)?
         }
     };

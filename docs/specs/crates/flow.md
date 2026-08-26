@@ -31,7 +31,7 @@ Before `run_pipeline` starts any stage: read `<fasta>.fai`; **if a `chr1` line e
 | qc | `qc::run(QcParams{r1,r2,out_dir:<out>/qc,…})`, OutFormat::Fqgz | `<stem>.clean[_R1/_R2].fq.gz` (qc naming contract) + `qc.json` |
 | map | `index_io::load(paidx)`; `AlignConfig::rna_default()` + `extend.editing_aware=true`; `jlib = gtf.map(gtf::from_gtf…)`; `jkmer = None` (not wired in 1.0.0, see BACKLOG); `l1 = l1_bundle.map(L1Index::open)`; `run_se_2pass` / `run_pe_2pass` (RNA always 2-pass) | `<out>/map/raw.bam` + `unmapped.fq.gz` + `align_qc.json` + `align.baln` |
 | sort | `bamio::sort::coordinate_sort(raw.bam → sorted.bam)` + builds `.bai` (see bamio spec addendum) | `<out>/map/sorted.bam(.bai)` |
-| scan | `scan::run_call(CallParams{…})`; FASTQ entries prefer `baln = align.baln` (byte-identical dual-source contract with BAM); Bam entries use the sorted input BAM | `<out>/scan/candidates.bed` |
+| scan | `scan::run_call(CallParams{…})`; single-end FASTQ entries use `baln = align.baln` (byte-identical dual-source contract with BAM); paired-end and Bam entries read the sorted BAM (the PE mapper does not write `.baln`) | `<out>/scan/candidates.bed` |
 | score | bed→sites bridge (next section) → `score::pipeline::score_sites_batched(bam=sorted.bam,…)`; BamSites entries parse `--sites` directly (same bridge) | `<out>/score/scores.tsv` (`chrom\tpos\tprob`, row order = input order) |
 | vcf | merge candidates.bed + scores.tsv (next section) | `<out>/sites.vcf` |
 
