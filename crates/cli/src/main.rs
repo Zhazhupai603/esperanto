@@ -41,11 +41,8 @@ Index(index::IndexArgs),
     Score(score::ScoreArgs),
     /// Full pipeline: qc → map → sort → scan → score → vcf.
     Run(run::RunArgs),
-<<<<<<< HEAD
-=======
     /// Regenerate the standalone HTML report for a finished run directory.
     Report(report::ReportArgs),
->>>>>>> dev/l1-experiment
     /// One-step reference environment: detect or download reference files
     /// in the refs directory, then build the index in place.
     Setup(setup::SetupArgs),
@@ -61,10 +58,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Scan(a) => scan::run(a),
         Cmd::Score(a) => score::run(a),
         Cmd::Run(a) => run::run(a),
-<<<<<<< HEAD
-=======
         Cmd::Report(a) => report::run(a),
->>>>>>> dev/l1-experiment
         Cmd::Setup(a) => setup::run(a),
     }
 }
