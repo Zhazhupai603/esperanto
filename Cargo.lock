@@ -649,6 +649,8 @@ dependencies = [
  "esperanto-qc",
  "esperanto-scan",
  "esperanto-score",
+ "flate2",
+ "rayon",
  "rust-htslib",
  "serde_json",
  "thiserror 2.0.20",

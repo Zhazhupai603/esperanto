@@ -18,6 +18,9 @@ dependencies beyond a reference FASTA and its index.
 - Splice-aware, editing-aware read alignment with 2-pass junction discovery;
   a transcriptome-first (L1) engine is enabled by default when an L1 bundle is
   found next to the alignment index
+- Unmapped reads get a second pass against a collapsed-alphabet index (A==G,
+  T==C), which recovers hyperedited reads; survivors are written back with
+  MAPQ 0 and an `RE:Z:collapsed` tag
 - Strand-resolved candidate calling from BAM or the binary `.baln` channel
 - Site scoring with a frozen Caduceus-Mamba model (pileup veto gate, 5-fold
   ensemble); AUROC 0.998 on the frozen evaluation corpus
@@ -78,7 +81,7 @@ esperanto index --fasta ref.fa --out ref.paidx
 
 # with a transcript annotation, the L1 engine bundle is built in the same pass
 esperanto index --fasta ref.fa --gtf genes.gtf --out ref.paidx
-# -> ref.paidx + ref.bndl + ref.tidx
+# -> ref.paidx + ref.bndl + ref.tidx + ref.cpaidx (collapsed rescue index)
 ```
 
 Run the full pipeline:
@@ -139,9 +142,11 @@ When an option is omitted, inputs are resolved automatically (first hit wins):
 - Model bundle: `ESPERANTO_BUNDLE`, package layout (`bundle/` next to the
   binary), user data dir (`~/.local/share/esperanto/bundle`).
 - L1 bundle: `--l1-bundle`, `ESPERANTO_L1_BUNDLE`, `<index stem>.bndl` (with its
-  `<index stem>.tidx` sidecar) next to
-  the alignment index. If none is found, alignment runs the genomic layer only
-  (a note is printed).
+  `<index stem>.tidx` sidecar) next to the alignment index. If none is found,
+  alignment runs the genomic layer only (a note is printed).
+- Rescue index: `<index stem>.cpaidx` next to the alignment index. When
+  present, the map stage re-aligns the unmapped set against it; absent, the
+  pass is skipped silently.
 - Reference files: `ESPERANTO_REFS`, package `refs/`, user data dir, `./refs`.
   A refs directory provides `hg38.fa`, a GTF, and a gnomAD VCF when present.
 

@@ -9,6 +9,8 @@ thiserror.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
 rust-htslib.workspace = true
+rayon.workspace = true
+flate2.workspace = true
 esperanto-qc = { path = "../qc" }
 esperanto-map = { path = "../map" }
 esperanto-scan = { path = "../scan" }
