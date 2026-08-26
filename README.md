@@ -46,23 +46,29 @@ cargo build --release
 
 ## Quick start
 
-First-time reference setup (detects files in the refs directory
-`~/.local/share/esperanto/refs`, or downloads the GENCODE GRCh38 reference +
-annotation when empty, then builds the index in place):
+First-time reference setup — one command:
 
 ```sh
 esperanto setup
 ```
 
-This also installs the scoring model bundle (from the release tarball) when
-none is present — after `setup`, `esperanto run --r1 reads.fq.gz --out out/`
-needs no reference flags at all.
+Setup works in the refs directory (`~/.local/share/esperanto/refs`; override
+with `ESPERANTO_REFS`). It detects a reference FASTA + GTF placed there, or
+downloads the GENCODE GRCh38 reference + annotation when the directory is
+empty, validates the files before building (both must parse, GTF contig names
+must match FASTA contig names, and the species guardrail must hold), and
+builds the index in place. It also installs the scoring model bundle when
+none is present.
 
-To use your own reference instead, place `<name>.fa` and `<name>.gtf` in that
-directory (compressed `.gz` files are decompressed automatically) and run the
-same command. Set `ESPERANTO_REFS` to use a different directory. Setup
-validates the files before building: both must parse, GTF contig names must
-match FASTA contig names, and the species guardrail must hold.
+After setup, the analysis needs no reference flags at all:
+
+```sh
+esperanto run --r1 reads.fq.gz --out out/
+```
+
+To use your own reference instead, place `<name>.fa` and `<name>.gtf` in the
+refs directory (compressed `.gz` files are decompressed automatically) and run
+`esperanto setup` again.
 
 Alternatively, build the alignment index by hand (once per reference):
 
@@ -143,7 +149,7 @@ When an option is omitted, inputs are resolved automatically (first hit wins):
 
 | Entry | Required | Optional |
 |---|---|---|
-| FASTQ (PE/SE) | `--r1` [`--r2`]; `--index` and `--fasta` are auto-resolved from the refs directory after `setup` | `--gtf`, `--l1-bundle`, `--gnomad` |
+| FASTQ (PE/SE) | `--r1` (plus `--r2` for paired-end); `--index` and `--fasta` are auto-resolved after `setup` | `--gtf`, `--l1-bundle`, `--gnomad` |
 | BAM | `--bam` (sorted + indexed), `--fasta` | `--gtf`, `--gnomad` |
 | BAM + sites | `--bam`, `--sites`, `--fasta` | `--gtf`, `--gnomad` |
 
