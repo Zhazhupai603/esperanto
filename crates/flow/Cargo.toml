@@ -15,5 +15,6 @@ esperanto-qc = { path = "../qc" }
 esperanto-map = { path = "../map" }
 esperanto-scan = { path = "../scan" }
 esperanto-score = { path = "../score" }
+esperanto-report = { path = "../report" }
 esperanto-bamio = { path = "../bamio" }
 esperanto-engine = { path = "../engine" }

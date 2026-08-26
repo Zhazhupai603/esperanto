@@ -1,0 +1,1488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22><rect width=%2216%22 height=%2216%22 rx=%224%22 fill=%22%230f766e%22/></svg>">
+<title>RNA Editing Report</title>
+<style>
+  :root {
+    --bg: #fafafa;
+    --surface: #ffffff;
+    --text-primary: #111827;
+    --text-secondary: #4b5563;
+    --text-tertiary: #9ca3af;
+    --accent: #0f766e;
+    --accent-muted: #ccfbf1;
+    --border: #e5e7eb;
+    --tooltip-bg: #1f2937;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background-color: var(--bg);
+    color: var(--text-primary);
+    line-height: 1.5;
+    padding: 32px 16px;
+  }
+  #app { max-width: 1200px; margin: 0 auto; }
+  header { margin-bottom: 32px; }
+  h1 { font-size: 24px; font-weight: 600; margin-bottom: 4px; }
+  .subtitle { font-size: 14px; color: var(--text-secondary); }
+  .section-title { font-size: 18px; font-weight: 600; margin-bottom: 16px; }
+
+  .metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+    margin-bottom: 32px;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05), 0 1px 2px rgba(0,0,0,0.025);
+  }
+  .card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+  }
+  .card-label { font-size: 13px; font-weight: 500; color: var(--text-secondary); }
+  .card-icon { color: var(--text-tertiary); cursor: pointer; }
+  .card-icon svg { width: 16px; height: 16px; }
+  .card-value { font-size: 32px; font-weight: 600; }
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05), 0 1px 2px rgba(0,0,0,0.025);
+    margin-bottom: 32px;
+  }
+
+  /* Breadcrumb */
+  .breadcrumb-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 24px;
+    font-size: 14px;
+    font-weight: 500;
+  }
+  .breadcrumb-item {
+    color: var(--accent);
+    cursor: pointer;
+    text-decoration: none;
+  }
+  .breadcrumb-item:hover {
+    color: var(--accent);
+    text-decoration: underline;
+  }
+  .breadcrumb-separator {
+    color: var(--text-tertiary);
+  }
+  .breadcrumb-item.active {
+    color: var(--text-primary);
+    cursor: default;
+    text-decoration: none;
+  }
+
+  /* Explorer */
+  .explorer-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+  }
+  .explorer-hint {
+    font-size: 14px;
+    color: var(--text-secondary);
+    font-style: italic;
+  }
+  .heat-legend {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+  .legend-strip {
+    width: 120px;
+    height: 10px;
+    border-radius: 5px;
+    background: linear-gradient(to right, #f8fafc, #0f766e);
+  }
+
+  .heat-container {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    overflow-x: auto;
+    padding-bottom: 8px;
+  }
+  .heat-row {
+    display: flex;
+    align-items: center;
+    min-width: 600px;
+    cursor: pointer;
+    border-radius: 4px;
+    padding: 2px 0;
+  }
+  .heat-row:hover {
+    background: var(--bg);
+  }
+  .heat-label {
+    width: 48px;
+    flex-shrink: 0;
+    font-size: 12px;
+    color: var(--text-secondary);
+    text-align: right;
+    padding-right: 8px;
+  }
+  .heat-track {
+    flex-grow: 1;
+    height: 16px;
+    background: #f8fafc;
+    border-radius: 4px;
+    overflow: hidden;
+    display: flex;
+  }
+  .heat-cell {
+    height: 100%;
+    cursor: pointer;
+  }
+  .heat-cell:hover {
+    opacity: 0.7;
+  }
+  .heat-axis {
+    position: relative;
+    flex-grow: 1;
+    height: 16px;
+    font-size: 10px;
+    color: var(--text-secondary);
+  }
+  .axis-tick {
+    position: absolute;
+    top: 0;
+    white-space: nowrap;
+  }
+  .track-caption {
+    display: flex;
+    gap: 18px;
+    align-items: center;
+    flex-wrap: wrap;
+    font-size: 12px;
+    color: var(--text-secondary);
+    padding: 8px 20px 0;
+  }
+  .track-caption span { white-space: nowrap; }
+  .track-zoom-note { margin-left: auto; font-style: italic; white-space: normal !important; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+  .dot-pass { background: var(--accent); }
+  .dot-fail { background: #d1d5db; }
+  .heat-arrow {
+    width: 24px;
+    text-align: center;
+    color: var(--text-tertiary);
+    font-size: 16px;
+    line-height: 16px;
+    opacity: 0;
+    transition: opacity 0.2s;
+  }
+  .heat-row:hover .heat-arrow {
+    opacity: 1;
+  }
+
+  /* Search */
+  .search-container {
+    position: relative;
+    margin-bottom: 24px;
+  }
+  .search-icon {
+    position: absolute;
+    left: 12px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--text-tertiary);
+    width: 20px;
+    height: 20px;
+  }
+  .search-input {
+    width: 100%;
+    height: 48px;
+    padding: 0 16px 0 40px;
+    font-size: 16px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    outline: none;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+  .search-input:focus {
+    border-color: #14b8a6;
+    box-shadow: 0 0 0 2px rgba(20, 184, 166, 0.2);
+  }
+  .dropdown {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    margin-top: 4px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1), 0 2px 4px -1px rgba(0,0,0,0.06);
+    max-height: 300px;
+    overflow-y: auto;
+    z-index: 10;
+  }
+  .dropdown-item {
+    padding: 12px 16px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  .dropdown-item:hover, .dropdown-item.active {
+    background: var(--accent-muted);
+  }
+
+  /* Gene View */
+  .gene-header {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+  .gene-header h3 { font-size: 18px; font-weight: 600; }
+  .gene-summary { font-size: 13px; color: var(--text-secondary); }
+  .gene-link { font-size: 13px; color: var(--accent); text-decoration: none; margin-left: auto; }
+  .gene-link:hover { text-decoration: underline; }
+  
+  .chip-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 16px;
+  }
+  .chip {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 4px 12px;
+    font-size: 12px;
+    color: var(--text-primary);
+  }
+
+  /* Track */
+  .track-container {
+    width: 100%;
+    height: 200px;
+    margin-bottom: 24px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    position: relative;
+    background: #f8fafc;
+  }
+  .track-svg {
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  .track-point {
+    cursor: pointer;
+    transition: stroke-width 0.1s;
+  }
+  .track-point:hover {
+    stroke: #111827;
+    stroke-width: 2px;
+  }
+  .track-highlight {
+    fill: none;
+    stroke: var(--accent);
+    stroke-width: 2px;
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse {
+    0% { r: 10px; opacity: 1; }
+    100% { r: 20px; opacity: 0; }
+  }
+
+  /* Table */
+  .table-container {
+    overflow-x: auto;
+  }
+  .sites-table {
+    width: 100%;
+    border-collapse: collapse;
+    text-align: left;
+  }
+  .sites-table th {
+    font-size: 12px;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+    font-weight: 500;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .sites-table td {
+    font-size: 14px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .sites-table tr.clickable:hover {
+    background: var(--bg);
+    cursor: pointer;
+  }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 9999px;
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .badge.pass { background: var(--accent-muted); color: var(--accent); }
+  .badge.fail { background: #f3f4f6; color: var(--text-secondary); }
+
+  .empty-state {
+    text-align: center;
+    padding: 48px 24px;
+    color: var(--text-tertiary);
+    font-size: 14px;
+  }
+
+  .tooltip {
+    position: fixed;
+    background: var(--tooltip-bg);
+    color: #fff;
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    pointer-events: none;
+    z-index: 100;
+    white-space: nowrap;
+    transform: translate(-50%, -100%);
+    margin-top: -8px;
+    box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
+  }
+  .tooltip::after {
+    content: '';
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    margin-left: -4px;
+    border-width: 4px;
+    border-style: solid;
+    border-color: var(--tooltip-bg) transparent transparent transparent;
+  }
+
+  #error-state {
+    background: #fee2e2;
+    color: #991b1b;
+    padding: 16px;
+    border-radius: 8px;
+    margin-bottom: 24px;
+  }
+  
+  .info-panel {
+    margin-top: 24px;
+    border-top: 1px solid var(--border);
+    padding-top: 24px;
+  }
+
+  .zoom-controls {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    display: flex;
+    gap: 4px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+    z-index: 10;
+  }
+  .zoom-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: var(--text-secondary);
+    width: 24px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+  }
+  .zoom-btn:hover {
+    background: var(--bg);
+    color: var(--text-primary);
+  }
+  .zoom-btn svg {
+    width: 16px;
+    height: 16px;
+  }
+
+</style>
+</head>
+<body>
+  <div id="app">
+    <div id="error-state" style="display: none;"></div>
+    <div id="loading-state">Loading report data...</div>
+    
+    <div id="report-content" style="display: none;">
+      <header>
+        <h1 id="sample-name"></h1>
+        <p class="subtitle">A-to-I RNA editing report</p>
+      </header>
+      
+      <section class="metrics-grid" id="metrics-container"></section>
+
+      <section class="panel" id="explorer-panel">
+        <div class="breadcrumb-bar" id="breadcrumb"></div>
+        
+        <div class="explorer-header">
+          <span class="explorer-hint" id="explorer-hint"></span>
+          <div class="heat-legend" id="heat-legend">
+            <span>Low</span>
+            <div class="legend-strip"></div>
+            <span>High</span>
+          </div>
+        </div>
+        
+        <div id="explorer-content"></div>
+        <div class="info-panel" id="info-panel"></div>
+      </section>
+
+      <section class="panel">
+        <h2 class="section-title">Gene Search</h2>
+        <div class="search-container">
+          <svg class="search-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="8"></circle>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+          </svg>
+          <input type="text" id="gene-search" class="search-input" placeholder="Search a gene… e.g. HSPA5" autocomplete="off">
+          <div class="dropdown" id="search-dropdown" style="display: none;"></div>
+        </div>
+        
+        <div id="gene-view" style="display: none;">
+          <div class="gene-header">
+            <h3 id="gene-name"></h3>
+            <span id="gene-summary" class="gene-summary"></span>
+            <a href="#" id="gene-link" class="gene-link">→ view in genome</a>
+          </div>
+          <div id="gene-chips" class="chip-list"></div>
+          <div class="track-container" id="gene-track-container"></div>
+          <div class="table-container">
+            <table class="sites-table">
+              <thead>
+                <tr>
+                  <th>Position</th>
+                  <th>Probability</th>
+                  <th>VAF</th>
+                  <th>Depth</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="gene-sites-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+        <div id="gene-empty" class="empty-state">
+          Type a gene name to see per-base editing detail — try HSPA5
+        </div>
+      </section>
+
+      <section class="panel" id="recoded-panel">
+        <h2 class="section-title">Recoded Proteins</h2>
+        <div class="search-container">
+          <svg class="search-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="8"></circle>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+          </svg>
+          <input type="text" id="recoded-search" class="search-input" placeholder="Filter by gene or change (e.g. HSPA5 or T50A)..." autocomplete="off">
+        </div>
+        <div class="table-container">
+          <table class="sites-table">
+            <thead>
+              <tr>
+                <th>Gene</th>
+                <th>Change</th>
+                <th>Location</th>
+                <th>Probability</th>
+                <th>VAF</th>
+                <th>Depth</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="recoded-tbody"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </div>
+  
+  <div id="tooltip" class="tooltip" style="display: none;"></div>
+
+  <script>
+    const tooltip = document.getElementById('tooltip');
+    const EMBEDDED_DATA = null; // __ESPERANTO_DATA__
+    let reportData = null;
+    let activeDropdownIndex = -1;
+    let filteredGenes = [];
+    let l2State = null;
+    let l3State = null;
+    let geneState = null;
+
+    function showTooltip(e, text) {
+      tooltip.textContent = text;
+      tooltip.style.display = 'block';
+      tooltip.style.left = e.clientX + 'px';
+      tooltip.style.top = e.clientY + 'px';
+    }
+
+    function hideTooltip() {
+      tooltip.style.display = 'none';
+    }
+
+    function formatNumber(num) {
+      return new Intl.NumberFormat('en-US').format(num);
+    }
+
+    function formatPercent(num) {
+      return (num * 100).toFixed(1) + '%';
+    }
+
+    function interpolateColor(val, maxVal) {
+      const ratio = Math.min(Math.max(val / maxVal, 0), 1);
+      const r = Math.round(224 - ratio * (224 - 15));
+      const g = Math.round(242 - ratio * (242 - 118));
+      const b = Math.round(240 - ratio * (240 - 110));
+      return `rgb(${r}, ${g}, ${b})`;
+    }
+
+    const chromRank = c => {
+      const m = /^chr(\d+)$/.exec(c);
+      if (m) return parseInt(m[1], 10);
+      return { chrX: 23, chrY: 24, chrM: 25 }[c] ?? 99;
+    };
+
+    async function init() {
+      try {
+        if (typeof EMBEDDED_DATA !== 'undefined') {
+          reportData = EMBEDDED_DATA;
+        } else {
+          const res = await fetch('data.json');
+          if (!res.ok) throw new Error('Failed to load data.json');
+          reportData = await res.json();
+        }
+        
+        // Sort chroms
+        reportData.chroms.sort((a, b) => chromRank(a.chrom) - chromRank(b.chrom));
+        
+        document.getElementById('loading-state').style.display = 'none';
+        document.getElementById('report-content').style.display = 'block';
+        
+        renderMetrics();
+        setupGeneSearch();
+        setupRecodedSearch();
+        
+        window.addEventListener('hashchange', handleHashChange);
+        handleHashChange();
+      } catch (err) {
+        document.getElementById('loading-state').style.display = 'none';
+        const errDiv = document.getElementById('error-state');
+        errDiv.style.display = 'block';
+        errDiv.innerHTML = `<strong>Error loading data:</strong> ${err.message}<br><br>Please ensure you are serving this folder with a local web server, e.g., <code>python3 -m http.server</code>`;
+      }
+    }
+
+    function renderMetrics() {
+      document.getElementById('sample-name').textContent = reportData.sample;
+      const metrics = [
+        { label: 'Editing events', value: formatNumber(reportData.metrics.events), tip: 'Total number of A-to-I editing events detected.' },
+        { label: 'Confident sites', value: formatNumber(reportData.metrics.pass), tip: 'High-confidence editing sites passing all filters.' },
+        { label: 'Recoded proteins', value: formatNumber(reportData.metrics.recodings), tip: 'Number of amino acid changes caused by editing.' },
+        { label: 'Rescued hyperedited reads', value: formatNumber(reportData.metrics.rescued), tip: 'Reads with dense editing rescued by the hyperediting pipeline.' }
+      ];
+      
+      document.getElementById('metrics-container').innerHTML = metrics.map(m => `
+        <div class="card">
+          <div class="card-header">
+            <span class="card-label">${m.label}</span>
+            <span class="card-icon" onmouseenter="showTooltip(event, '${m.tip}')" onmouseleave="hideTooltip()" onmousemove="showTooltip(event, '${m.tip}')">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
+            </span>
+          </div>
+          <div class="card-value">${m.value}</div>
+        </div>
+      `).join('');
+    }
+
+    function handleHashChange() {
+      const hash = window.location.hash.slice(1);
+      const parts = hash.split('/').filter(Boolean);
+      
+      if (parts.length === 0) {
+        renderL1();
+      } else if (parts[0].startsWith('chr')) {
+        const chrom = parts[0];
+        if (parts.length === 1) {
+          renderL2(chrom);
+        } else if (parts.length >= 2) {
+          const mb = parseInt(parts[1], 10);
+          const highlightPos = parts[2] ? parseInt(parts[2], 10) : null;
+          renderL3(chrom, mb, highlightPos);
+        }
+      }
+    }
+
+    function updateBreadcrumb(crumbs) {
+      const html = crumbs.map((c, i) => {
+        if (i === crumbs.length - 1) {
+          return `<span class="breadcrumb-item active">${c.label}</span>`;
+        }
+        return `<a href="${c.href}" class="breadcrumb-item">${c.label}</a><span class="breadcrumb-separator">/</span>`;
+      }).join('');
+      document.getElementById('breadcrumb').innerHTML = html;
+    }
+
+    function renderL1() {
+      updateBreadcrumb([{ label: 'Genome', href: '#' }]);
+      document.getElementById('explorer-hint').textContent = 'Click a chromosome to zoom in';
+      document.getElementById('heat-legend').style.display = '';
+      
+      let maxHeat = 0;
+      const chroms = reportData.chroms.filter(c => reportData.heat5[c.chrom]);
+      chroms.forEach(c => {
+        reportData.heat5[c.chrom].forEach(v => {
+          const l = Math.log1p(v);
+          if (l > maxHeat) maxHeat = l;
+        });
+      });
+
+      const heatHtml = chroms.map(c => {
+        const vals = reportData.heat5[c.chrom];
+        const cellWidth = 100 / vals.length;
+        const cells = vals.map((v, i) => {
+          const color = interpolateColor(Math.log1p(v), maxHeat);
+          const startMb = i * 5;
+          const endMb = startMb + 5;
+          const tip = `${c.chrom}: ${startMb}-${endMb} Mb | Signal: ${v.toFixed(2)}`;
+          return `<rect x="${i * cellWidth}%" y="0" width="${cellWidth}%" height="100%" fill="${color}" class="heat-cell" style="stroke:#ffffff;stroke-width:1;vector-effect:non-scaling-stroke" onmouseenter="showTooltip(event, '${tip}')" onmouseleave="hideTooltip()" onmousemove="showTooltip(event, '${tip}')" />`;
+        }).join('');
+        
+        return `
+          <div class="heat-row" onclick="window.location.hash = '#/${c.chrom}'">
+            <div class="heat-label">${c.chrom}</div>
+            <div class="heat-track">
+              <svg width="100%" height="100%" preserveAspectRatio="none">${cells}</svg>
+            </div>
+            <div class="heat-arrow">›</div>
+          </div>
+        `;
+      }).join('');
+      
+      document.getElementById('explorer-content').innerHTML = `<div class="heat-container">${heatHtml}</div>`;
+      
+      // Info panel: top 10 chromosomes
+      const chromStats = chroms.map(c => {
+        const signal = reportData.heat5[c.chrom].reduce((a, b) => a + b, 0);
+        const sites = reportData.sites[c.chrom] ? reportData.sites[c.chrom].length : 0;
+        return { chrom: c.chrom, signal, sites };
+      }).sort((a, b) => b.signal - a.signal).slice(0, 10);
+      
+      document.getElementById('info-panel').innerHTML = `
+        <h3 class="section-title" style="font-size: 16px;">Top Chromosomes by Signal</h3>
+        <div class="table-container">
+          <table class="sites-table">
+            <thead><tr><th>Chromosome</th><th>Total Signal</th><th>Sites</th></tr></thead>
+            <tbody>
+              ${chromStats.map(s => `
+                <tr class="clickable" onclick="window.location.hash = '#/${s.chrom}'">
+                  <td>${s.chrom}</td>
+                  <td>${s.signal.toFixed(2)}</td>
+                  <td>${formatNumber(s.sites)}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      `;
+    }
+
+    function renderL2(chrom) {
+      updateBreadcrumb([
+        { label: 'Genome', href: '#' },
+        { label: chrom, href: `#/${chrom}` }
+      ]);
+      document.getElementById('explorer-hint').textContent = 'Click a 1 Mb window to see individual sites';
+      document.getElementById('heat-legend').style.display = '';
+      
+      const vals = reportData.heat1[chrom] || [];
+      let maxHeat = 0;
+      vals.forEach(v => {
+        const l = Math.log1p(v);
+        if (l > maxHeat) maxHeat = l;
+      });
+
+      const chromLen = (reportData.chroms.find(c => c.chrom === chrom) || {}).len || 0;
+      const maxMb = Math.ceil(chromLen / 1000000);
+
+      l2State = {
+        chrom, vals, maxHeat, maxMb,
+        origXMin: 0, origXMax: maxMb,
+        xMin: 0, xMax: maxMb
+      };
+
+      document.getElementById('explorer-content').innerHTML = `
+        <div class="heat-container" id="l2-track-container" style="position: relative; overflow: hidden; touch-action: none; padding-bottom: 24px;">
+          <div class="heat-row" style="cursor: default;">
+            <div class="heat-label">${chrom}</div>
+            <div class="heat-track" id="l2-track" style="position: relative;"></div>
+          </div>
+          <div class="heat-row" style="cursor: default; margin-top: 4px;">
+            <div class="heat-label"></div>
+            <div class="heat-axis" id="l2-axis" style="position: relative; height: 20px; width: 100%; flex-grow: 1;"></div>
+          </div>
+        </div>
+      `;
+
+      setupL2Events();
+      drawL2();
+      
+      // Info panel: top genes in this chromosome
+      const genesInChrom = reportData.genes.filter(g => g.chrom === chrom).sort((a, b) => b.maxprob - a.maxprob).slice(0, 10);
+      
+      document.getElementById('info-panel').innerHTML = `
+        <h3 class="section-title" style="font-size: 16px;">Top Genes in ${chrom}</h3>
+        <div class="table-container">
+          <table class="sites-table">
+            <thead><tr><th>Gene</th><th>Sites</th><th>Confident</th><th>Max Prob</th></tr></thead>
+            <tbody>
+              ${genesInChrom.map(g => `
+                <tr class="clickable" onclick="selectGeneByName('${g.gene}')">
+                  <td>${g.gene}</td>
+                  <td>${g.n}</td>
+                  <td>${g.pass}</td>
+                  <td>${g.maxprob.toFixed(3)}</td>
+                </tr>
+              `).join('')}
+              ${genesInChrom.length === 0 ? '<tr><td colspan="4" class="empty-state" style="padding: 24px;">No genes found in this chromosome</td></tr>' : ''}
+            </tbody>
+          </table>
+        </div>
+      `;
+    }
+
+    function drawL2() {
+      if (!l2State) return;
+      const { chrom, vals, maxHeat, maxMb, xMin, xMax } = l2State;
+      
+      const track = document.getElementById('l2-track');
+      const axis = document.getElementById('l2-axis');
+      if (!track || !axis) return;
+      
+      const mbSpan = xMax - xMin;
+      
+      const cells = vals.map((v, i) => {
+        if (i + 1 < xMin || i > xMax) return '';
+        
+        const color = interpolateColor(Math.log1p(v), maxHeat);
+        const sitesInWindow = (reportData.sites[chrom] || []).filter(s => s[0] >= i * 1000000 && s[0] < (i + 1) * 1000000).length;
+        const tip = `${chrom}: ${i}-${i+1} Mb — signal ${v.toFixed(2)}, ${sitesInWindow} sites`;
+        
+        const xPct = ((i - xMin) / mbSpan) * 100;
+        const wPct = (1 / mbSpan) * 100;
+        
+        return `<rect x="${xPct}%" y="0" width="${wPct}%" height="100%" fill="${color}" class="heat-cell" style="stroke:#ffffff;stroke-width:1;vector-effect:non-scaling-stroke" onclick="window.location.hash = '#/${chrom}/${i}'" onmouseenter="showTooltip(event, '${tip}')" onmouseleave="hideTooltip()" onmousemove="showTooltip(event, '${tip}')" />`;
+      }).join('');
+      
+      track.innerHTML = `<svg width="100%" height="100%" preserveAspectRatio="none">${cells}</svg>`;
+      
+      const rawStep = mbSpan / 5;
+      const pow = Math.pow(10, Math.floor(Math.log10(rawStep)));
+      const mant = rawStep / pow;
+      const niceStep = Math.max(1, pow * (mant <= 1 ? 1 : mant <= 2 ? 2 : mant <= 5 ? 5 : 10));
+      const tickStart = Math.ceil(xMin / niceStep) * niceStep;
+      const tickMbs = [];
+      for (let mb = tickStart; mb <= xMax; mb += niceStep) tickMbs.push(mb);
+      
+      const axisHtml = tickMbs.map(mb => {
+        const left = ((mb - xMin) / mbSpan) * 100;
+        return `<span class="axis-tick" style="left:${left}%; transform: translateX(-50%); position: absolute; font-size: 12px; color: var(--text-secondary);">${mb}</span>`;
+      }).join('') + `<span class="axis-tick" style="right:0; transform:none; position: absolute; font-size: 12px; color: var(--text-secondary);">Mb</span>`;
+      
+      axis.innerHTML = axisHtml;
+    }
+
+    function setupL2Events() {
+      const container = document.getElementById('l2-track-container');
+      let isDragging = false;
+      let lastX = 0;
+      
+      container.addEventListener('mousedown', e => {
+        isDragging = true;
+        lastX = e.clientX;
+        container.style.cursor = 'grabbing';
+      });
+      
+      window.addEventListener('mousemove', e => {
+        if (!isDragging || !l2State) return;
+        const dx = e.clientX - lastX;
+        lastX = e.clientX;
+        
+        const track = document.getElementById('l2-track');
+        const width = track.clientWidth || 800;
+        const mbSpan = l2State.xMax - l2State.xMin;
+        
+        const mbShift = (dx / width) * mbSpan;
+        l2State.xMin -= mbShift;
+        l2State.xMax -= mbShift;
+        
+        if (l2State.xMin < 0) {
+          l2State.xMax -= l2State.xMin;
+          l2State.xMin = 0;
+        }
+        if (l2State.xMax > l2State.maxMb) {
+          l2State.xMin -= (l2State.xMax - l2State.maxMb);
+          l2State.xMax = l2State.maxMb;
+        }
+        
+        drawL2();
+      });
+      
+      window.addEventListener('mouseup', () => {
+        isDragging = false;
+        if (container) container.style.cursor = '';
+      });
+      
+      container.addEventListener('wheel', e => {
+        e.preventDefault();
+        if (!l2State) return;
+        
+        const zoomFactor = e.deltaY > 0 ? 1.1 : 0.9;
+        
+        const track = document.getElementById('l2-track');
+        const rect = track.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left;
+        const width = track.clientWidth || 800;
+        
+        const clampedX = Math.max(0, Math.min(width, mouseX));
+        const f = clampedX / width;
+        
+        const mbUnderCursor = l2State.xMin + f * (l2State.xMax - l2State.xMin);
+        const newSpan = (l2State.xMax - l2State.xMin) * zoomFactor;
+        
+        if (newSpan < 1 && zoomFactor < 1) return;
+        if (newSpan > l2State.maxMb && zoomFactor > 1) return;
+        
+        l2State.xMin = mbUnderCursor - f * newSpan;
+        l2State.xMax = l2State.xMin + newSpan;
+        
+        if (l2State.xMin < 0) {
+          l2State.xMax -= l2State.xMin;
+          l2State.xMin = 0;
+        }
+        if (l2State.xMax > l2State.maxMb) {
+          l2State.xMin -= (l2State.xMax - l2State.maxMb);
+          l2State.xMax = l2State.maxMb;
+        }
+        
+        drawL2();
+      }, { passive: false });
+    }
+
+    function renderL3(chrom, mb, highlightPos) {
+      updateBreadcrumb([
+        { label: 'Genome', href: '#' },
+        { label: chrom, href: `#/${chrom}` },
+        { label: `${mb}–${mb+1} Mb`, href: `#/${chrom}/${mb}` }
+      ]);
+      document.getElementById('explorer-hint').textContent = 'Each dot is one editing site — hover for details';
+      document.getElementById('heat-legend').style.display = 'none';
+      
+      const startPos = mb * 1000000;
+      const endPos = (mb + 1) * 1000000;
+      const sites = (reportData.sites[chrom] || []).filter(s => s[0] >= startPos && s[0] < endPos);
+      
+      let maxDepth = 1;
+      sites.forEach(s => { if (s[3] > maxDepth) maxDepth = s[3]; });
+      
+      let xMin = startPos, xMax = endPos;
+      if (sites.length > 0) {
+        const lo = Math.min(...sites.map(s => s[0]));
+        const hi = Math.max(...sites.map(s => s[0]));
+        const padX = Math.max(250, Math.round((hi - lo) * 0.08));
+        xMin = lo - padX;
+        xMax = hi + padX;
+        if (xMax - xMin < 2000) {
+          const mid = (xMin + xMax) / 2;
+          xMin = mid - 1000;
+          xMax = mid + 1000;
+        }
+      }
+      
+      l3State = {
+        chrom, mb, highlightPos, sites, maxDepth,
+        origXMin: xMin, origXMax: xMax,
+        xMin, xMax
+      };
+      
+      document.getElementById('explorer-content').innerHTML = `
+        <div class="track-container" id="l3-track-container" style="position: relative; overflow: hidden; touch-action: none;">
+          <div class="zoom-controls">
+            <button class="zoom-btn" onclick="zoomL3(1.5)" title="Zoom In">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+            </button>
+            <button class="zoom-btn" onclick="zoomL3(1/1.5)" title="Zoom Out">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+            </button>
+            <button class="zoom-btn" onclick="resetL3()" title="Reset Zoom">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path><polyline points="3 3 3 8 8 8"></polyline></svg>
+            </button>
+          </div>
+          <svg class="track-svg" id="l3-svg"></svg>
+        </div>
+        <div class="track-caption" style="font-size: 12px; color: var(--text-secondary); display: flex; gap: 16px; align-items: center;">
+          <span style="font-weight: 600;">y: editing level (VAF)</span>
+          <span style="display: flex; align-items: center; gap: 4px;"><span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--accent);"></span>Confident (PASS)</span>
+          <span style="display: flex; align-items: center; gap: 4px;"><span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #d1d5db;"></span>Filtered (low confidence)</span>
+          <span class="track-zoom-note" id="l3-zoom-note" style="margin-left: auto; font-style: italic;"></span>
+        </div>
+      `;
+      
+      setupL3Events();
+      drawL3();
+      
+      // Info panel: sites table + overlapping genes
+      const overlappingGenes = reportData.genes.filter(g => g.chrom === chrom && g.end >= startPos && g.start < endPos);
+      
+      document.getElementById('info-panel').innerHTML = `
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px;">
+          <div>
+            <h3 class="section-title" style="font-size: 16px;">Sites in Window</h3>
+            <div class="table-container" style="max-height: 300px; overflow-y: auto;">
+              <table class="sites-table">
+                <thead><tr><th>Pos</th><th>Gene</th><th>Prob</th><th>VAF</th><th>Depth</th><th>Status</th></tr></thead>
+                <tbody>
+                  ${sites.map(s => `
+                    <tr ${highlightPos === s[0] ? 'style="background: var(--accent-muted);"' : ''}>
+                      <td>${formatNumber(s[0])}</td>
+                      <td>${s[5] || '-'}</td>
+                      <td>${s[1].toFixed(3)}</td>
+                      <td>${s[2].toFixed(3)}</td>
+                      <td>${s[3]}</td>
+                      <td><span class="badge ${s[4] ? 'pass' : 'fail'}">${s[4] ? 'Pass' : 'Filtered'}</span></td>
+                    </tr>
+                  `).join('')}
+                  ${sites.length === 0 ? '<tr><td colspan="6" class="empty-state" style="padding: 24px;">No sites in this window</td></tr>' : ''}
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <h3 class="section-title" style="font-size: 16px;">Overlapping Genes</h3>
+            <div class="table-container" style="max-height: 300px; overflow-y: auto;">
+              <table class="sites-table">
+                <thead><tr><th>Gene</th><th>Location</th></tr></thead>
+                <tbody>
+                  ${overlappingGenes.map(g => `
+                    <tr class="clickable" onclick="selectGeneByName('${g.gene}')">
+                      <td>${g.gene}</td>
+                      <td>${formatNumber(g.start)} - ${formatNumber(g.end)}</td>
+                    </tr>
+                  `).join('')}
+                  ${overlappingGenes.length === 0 ? '<tr><td colspan="2" class="empty-state" style="padding: 24px;">No genes overlap this window</td></tr>' : ''}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function drawL3() {
+      if (!l3State) return;
+      const { chrom, mb, highlightPos, sites, maxDepth, xMin, xMax } = l3State;
+      
+      const container = document.getElementById('l3-track-container');
+      if (!container) return;
+      const width = container.clientWidth || 800;
+      const height = 200;
+      const padding = 20;
+      const padBottom = 34;
+      
+      const xSpan = xMax - xMin;
+      
+      const circles = sites.map(s => {
+        const pos = s[0];
+        if (pos < xMin || pos > xMax) return '';
+        const prob = s[1];
+        const vaf = s[2];
+        const depth = s[3];
+        const pass = s[4];
+        const gene = s[5];
+        
+        const cx = padding + ((pos - xMin) / xSpan) * (width - padding * 2);
+        const cy = height - padBottom - (vaf * (height - padding - padBottom));
+        const r = 3 + (depth / maxDepth) * 5;
+        const fill = pass ? 'var(--accent)' : '#d1d5db';
+        const tip = `Pos: ${formatNumber(pos)} | Gene: ${gene || 'Intergenic'} | Prob: ${prob.toFixed(3)} | VAF: ${vaf.toFixed(3)} | Depth: ${depth}`;
+        
+        let highlight = '';
+        if (highlightPos && pos === highlightPos) {
+          highlight = `<circle class="track-highlight" cx="${cx}" cy="${cy}" r="${r + 4}" />`;
+        }
+        
+        return `${highlight}<circle class="track-point" cx="${cx}" cy="${cy}" r="${r}" fill="${fill}" onmouseenter="showTooltip(event, '${tip}')" onmouseleave="hideTooltip()" onmousemove="showTooltip(event, '${tip}')" />`;
+      }).join('');
+      
+      const gridLines = [0, 0.25, 0.5, 0.75, 1].map(v => {
+        const y = height - padBottom - (v * (height - padding - padBottom));
+        return `<line x1="${padding}" y1="${y}" x2="${width - padding}" y2="${y}" stroke="var(--border)" stroke-dasharray="4 4" />
+                <text x="${padding - 4}" y="${y + 4}" font-size="10" fill="var(--text-tertiary)" text-anchor="end">${v}</text>`;
+      }).join('');
+      
+      const rawStep = xSpan / 4;
+      const pow = Math.pow(10, Math.floor(Math.log10(rawStep)));
+      const mant = rawStep / pow;
+      const niceStep = Math.max(100, pow * (mant <= 1 ? 1 : mant <= 2 ? 2 : mant <= 5 ? 5 : 10));
+      const tickStart = Math.ceil(xMin / niceStep) * niceStep;
+      const tickBps = [];
+      for (let bp = tickStart; bp <= xMax; bp += niceStep) tickBps.push(bp);
+      const xTicks = tickBps.map(bp => {
+        const f = (bp - xMin) / xSpan;
+        const x = padding + f * (width - padding * 2);
+        return `<line x1="${x}" y1="${height - padBottom}" x2="${x}" y2="${height - padBottom + 5}" stroke="var(--border)" />
+                <text x="${x}" y="${height - padBottom + 18}" font-size="10" fill="var(--text-tertiary)" text-anchor="middle">${formatNumber(bp)}</text>`;
+      }).join('');
+      
+      const svg = document.getElementById('l3-svg');
+      svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+      svg.innerHTML = `
+        ${gridLines}
+        ${circles}
+        ${xTicks}
+        <text x="${width - padding}" y="${height - 6}" font-size="10" fill="var(--text-secondary)" text-anchor="end">position (bp) on ${chrom}</text>
+      `;
+      
+      document.getElementById('l3-zoom-note').textContent = `showing sites span: ${formatNumber(Math.round(xMin))}–${formatNumber(Math.round(xMax))} bp (zoomed from the ${mb}–${mb + 1} Mb window)`;
+    }
+
+    function setupL3Events() {
+      const container = document.getElementById('l3-track-container');
+      let isDragging = false;
+      let lastX = 0;
+      
+      container.addEventListener('mousedown', e => {
+        isDragging = true;
+        lastX = e.clientX;
+        container.style.cursor = 'grabbing';
+      });
+      
+      window.addEventListener('mousemove', e => {
+        if (!isDragging || !l3State) return;
+        const dx = e.clientX - lastX;
+        lastX = e.clientX;
+        
+        const width = container.clientWidth || 800;
+        const padding = 20;
+        const trackWidth = width - padding * 2;
+        const xSpan = l3State.xMax - l3State.xMin;
+        
+        const bpShift = (dx / trackWidth) * xSpan;
+        l3State.xMin -= bpShift;
+        l3State.xMax -= bpShift;
+        drawL3();
+      });
+      
+      window.addEventListener('mouseup', () => {
+        isDragging = false;
+        if (container) container.style.cursor = '';
+      });
+      
+      container.addEventListener('wheel', e => {
+        e.preventDefault();
+        if (!l3State) return;
+        
+        const zoomFactor = e.deltaY > 0 ? 1.1 : 0.9;
+        
+        const rect = container.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left;
+        const width = container.clientWidth || 800;
+        const padding = 20;
+        const trackWidth = width - padding * 2;
+        
+        const clampedX = Math.max(padding, Math.min(width - padding, mouseX));
+        const f = (clampedX - padding) / trackWidth;
+        
+        const bpUnderCursor = l3State.xMin + f * (l3State.xMax - l3State.xMin);
+        const newSpan = (l3State.xMax - l3State.xMin) * zoomFactor;
+        
+        if (newSpan < 100 && zoomFactor < 1) return;
+        
+        l3State.xMin = bpUnderCursor - f * newSpan;
+        l3State.xMax = l3State.xMin + newSpan;
+        drawL3();
+      }, { passive: false });
+      
+      container.addEventListener('dblclick', () => {
+        resetL3();
+      });
+    }
+
+    function zoomL3(factor) {
+      if (!l3State) return;
+      const mid = (l3State.xMin + l3State.xMax) / 2;
+      const newSpan = (l3State.xMax - l3State.xMin) / factor;
+      if (newSpan < 100 && factor > 1) return;
+      l3State.xMin = mid - newSpan / 2;
+      l3State.xMax = mid + newSpan / 2;
+      drawL3();
+    }
+
+    function resetL3() {
+      if (!l3State) return;
+      l3State.xMin = l3State.origXMin;
+      l3State.xMax = l3State.origXMax;
+      drawL3();
+    }
+
+    // Gene Search
+    function setupGeneSearch() {
+      const searchInput = document.getElementById('gene-search');
+      const dropdown = document.getElementById('search-dropdown');
+      
+      searchInput.addEventListener('input', (e) => {
+        const q = e.target.value.toLowerCase();
+        if (!q) {
+          dropdown.style.display = 'none';
+          return;
+        }
+        filteredGenes = reportData.genes.filter(g => g.gene.toLowerCase().includes(q)).slice(0, 10);
+        activeDropdownIndex = -1;
+        renderDropdown();
+      });
+
+      searchInput.addEventListener('keydown', (e) => {
+        if (dropdown.style.display === 'none') return;
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          activeDropdownIndex = Math.min(activeDropdownIndex + 1, filteredGenes.length - 1);
+          renderDropdown();
+        } else if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          activeDropdownIndex = Math.max(activeDropdownIndex - 1, 0);
+          renderDropdown();
+        } else if (e.key === 'Enter') {
+          e.preventDefault();
+          if (activeDropdownIndex >= 0 && activeDropdownIndex < filteredGenes.length) {
+            selectGene(filteredGenes[activeDropdownIndex]);
+          }
+        }
+      });
+
+      document.addEventListener('click', (e) => {
+        if (!e.target.closest('.search-container')) {
+          dropdown.style.display = 'none';
+        }
+      });
+    }
+
+    function renderDropdown() {
+      const dropdown = document.getElementById('search-dropdown');
+      if (filteredGenes.length === 0) {
+        dropdown.innerHTML = '<div class="dropdown-item" style="color: var(--text-tertiary);">No genes found</div>';
+      } else {
+        dropdown.innerHTML = filteredGenes.map((g, i) => `
+          <div class="dropdown-item ${i === activeDropdownIndex ? 'active' : ''}" onclick="selectGeneByName('${g.gene}')">
+            ${g.gene} <span style="color: var(--text-tertiary); font-size: 12px; margin-left: 8px;">${g.n} sites</span>
+          </div>
+        `).join('');
+      }
+      dropdown.style.display = 'block';
+    }
+
+    window.selectGeneByName = function(name) {
+      const gene = reportData.genes.find(g => g.gene === name);
+      if (gene) selectGene(gene);
+    };
+
+    function selectGene(gene) {
+      document.getElementById('gene-search').value = gene.gene;
+      document.getElementById('search-dropdown').style.display = 'none';
+      document.getElementById('gene-empty').style.display = 'none';
+      document.getElementById('gene-view').style.display = 'block';
+
+      document.getElementById('gene-name').textContent = gene.gene;
+      document.getElementById('gene-summary').textContent = `${gene.n} sites (${gene.pass} confident) • Max prob: ${gene.maxprob.toFixed(3)}`;
+      
+      let dominantMb = 0;
+      if (gene.sites.length > 0) {
+        const topSite = gene.sites.reduce((prev, current) => (prev.prob > current.prob) ? prev : current);
+        dominantMb = Math.floor(topSite.pos / 1000000);
+      } else {
+        dominantMb = Math.floor(gene.start / 1000000);
+      }
+      
+      const link = document.getElementById('gene-link');
+      link.href = `#/${gene.chrom}/${dominantMb}`;
+      link.onclick = () => {
+        document.getElementById('explorer-panel').scrollIntoView({ behavior: 'smooth' });
+      };
+
+      const recodings = reportData.recodings.filter(r => r.gene === gene.gene);
+      const chipContainer = document.getElementById('gene-chips');
+      if (recodings.length > 0) {
+        const counts = {};
+        recodings.forEach(r => { counts[r.change] = (counts[r.change] || 0) + 1; });
+        chipContainer.innerHTML = Object.entries(counts).map(([change, count]) => `
+          <div class="chip">${change} ${count > 1 ? '×' + count : ''}</div>
+        `).join('');
+        chipContainer.style.display = 'flex';
+      } else {
+        chipContainer.style.display = 'none';
+      }
+
+      const positions = gene.sites.map(s => s.pos);
+      const minPos = Math.min(...positions);
+      const maxPos = Math.max(...positions);
+      const posRange = Math.max(maxPos - minPos, 1);
+      const posPad = posRange * 0.05;
+      const xMin = minPos - posPad;
+      const xMax = maxPos + posPad;
+      
+      const depths = gene.sites.map(s => s.depth);
+      const maxDepth = Math.max(...depths, 1);
+
+      geneState = {
+        chrom: gene.chrom, sites: gene.sites, maxDepth,
+        origXMin: xMin, origXMax: xMax,
+        xMin, xMax
+      };
+
+      const trackContainer = document.getElementById('gene-track-container');
+      trackContainer.style.overflow = 'hidden';
+      trackContainer.style.touchAction = 'none';
+      trackContainer.innerHTML = `
+        <div class="zoom-controls">
+          <button class="zoom-btn" onclick="zoomGene(1.5)" title="Zoom In">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+          </button>
+          <button class="zoom-btn" onclick="zoomGene(1/1.5)" title="Zoom Out">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+          </button>
+          <button class="zoom-btn" onclick="resetGene()" title="Reset Zoom">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path><polyline points="3 3 3 8 8 8"></polyline></svg>
+          </button>
+        </div>
+        <svg class="track-svg" id="gene-svg"></svg>
+      `;
+
+      setupGeneEvents();
+      drawGene();
+
+      const tbody = document.getElementById('gene-sites-tbody');
+      tbody.innerHTML = gene.sites.map(s => `
+        <tr>
+          <td>${formatNumber(s.pos)}</td>
+          <td>${s.prob.toFixed(3)}</td>
+          <td>${s.vaf.toFixed(3)}</td>
+          <td>${s.depth}</td>
+          <td><span class="badge ${s.pass ? 'pass' : 'fail'}">${s.pass ? 'Pass' : 'Filtered'}</span></td>
+        </tr>
+      `).join('');
+    }
+
+    function drawGene() {
+      if (!geneState) return;
+      const { chrom, sites, maxDepth, xMin, xMax } = geneState;
+      
+      const container = document.getElementById('gene-track-container');
+      if (!container) return;
+      const width = container.clientWidth || 800;
+      const height = 200;
+      const padding = 20;
+      const padBottom = 34;
+      
+      const xSpan = xMax - xMin;
+      
+      const circles = sites.map(s => {
+        const pos = s.pos;
+        if (pos < xMin || pos > xMax) return '';
+        const prob = s.prob;
+        const vaf = s.vaf;
+        const depth = s.depth;
+        const pass = s.pass;
+        
+        const cx = padding + ((pos - xMin) / xSpan) * (width - padding * 2);
+        const cy = height - padBottom - (vaf * (height - padding - padBottom));
+        const r = 3 + (depth / maxDepth) * 5;
+        const fill = pass ? 'var(--accent)' : '#d1d5db';
+        const tip = `Pos: ${formatNumber(pos)} | Prob: ${prob.toFixed(3)} | VAF: ${vaf.toFixed(3)} | Depth: ${depth}`;
+        
+        return `<circle class="track-point" cx="${cx}" cy="${cy}" r="${r}" fill="${fill}" onmouseenter="showTooltip(event, '${tip}')" onmouseleave="hideTooltip()" onmousemove="showTooltip(event, '${tip}')" />`;
+      }).join('');
+      
+      const gridLines = [0, 0.25, 0.5, 0.75, 1].map(v => {
+        const y = height - padBottom - (v * (height - padding - padBottom));
+        return `<line x1="${padding}" y1="${y}" x2="${width - padding}" y2="${y}" stroke="var(--border)" stroke-dasharray="4 4" />
+                <text x="${padding - 4}" y="${y + 4}" font-size="10" fill="var(--text-tertiary)" text-anchor="end">${v}</text>`;
+      }).join('');
+      
+      const rawStep = xSpan / 4;
+      const pow = Math.pow(10, Math.floor(Math.log10(rawStep)));
+      const mant = rawStep / pow;
+      const niceStep = Math.max(100, pow * (mant <= 1 ? 1 : mant <= 2 ? 2 : mant <= 5 ? 5 : 10));
+      const tickStart = Math.ceil(xMin / niceStep) * niceStep;
+      const tickBps = [];
+      for (let bp = tickStart; bp <= xMax; bp += niceStep) tickBps.push(bp);
+      const xTicks = tickBps.map(bp => {
+        const f = (bp - xMin) / xSpan;
+        const x = padding + f * (width - padding * 2);
+        return `<line x1="${x}" y1="${height - padBottom}" x2="${x}" y2="${height - padBottom + 5}" stroke="var(--border)" />
+                <text x="${x}" y="${height - padBottom + 18}" font-size="10" fill="var(--text-tertiary)" text-anchor="middle">${formatNumber(bp)}</text>`;
+      }).join('');
+      
+      const svg = document.getElementById('gene-svg');
+      svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+      svg.innerHTML = `
+        ${gridLines}
+        ${circles}
+        ${xTicks}
+        <text x="${width - padding}" y="${height - 6}" font-size="10" fill="var(--text-secondary)" text-anchor="end">position (bp) on ${chrom}</text>
+      `;
+    }
+
+    function setupGeneEvents() {
+      const container = document.getElementById('gene-track-container');
+      let isDragging = false;
+      let lastX = 0;
+      
+      container.addEventListener('mousedown', e => {
+        isDragging = true;
+        lastX = e.clientX;
+        container.style.cursor = 'grabbing';
+      });
+      
+      window.addEventListener('mousemove', e => {
+        if (!isDragging || !geneState) return;
+        const dx = e.clientX - lastX;
+        lastX = e.clientX;
+        
+        const width = container.clientWidth || 800;
+        const padding = 20;
+        const trackWidth = width - padding * 2;
+        const xSpan = geneState.xMax - geneState.xMin;
+        
+        const bpShift = (dx / trackWidth) * xSpan;
+        geneState.xMin -= bpShift;
+        geneState.xMax -= bpShift;
+        drawGene();
+      });
+      
+      window.addEventListener('mouseup', () => {
+        isDragging = false;
+        if (container) container.style.cursor = '';
+      });
+      
+      container.addEventListener('wheel', e => {
+        e.preventDefault();
+        if (!geneState) return;
+        
+        const zoomFactor = e.deltaY > 0 ? 1.1 : 0.9;
+        
+        const rect = container.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left;
+        const width = container.clientWidth || 800;
+        const padding = 20;
+        const trackWidth = width - padding * 2;
+        
+        const clampedX = Math.max(padding, Math.min(width - padding, mouseX));
+        const f = (clampedX - padding) / trackWidth;
+        
+        const bpUnderCursor = geneState.xMin + f * (geneState.xMax - geneState.xMin);
+        const newSpan = (geneState.xMax - geneState.xMin) * zoomFactor;
+        
+        if (newSpan < 100 && zoomFactor < 1) return;
+        
+        geneState.xMin = bpUnderCursor - f * newSpan;
+        geneState.xMax = geneState.xMin + newSpan;
+        drawGene();
+      }, { passive: false });
+      
+      container.addEventListener('dblclick', () => {
+        resetGene();
+      });
+    }
+
+    function zoomGene(factor) {
+      if (!geneState) return;
+      const mid = (geneState.xMin + geneState.xMax) / 2;
+      const newSpan = (geneState.xMax - geneState.xMin) / factor;
+      if (newSpan < 100 && factor > 1) return;
+      geneState.xMin = mid - newSpan / 2;
+      geneState.xMax = mid + newSpan / 2;
+      drawGene();
+    }
+
+    function resetGene() {
+      if (!geneState) return;
+      geneState.xMin = geneState.origXMin;
+      geneState.xMax = geneState.origXMax;
+      drawGene();
+    }
+
+    // Recoded Proteins
+    function setupRecodedSearch() {
+      const input = document.getElementById('recoded-search');
+      input.addEventListener('input', renderRecodedTable);
+      renderRecodedTable();
+    }
+
+    function renderRecodedTable() {
+      const q = document.getElementById('recoded-search').value.toLowerCase();
+      const tbody = document.getElementById('recoded-tbody');
+      
+      const filtered = reportData.recodings.filter(r => 
+        r.gene.toLowerCase().includes(q) || r.change.toLowerCase().includes(q)
+      ).slice(0, 100); // Limit to 100 for performance
+      
+      tbody.innerHTML = filtered.map(r => {
+        const mb = Math.floor(r.pos / 1000000);
+        return `
+          <tr class="clickable" onclick="window.location.hash = '#/${r.chrom}/${mb}/${r.pos}'; document.getElementById('explorer-panel').scrollIntoView({ behavior: 'smooth' });">
+            <td style="font-weight: 500;">${r.gene}</td>
+            <td><span class="chip" style="margin: 0;">${r.change}</span></td>
+            <td>${r.chrom}:${formatNumber(r.pos)}</td>
+            <td>${r.prob.toFixed(3)}</td>
+            <td>${r.vaf.toFixed(3)}</td>
+            <td>${r.depth}</td>
+            <td><span class="badge ${r.pass ? 'pass' : 'fail'}">${r.pass ? 'Pass' : 'Filtered'}</span></td>
+          </tr>
+        `;
+      }).join('');
+      
+      if (filtered.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="7" class="empty-state">No recoded proteins match your search</td></tr>';
+      }
+    }
+
+    
+    
+    let resizeTimeout;
+    window.addEventListener('resize', () => {
+      clearTimeout(resizeTimeout);
+      resizeTimeout = setTimeout(() => {
+        drawL2();
+        drawL3();
+        drawGene();
+      }, 100);
+    });
+    init();
+  </script>
+</body>
+</html>

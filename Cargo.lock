@@ -619,6 +619,7 @@ dependencies = [
  "esperanto-map",
  "esperanto-pile",
  "esperanto-qc",
+ "esperanto-report",
  "esperanto-scan",
  "esperanto-score",
  "esperanto-tidx",
@@ -647,6 +648,7 @@ dependencies = [
  "esperanto-engine",
  "esperanto-map",
  "esperanto-qc",
+ "esperanto-report",
  "esperanto-scan",
  "esperanto-score",
  "flate2",
@@ -691,6 +693,15 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "esperanto-report"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

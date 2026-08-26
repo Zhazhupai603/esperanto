@@ -10,6 +10,7 @@ members = [
     "crates/map",
 "crates/scan",
     "crates/score",
+    "crates/report",
     "crates/flow",
     "crates/cli",
 ]

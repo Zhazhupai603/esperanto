@@ -21,6 +21,13 @@ dependencies beyond a reference FASTA and its index.
 - Unmapped reads get a second pass against a collapsed-alphabet index (A==G,
   T==C), which recovers hyperedited reads; survivors are written back with
   MAPQ 0 and an `RE:Z:collapsed` tag
+<<<<<<< HEAD
+=======
+- Every run ends with a self-contained HTML report (`out/report.html`, opens
+  in any browser): sample metrics, a drill-down genome explorer (chromosome →
+  1 Mb window → per-base site track), gene search, and the recoded-protein
+  table (amino-acid changes from A-to-I edits)
+>>>>>>> dev/l1-experiment
 - Strand-resolved candidate calling from BAM or the binary `.baln` channel
 - Site scoring with a frozen Caduceus-Mamba model (pileup veto gate, 5-fold
   ensemble); AUROC 0.998 on the frozen evaluation corpus
@@ -35,8 +42,12 @@ Pre-built binary (Linux x86_64):
 curl -fsSL https://github.com/Zhazhupai603/esperanto/releases/latest/download/install.sh | sh
 ```
 
-This installs `esperanto` into `~/.local/bin` and the model bundle into
-`~/.local/share/esperanto/bundle`. Re-run the same command to upgrade.
+The installer places:
+
+- the `esperanto` binary — `~/.local/bin/`
+- the model bundle — `~/.local/share/esperanto/bundle/`
+
+Re-run the same command to upgrade.
 
 Build from source (stable Rust toolchain):
 
@@ -55,8 +66,8 @@ First-time reference setup — one command:
 esperanto setup
 ```
 
-Setup works in the refs directory (`~/.local/share/esperanto/refs`; override
-with `ESPERANTO_REFS`). It detects a reference FASTA + GTF placed there, or
+Setup works in the refs directory — default `~/.local/share/esperanto/refs`,
+override with `ESPERANTO_REFS`. It detects a reference FASTA + GTF placed there, or
 downloads the GENCODE GRCh38 reference + annotation when the directory is
 empty, validates the files before building (both must parse, GTF contig names
 must match FASTA contig names, and the species guardrail must hold), and
@@ -103,7 +114,11 @@ esperanto run --bam sample.sorted.bam --fasta ref.fa --out out/
 
 The main output is `out/sites.vcf`: one row per called site, `FILTER=PASS`
 when `RE_PROB >= 0.5`, with `RE_PROB`, `VAF`, `DEPTH`, strand, and evidence
+<<<<<<< HEAD
 annotations.
+=======
+annotations. Open `out/report.html` in a browser for the interactive report.
+>>>>>>> dev/l1-experiment
 
 The bundled model targets human hg38. References whose `chr1` length matches
 neither hg38 (248956422) nor a small test genome (< 10 Mb) are rejected.
@@ -123,7 +138,12 @@ esperanto <COMMAND> [OPTIONS]
 | `pile` | 8-dim pileup features for a single site or a site list |
 | `scan` | Strand-resolved candidate editing-site discovery (BAM or `.baln`) |
 | `score` | RE_PROB scoring: encoder + pileup veto gate + 5-fold ensemble |
+<<<<<<< HEAD
 | `run` | Full pipeline: qc → map → sort → scan → filter → score → vcf |
+=======
+| `run` | Full pipeline: qc → map → sort → scan → filter → score → vcf + HTML report |
+| `report` | Regenerate the HTML report for an existing run directory |
+>>>>>>> dev/l1-experiment
 
 Each subcommand supports `--help`.
 
@@ -168,6 +188,10 @@ discovery.
 | `out/scan/candidates.bed` | candidate sites (coordinate, strand, evidence, score, depth, allele frequency) |
 | `out/score/scores.tsv` | `chrom`, `pos`, `RE_PROB` for every scored site |
 | `out/sites.vcf` | final calls |
+<<<<<<< HEAD
+=======
+| `out/report.html` | self-contained interactive report (metrics, genome explorer, gene search, recoded proteins) |
+>>>>>>> dev/l1-experiment
 
 ## Guarantees
 

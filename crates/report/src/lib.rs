@@ -1,0 +1,466 @@
+//! esperanto-report - self-contained HTML report for a finished run
+//! directory.
+//!
+//! Reads `<out>/sites.vcf`, `<out>/qc/qc.json` and `<out>/map/align_qc.json`
+//! plus the reference FASTA (`.fai` required) and GTF, then packs per-gene
+//! aggregation, genome heat maps (5 Mb / 1 Mb) and recoding (amino-acid
+//! change) annotations into the embedded report template. The data is
+//! inlined as a JS object literal so `report.html` renders standalone from
+//! `file://`.
+//!
+//! Data semantics are ported verbatim from the validated reference
+//! implementation; every threshold, ordering and rounding rule here is
+//! contract, not taste.
+
+mod annotate;
+
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+
+use annotate::{Annotation, Recoder};
+use anyhow::{bail, Context};
+use fasta::FastaIndex;
+use serde::Serialize;
+
+mod fasta;
+
+/// Embedded UI template; the `__ESPERANTO_DATA__` marker line is replaced
+/// with the serialized data pack.
+const TEMPLATE: &str = include_str!("report_template.html");
+/// Marker replaced by the data pack (must occur exactly once).
+const MARKER: &str = "null; // __ESPERANTO_DATA__";
+/// Per-gene top-sites cap.
+const GENE_SITES_CAP: usize = 60;
+/// Minimum probability for a site to enter a gene's site list.
+const GENE_SITE_MIN_PROB: f64 = 0.3;
+/// Minimum probability for the recoding check.
+const RECODE_MIN_PROB: f64 = 0.2;
+
+/// Decimal rounding that matches the reference implementation: correct
+/// decimal rounding of the exact binary value, ties to even, then back to
+/// the nearest f64.
+fn round_dp(x: f64, dp: usize) -> f64 {
+    format!("{x:.dp$}").parse().unwrap_or(x)
+}
+
+/// One VCF site row.
+struct Site {
+    chrom: String,
+    pos: i64,
+    prob: f64,
+    vaf: f64,
+    depth: i64,
+    pass_: bool,
+    gene: String,
+}
+
+/// Output document (field order mirrors the reference data pack).
+#[derive(Serialize)]
+struct DataPack {
+    sample: String,
+    metrics: Metrics,
+    chroms: Vec<ChromLen>,
+    heat5: BTreeMap<String, Vec<f64>>,
+    heat1: BTreeMap<String, Vec<f64>>,
+    sites: BTreeMap<String, Vec<SiteRow>>,
+    recodings: Vec<Recoding>,
+    genes: Vec<GeneOut>,
+}
+
+#[derive(Serialize)]
+struct Metrics {
+    events: u64,
+    pass: u64,
+    reads_in: u64,
+    map_rate: f64,
+    rescued: u64,
+    recodings: u64,
+}
+
+#[derive(Serialize)]
+struct ChromLen {
+    chrom: String,
+    len: i64,
+}
+
+/// Site row serialized as `[pos, prob, vaf, depth, pass, gene]`.
+#[derive(Serialize)]
+struct SiteRow(i64, f64, f64, i64, i64, String);
+
+#[derive(Serialize)]
+struct Recoding {
+    gene: String,
+    chrom: String,
+    pos: i64,
+    change: String,
+    prob: f64,
+    vaf: f64,
+    depth: i64,
+    pass: i64,
+}
+
+#[derive(Serialize)]
+struct GeneOut {
+    gene: String,
+    chrom: String,
+    start: i64,
+    end: i64,
+    n: u64,
+    pass: u64,
+    maxprob: f64,
+    n_rec: u64,
+    sites: Vec<GeneSiteOut>,
+}
+
+#[derive(Clone, Serialize)]
+struct GeneSiteOut {
+    pos: i64,
+    prob: f64,
+    vaf: f64,
+    depth: i64,
+    pass: i64,
+}
+
+/// Per-gene accumulator (insertion order preserved for stable sorting).
+struct GeneAcc {
+    gene: String,
+    n: u64,
+    pass: u64,
+    maxprob: f64,
+    n_rec: u64,
+    sites: Vec<GeneSiteOut>,
+}
+
+/// Parse `<out>/sites.vcf`: INFO keys RE_PROB / VAF / DEPTH (defaults 0),
+/// FILTER column `PASS`.
+fn read_sites(vcf: &Path) -> anyhow::Result<Vec<Site>> {
+    let text =
+        std::fs::read_to_string(vcf).with_context(|| format!("reading {}", vcf.display()))?;
+    let mut sites = Vec::new();
+    for (ln, line) in text.lines().enumerate() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 8 {
+            bail!("{} line {}: expected >= 8 columns", vcf.display(), ln + 1);
+        }
+        let pos: i64 = f[1]
+            .parse()
+            .with_context(|| format!("{} line {}: bad POS '{}'", vcf.display(), ln + 1, f[1]))?;
+        let (mut prob, mut vaf, mut depth) = (0.0f64, 0.0f64, 0i64);
+        for part in f[7].split(';') {
+            if let Some((k, v)) = part.split_once('=') {
+                match k {
+                    "RE_PROB" => {
+                        prob = v.parse().with_context(|| {
+                            format!("{} line {}: bad RE_PROB '{v}'", vcf.display(), ln + 1)
+                        })?
+                    }
+                    "VAF" => {
+                        vaf = v.parse().with_context(|| {
+                            format!("{} line {}: bad VAF '{v}'", vcf.display(), ln + 1)
+                        })?
+                    }
+                    "DEPTH" => {
+                        depth = v.parse().with_context(|| {
+                            format!("{} line {}: bad DEPTH '{v}'", vcf.display(), ln + 1)
+                        })?
+                    }
+                    _ => {}
+                }
+            }
+        }
+        sites.push(Site {
+            chrom: f[0].to_string(),
+            pos,
+            prob,
+            vaf,
+            depth,
+            pass_: f[6] == "PASS",
+            gene: String::new(),
+        });
+    }
+    Ok(sites)
+}
+
+/// metrics inputs: `qc/qc.json` `summary.reads_before`, `map/align_qc.json`
+/// `mapping_rate` and `rescued_collapsed`. Missing artifacts (Bam-entry
+/// runs have no qc/ or map/) count as zero; an `align_qc.json` predating
+/// the `rescued_collapsed` key reads as 0 (backward compatible).
+fn read_metrics(out_dir: &Path) -> anyhow::Result<(u64, f64, u64)> {
+    let mut reads_in = 0u64;
+    if let Ok(text) = std::fs::read_to_string(out_dir.join("qc").join("qc.json")) {
+        let v: serde_json::Value = serde_json::from_str(&text).context("parsing qc/qc.json")?;
+        if let Some(n) = v["summary"]["reads_before"].as_u64() {
+            reads_in = n;
+        }
+    }
+    let mut map_rate = 0.0f64;
+    let mut rescued = 0u64;
+    if let Ok(text) = std::fs::read_to_string(out_dir.join("map").join("align_qc.json")) {
+        let v: serde_json::Value =
+            serde_json::from_str(&text).context("parsing map/align_qc.json")?;
+        if let Some(r) = v["mapping_rate"].as_f64() {
+            map_rate = r;
+        }
+        if let Some(n) = v["rescued_collapsed"].as_u64() {
+            rescued = n;
+        }
+    }
+    Ok((reads_in, map_rate, rescued))
+}
+
+/// Reportable chromosomes straight from the `.fai` in file order:
+/// `chr`-prefixed, no `_` (decoys/alternates), excluding `chrM`.
+fn report_chroms(fa: &FastaIndex) -> Vec<ChromLen> {
+    fa.contigs()
+        .iter()
+        .filter(|(n, _)| n.starts_with("chr") && !n.contains('_') && n != "chrM")
+        .map(|(n, l)| ChromLen {
+            chrom: n.clone(),
+            len: *l,
+        })
+        .collect()
+}
+
+/// PASS-site probability mass per `win`-sized window, rounded to 2 dp.
+fn mkheat(sites: &[Site], chroms: &[ChromLen], win: i64) -> BTreeMap<String, Vec<f64>> {
+    let mut vals: HashMap<&str, Vec<f64>> = chroms
+        .iter()
+        .map(|c| (c.chrom.as_str(), vec![0.0; (c.len / win + 1) as usize]))
+        .collect();
+    for s in sites {
+        if !s.pass_ {
+            continue;
+        }
+        if let Some(v) = vals.get_mut(s.chrom.as_str()) {
+            v[(s.pos / win) as usize] += s.prob;
+        }
+    }
+    vals.into_iter()
+        .map(|(k, v)| {
+            (
+                k.to_string(),
+                v.into_iter().map(|x| round_dp(x, 2)).collect(),
+            )
+        })
+        .collect()
+}
+
+/// Generate `<out>/report.html`; returns its path.
+pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<PathBuf> {
+    let mut sites = read_sites(&out_dir.join("sites.vcf"))?;
+    let ann = Annotation::load(gtf)?;
+    let mut fa = FastaIndex::open(fasta)?;
+    let chroms = report_chroms(&fa);
+    let (reads_in, map_rate, rescued) = read_metrics(out_dir)?;
+
+    // Gene annotation + aggregation + recoding in one VCF-order pass.
+    let mut per_gene: Vec<GeneAcc> = Vec::new();
+    let mut gene_idx: HashMap<String, usize> = HashMap::new();
+    let mut recodings: Vec<Recoding> = Vec::new();
+    let mut recoder = Recoder::new(&mut fa, &ann);
+    for s in &mut sites {
+        let g = ann.gene_at(&s.chrom, s.pos).map(str::to_owned);
+        if let Some(ref gname) = g {
+            s.gene = gname.clone();
+            let gi = *gene_idx.entry(gname.clone()).or_insert_with(|| {
+                per_gene.push(GeneAcc {
+                    gene: gname.clone(),
+                    n: 0,
+                    pass: 0,
+                    maxprob: 0.0,
+                    n_rec: 0,
+                    sites: Vec::new(),
+                });
+                per_gene.len() - 1
+            });
+            let pg = &mut per_gene[gi];
+            pg.n += 1;
+            pg.pass += u64::from(s.pass_);
+            pg.maxprob = pg.maxprob.max(s.prob);
+            if s.prob >= GENE_SITE_MIN_PROB {
+                pg.sites.push(GeneSiteOut {
+                    pos: s.pos,
+                    prob: round_dp(s.prob, 3),
+                    vaf: round_dp(s.vaf, 3),
+                    depth: s.depth,
+                    pass: i64::from(s.pass_),
+                });
+            }
+        }
+        if s.prob < RECODE_MIN_PROB {
+            continue;
+        }
+        // First valid transcript hit per site (transcripts sorted by CDS
+        // start per chrom); candidate span check uses the raw VCF pos.
+        let mut hit: Option<(char, char, i64, String)> = None;
+        for (c0, c1, tid) in ann.transcripts(&s.chrom) {
+            if *c0 > s.pos {
+                break;
+            }
+            if *c0 <= s.pos && s.pos < *c1 {
+                if let Some((ra, aa, ap)) = recoder.recode_at(tid, s.pos)? {
+                    hit = Some((ra, aa, ap, tid.clone()));
+                    break;
+                }
+            }
+        }
+        if let Some((ra, aa, ap, tid)) = hit {
+            let tgene = recoder.gene_of(&tid);
+            recodings.push(Recoding {
+                gene: tgene,
+                chrom: s.chrom.clone(),
+                pos: s.pos,
+                change: format!("{ra}{ap}{aa}"),
+                prob: round_dp(s.prob, 3),
+                vaf: round_dp(s.vaf, 3),
+                depth: s.depth,
+                pass: i64::from(s.pass_),
+            });
+            if let Some(&gi) = gene_idx.get(s.gene.as_str()) {
+                per_gene[gi].n_rec += 1;
+            }
+        }
+    }
+
+    // Sites arrays per chrom, sorted lexicographically by the full row.
+    let mut per_chrom: BTreeMap<String, Vec<SiteRow>> = BTreeMap::new();
+    for s in &sites {
+        per_chrom.entry(s.chrom.clone()).or_default().push(SiteRow(
+            s.pos,
+            round_dp(s.prob, 3),
+            round_dp(s.vaf, 3),
+            s.depth,
+            i64::from(s.pass_),
+            s.gene.clone(),
+        ));
+    }
+    for v in per_chrom.values_mut() {
+        v.sort_by(cmp_site_row);
+    }
+
+    // Recodings by probability descending (stable).
+    recodings.sort_by(|a, b| b.prob.total_cmp(&a.prob));
+
+    // Genes by unrounded maxprob descending (stable, insertion order on
+    // ties), dropping names without gene coordinates.
+    let mut gene_pairs: Vec<(f64, GeneOut)> = per_gene
+        .iter()
+        .filter_map(|pg| {
+            let (gchrom, gstart, gend) = ann.gene_coord(&pg.gene)?;
+            let mut top = pg.sites.clone();
+            top.sort_by(|a, b| b.prob.total_cmp(&a.prob));
+            Some((
+                pg.maxprob,
+                GeneOut {
+                    gene: pg.gene.clone(),
+                    chrom: gchrom.to_string(),
+                    start: gstart,
+                    end: gend,
+                    n: pg.n,
+                    pass: pg.pass,
+                    maxprob: round_dp(pg.maxprob, 3),
+                    n_rec: pg.n_rec,
+                    sites: top.into_iter().take(GENE_SITES_CAP).collect(),
+                },
+            ))
+        })
+        .collect();
+    gene_pairs.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let gene_out: Vec<GeneOut> = gene_pairs.into_iter().map(|(_, g)| g).collect();
+
+    let heat5 = mkheat(&sites, &chroms, 5_000_000);
+    let heat1 = mkheat(&sites, &chroms, 1_000_000);
+    let pack = DataPack {
+        sample: out_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "run".to_string()),
+        metrics: Metrics {
+            events: sites.len() as u64,
+            pass: sites.iter().filter(|s| s.pass_).count() as u64,
+            reads_in,
+            map_rate,
+            rescued,
+            recodings: recodings.len() as u64,
+        },
+        chroms,
+        heat5,
+        heat1,
+        sites: per_chrom,
+        recodings,
+        genes: gene_out,
+    };
+    let html = render(&pack)?;
+    let out_path = out_dir.join("report.html");
+    std::fs::write(&out_path, &html).with_context(|| format!("writing {}", out_path.display()))?;
+    Ok(out_path)
+}
+
+/// Lexicographic row comparison mirroring the reference list-of-lists sort:
+/// pos, prob, vaf, depth, pass, gene.
+fn cmp_site_row(a: &SiteRow, b: &SiteRow) -> std::cmp::Ordering {
+    a.0.cmp(&b.0)
+        .then(a.1.total_cmp(&b.1))
+        .then(a.2.total_cmp(&b.2))
+        .then(a.3.cmp(&b.3))
+        .then(a.4.cmp(&b.4))
+        .then(a.5.cmp(&b.5))
+}
+
+/// Serialize the pack and splice it into the template at the marker line.
+fn render(pack: &DataPack) -> anyhow::Result<String> {
+    if TEMPLATE.matches(MARKER).count() != 1 {
+        bail!("report template marker missing or duplicated");
+    }
+    let json = serde_json::to_string(pack)?;
+    // `</` guard: keep any string content from terminating the script tag.
+    let json = json.replace("</", "<\\/");
+    Ok(TEMPLATE.replacen(MARKER, &format!("{json};"), 1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_dp_matches_reference_conventions() {
+        // Ties to even on exactly representable halves (0.0625 and 0.1875
+        // are exact in binary; 0.0615 is not - its exact value sits below
+        // the tie, so it rounds down, matching the reference).
+        assert_eq!(round_dp(0.0625, 3), 0.062);
+        assert_eq!(round_dp(0.1875, 3), 0.188);
+        assert_eq!(round_dp(0.0615, 3), 0.061);
+        assert_eq!(round_dp(0.9662381, 3), 0.966);
+        assert_eq!(round_dp(85.529999, 2), 85.53);
+    }
+
+    #[test]
+    fn render_embeds_data_with_script_guard() {
+        let pack = DataPack {
+            sample: "s</script>x".into(),
+            metrics: Metrics {
+                events: 1,
+                pass: 1,
+                reads_in: 2,
+                map_rate: 0.5,
+                rescued: 0,
+                recodings: 0,
+            },
+            chroms: vec![],
+            heat5: BTreeMap::new(),
+            heat1: BTreeMap::new(),
+            sites: BTreeMap::new(),
+            recodings: vec![],
+            genes: vec![],
+        };
+        let html = render(&pack).unwrap();
+        assert!(html.contains("const EMBEDDED_DATA = {"));
+        assert!(!html.contains("null; // __ESPERANTO_DATA__"));
+        // The literal `</script>` inside the data must be escaped.
+        assert!(!html[..html.find("let reportData").unwrap()].contains("</script>x"));
+        assert!(html.contains("s<\\/script>x"));
+    }
+}

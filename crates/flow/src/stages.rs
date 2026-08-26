@@ -107,7 +107,21 @@ pub fn run(params: &RunParams) -> Result<(), FlowError> {
 
     let probs = stage_score(params, &current_bam, &sites)?;
     vcf::write_vcf(params, entry, &sites, &probs)?;
+    stage_report(params);
     Ok(())
+}
+
+/// Report stage (best-effort): pack the finished run directory into a
+/// standalone `<out>/report.html`. A report failure must never lose the
+/// science outputs — errors are printed and the pipeline still succeeds.
+fn stage_report(params: &RunParams) {
+    match params.gtf.as_deref() {
+        Some(gtf) => match esperanto_report::generate(&params.out_dir, &params.fasta, gtf) {
+            Ok(p) => eprintln!("[report] written: {}", p.display()),
+            Err(e) => eprintln!("[report] warning: report generation failed: {e}"),
+        },
+        None => eprintln!("[report] warning: no GTF available; skipped report.html"),
+    }
 }
 
 /// Bam/BamSites entry contract: input BAM must already be coordinate-sorted
@@ -543,6 +557,17 @@ fn rescue_collapsed(
         w.flush()?;
     }
     fs::rename(&merged, raw_bam)?;
+    // Record the placement count into align_qc.json (the rescue runs after
+    // the stats document is written, so the key is patched in here; the
+    // report stage reads it, treating absence as 0).
+    {
+        let p = map_dir.join("align_qc.json");
+        let mut stats: esperanto_map::stats::AlignStats =
+            serde_json::from_str(&fs::read_to_string(&p)?).map_err(stage_err("map"))?;
+        stats.rescued_collapsed = Some(rescued.len() as u64);
+        let json = serde_json::to_string_pretty(&stats).map_err(stage_err("map"))?;
+        fs::write(&p, format!("{json}\n"))?;
+    }
     eprintln!(
         "[rescue] collapsed: {} of {} unmapped placed (MAPQ 0)",
         rescued.len(),
