@@ -46,11 +46,33 @@ cargo build --release
 
 ## Quick start
 
-Build the alignment index (once per reference):
+First-time reference setup (detects files in the refs directory
+`~/.local/share/esperanto/refs`, or downloads the GENCODE GRCh38 reference +
+annotation when empty, then builds the index in place):
+
+```sh
+esperanto setup
+```
+
+This also installs the scoring model bundle (from the release tarball) when
+none is present — after `setup`, `esperanto run --r1 reads.fq.gz --out out/`
+needs no reference flags at all.
+
+To use your own reference instead, place `<name>.fa` and `<name>.gtf` in that
+directory (compressed `.gz` files are decompressed automatically) and run the
+same command. Set `ESPERANTO_REFS` to use a different directory. Setup
+validates the files before building: both must parse, GTF contig names must
+match FASTA contig names, and the species guardrail must hold.
+
+Alternatively, build the alignment index by hand (once per reference):
 
 ```sh
 samtools faidx ref.fa
 esperanto index --fasta ref.fa --out ref.paidx
+
+# with a transcript annotation, the L1 engine bundle is built in the same pass
+esperanto index --fasta ref.fa --gtf genes.gtf --out ref.paidx
+# -> ref.paidx + ref.bndl + ref.tidx
 ```
 
 Run the full pipeline:
@@ -86,8 +108,9 @@ esperanto <COMMAND> [OPTIONS]
 | Command | Purpose |
 |---|---|
 | `index` | Build a paidx alignment index from a reference FASTA |
+| `setup` | One-step reference environment: fetch/detect references + build the index |
 | `qc` | FASTQ quality control (trimming, filtering, `qc.json`/`qc.html`) |
-| `map` | Splice-aware alignment (RNA 2-pass); writes `raw.bam` + `align.baln` |
+| `map` | Splice-aware alignment; single-pass with the L1 engine, 2-pass junction discovery otherwise |
 | `pile` | 8-dim pileup features for a single site or a site list |
 | `scan` | Strand-resolved candidate editing-site discovery (BAM or `.baln`) |
 | `score` | RE_PROB scoring: encoder + pileup veto gate + 5-fold ensemble |
@@ -109,7 +132,8 @@ When an option is omitted, inputs are resolved automatically (first hit wins):
 
 - Model bundle: `ESPERANTO_BUNDLE`, package layout (`bundle/` next to the
   binary), user data dir (`~/.local/share/esperanto/bundle`).
-- L1 bundle: `--l1-bundle`, `ESPERANTO_L1_BUNDLE`, `<index stem>.bndl` next to
+- L1 bundle: `--l1-bundle`, `ESPERANTO_L1_BUNDLE`, `<index stem>.bndl` (with its
+  `<index stem>.tidx` sidecar) next to
   the alignment index. If none is found, alignment runs the genomic layer only
   (a note is printed).
 - Reference files: `ESPERANTO_REFS`, package `refs/`, user data dir, `./refs`.
@@ -119,7 +143,7 @@ When an option is omitted, inputs are resolved automatically (first hit wins):
 
 | Entry | Required | Optional |
 |---|---|---|
-| FASTQ (PE/SE) | `--r1` [`--r2`], `--index`, `--fasta` (+`.fai`) | `--gtf`, `--l1-bundle`, `--gnomad` |
+| FASTQ (PE/SE) | `--r1` [`--r2`]; `--index` and `--fasta` are auto-resolved from the refs directory after `setup` | `--gtf`, `--l1-bundle`, `--gnomad` |
 | BAM | `--bam` (sorted + indexed), `--fasta` | `--gtf`, `--gnomad` |
 | BAM + sites | `--bam`, `--sites`, `--fasta` | `--gtf`, `--gnomad` |
 

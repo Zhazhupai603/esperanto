@@ -534,7 +534,7 @@ pub fn run_se_2pass(
     // available and the genome fallback detects novel introns from the seed
     // chain — pass1 discovery adds nothing. Single-pass keeps the same map
     // rate at half the cost.
-    if false { // TEMP: force 2-pass to test novel recovery
+    if out.l1.is_some() {
         let (stats, _) = run_se(out, r1, threads)?;
         return Ok((stats, Vec::new(), Vec::new()));
     }
@@ -584,7 +584,7 @@ pub fn run_pe_2pass(
     // available and the genome fallback detects novel introns from the seed
     // chain — pass1 discovery adds nothing. Single-pass keeps the same map
     // rate at half the cost.
-    if false { // TEMP: force 2-pass to test novel recovery
+    if out.l1.is_some() {
         let (stats, _) = run_pe(out, r1, r2, threads)?;
         return Ok((stats, Vec::new(), Vec::new()));
     }

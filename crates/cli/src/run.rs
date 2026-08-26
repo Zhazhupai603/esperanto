@@ -56,27 +56,28 @@ pub struct RunArgs {
 
 pub fn run(a: RunArgs) -> anyhow::Result<()> {
     let bundle = crate::resolve::bundle(&a.bundle)?;
-    let l1_bundle = a
-        .index
-        .as_ref()
-        .and_then(|idx| crate::resolve::l1_bundle(&a.l1_bundle, idx));
+    let mut index = a.index;
     let mut fasta = a.fasta;
     let mut gtf = a.gtf;
     let mut gnomad = a.gnomad;
-    if fasta.is_none() || gtf.is_none() || gnomad.is_none() {
+    if index.is_none() || fasta.is_none() || gtf.is_none() || gnomad.is_none() {
         if let Some(refs) = crate::resolve::refs() {
+            refs.fill_index(&mut index);
             refs.fill_fasta(&mut fasta);
             refs.fill_gtf(&mut gtf);
             refs.fill_gnomad(&mut gnomad);
         }
     }
+    let l1_bundle = index
+        .as_ref()
+        .and_then(|idx| crate::resolve::l1_bundle(&a.l1_bundle, idx));
     let fasta = crate::resolve::require_fasta(fasta)?;
     let params = esperanto_flow::RunParams {
         r1: a.r1,
         r2: a.r2,
         bam: a.bam,
         sites: a.sites,
-        index: a.index,
+        index,
         fasta,
         gtf,
         gnomad,

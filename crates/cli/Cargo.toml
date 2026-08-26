@@ -18,3 +18,8 @@ esperanto-pile = { path = "../pile" }
 esperanto-scan = { path = "../scan" }
 esperanto-score = { path = "../score" }
 esperanto-flow = { path = "../flow" }
+esperanto-engine = { path = "../engine" }
+esperanto-tidx = { path = "../tidx" }
+flate2.workspace = true
+tar.workspace = true
+ureq.workspace = true

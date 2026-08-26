@@ -22,6 +22,22 @@ pub fn threads(t: usize) -> usize {
     }
 }
 
+/// The user-data refs directory (`~/.local/share/esperanto/refs`,
+/// `ESPERANTO_HOME`/`XDG_DATA_HOME` aware) — the fixed `setup` folder.
+pub fn home_refs_dir() -> PathBuf {
+    home_data_dir()
+        .unwrap_or_else(|| PathBuf::from("refs"))
+        .join("refs")
+}
+
+/// The user-data model bundle directory
+/// (`~/.local/share/esperanto/bundle`) — the `setup` install target.
+pub fn home_bundle_dir() -> PathBuf {
+    home_data_dir()
+        .unwrap_or_else(|| PathBuf::from("bundle"))
+        .join("bundle")
+}
+
 fn home_data_dir() -> Option<PathBuf> {
     if let Ok(v) = std::env::var("ESPERANTO_HOME") {
         return Some(PathBuf::from(v));
@@ -86,9 +102,21 @@ pub struct Refs {
     pub gtf: Option<PathBuf>,
     /// First `dbsnp*`/`gnomad*` `*.vcf.gz`.
     pub gnomad: Option<PathBuf>,
+    /// First `*.paidx` alignment index.
+    pub index: Option<PathBuf>,
 }
 
 fn refs_in(dir: &Path) -> Option<Refs> {
+    let index = {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "paidx"))
+            .collect();
+        v.sort();
+        v.into_iter().next()
+    };
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .ok()?
         .filter_map(|e| e.ok())
@@ -113,6 +141,7 @@ fn refs_in(dir: &Path) -> Option<Refs> {
         fasta: Some(fasta),
         gtf,
         gnomad,
+        index,
     })
 }
 
@@ -158,6 +187,13 @@ impl Refs {
             *gnomad = self.gnomad.clone();
         }
     }
+
+    /// Fill `index` when unset.
+    pub fn fill_index(&self, index: &mut Option<PathBuf>) {
+        if index.is_none() {
+            *index = self.index.clone();
+        }
+    }
 }
 
 /// A required fasta after resolution, or an actionable error.
@@ -183,7 +219,15 @@ pub fn l1_bundle(explicit: &Option<PathBuf>, index: &Path) -> Option<PathBuf> {
     }
     let sibling = index.with_extension("bndl");
     if sibling.is_file() {
-        return Some(sibling);
+        // The runtime needs the .tidx sidecar next to the .bndl.
+        if sibling.with_extension("tidx").is_file() {
+            return Some(sibling);
+        }
+        eprintln!(
+            "[resolve] {} has no .tidx sidecar; running pure G layer",
+            sibling.display()
+        );
+        return None;
     }
     eprintln!(
         "[resolve] L1 bundle not found (tried ESPERANTO_L1_BUNDLE, {}); running pure G layer",

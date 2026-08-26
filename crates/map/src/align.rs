@@ -129,8 +129,7 @@ impl<'a> Aligner<'a> {
             .l1
             .as_ref()
             .and_then(|l1| l1.contig_name(contig))
-            .and_then(|name| self.index.reference.contig_index(name.as_bytes()))
-            .unwrap_or(contig);
+            .and_then(|name| self.index.reference.contig_index(name.as_bytes()))?;
 
         let map_strand = match strand {
             esperanto_engine::Strand::Plus => Strand::Plus,

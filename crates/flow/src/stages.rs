@@ -237,7 +237,20 @@ pub fn map_stage(
         None => None,
     };
     let l1 = match l1_bundle {
-        Some(p) => Some(Arc::new(L1Index::open(p).map_err(stage_err("map"))?)),
+        Some(p) => {
+            let l1 = L1Index::open(p).map_err(stage_err("map"))?;
+            // Reference agreement guard: every L1 projection contig must
+            // exist in the paidx reference — a mismatched bundle/index pair
+            // would project reads onto wrong contigs.
+            for name in l1.txmap().contigs() {
+                if index.reference.contig_index(name.as_bytes()).is_none() {
+                    return Err(FlowError::Entry(format!(
+                        "L1 bundle contig '{name}' is absent from the index reference; the .bndl/.tidx pair must be built from the same reference as the paidx"
+                    )));
+                }
+            }
+            Some(Arc::new(l1))
+        }
         None => None,
     };
 

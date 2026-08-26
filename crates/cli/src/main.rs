@@ -12,6 +12,7 @@ mod resolve;
 mod run;
 mod scan;
 mod score;
+mod setup;
 
 use clap::{Parser, Subcommand};
 
@@ -39,6 +40,9 @@ Index(index::IndexArgs),
     Score(score::ScoreArgs),
     /// Full pipeline: qc → map → sort → scan → score → vcf.
     Run(run::RunArgs),
+    /// One-step reference environment: detect or download reference files
+    /// in the refs directory, then build the index in place.
+    Setup(setup::SetupArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -51,5 +55,6 @@ fn main() -> anyhow::Result<()> {
         Cmd::Scan(a) => scan::run(a),
         Cmd::Score(a) => score::run(a),
         Cmd::Run(a) => run::run(a),
+        Cmd::Setup(a) => setup::run(a),
     }
 }
