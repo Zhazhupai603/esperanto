@@ -14,6 +14,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), version
   GPU channel measured ~1.9× faster than CPU scoring; numerics match the CPU
   path within 3e-4 per site.
 - `delete` and `update` subcommands (interactive confirm for both).
+- `resume` subcommand: continues an interrupted `run` from the first broken
+  stage. `run` now writes into a sample-scoped directory `<out>/<sample>/`
+  (`--sample`, default derived from the input file name) and freezes inputs
+  and resolved parameters into `run.json`; `resume` re-validates every stage
+  artifact (BGZF EOF for BAM, full-stream integrity for gzip, parse checks
+  for JSON/BED/TSV/VCF), refuses on changed inputs, and re-executes only
+  from the first invalid stage. An intact alignment is never re-run: with a
+  valid `raw.bam` + `align_qc.json`, at most the collapsed rescue repeats.
+
+### Changed
+
+- `run --out` now takes an output root: artifacts land in `<out>/<sample>/`
+  instead of directly in `<out>/` (breaking layout change).
+
+### Fixed
+
+- The pipeline no longer runs the coordinate sort and the collapsed rescue
+  twice per run (both were executed redundantly after the map stage).
+- The Phred+64 rejection message now names the actual threshold (lowest
+  quality byte >= 64 in the first 10000 reads).
 
 ## [1.0.1] - 2026-08-27
 

@@ -21,7 +21,7 @@ dependencies beyond a reference FASTA and its index.
 - Unmapped reads get a second pass against a collapsed-alphabet index (A==G,
   T==C), which recovers hyperedited reads; survivors are written back with
   MAPQ 0 and an `RE:Z:collapsed` tag
-- Every run ends with a self-contained HTML report (`out/report.html`, opens
+- Every run ends with a self-contained HTML report (`<out>/<sample>/report.html`, opens
   in any browser): sample metrics, a drill-down genome explorer (chromosome →
   1 Mb window → per-base site track), gene search, and the recoded-protein
   table (amino-acid changes from A-to-I edits)
@@ -125,9 +125,19 @@ Or start from a coordinate-sorted, indexed BAM:
 esperanto run --bam sample.sorted.bam --fasta ref.fa --out out/
 ```
 
-The main output is `out/sites.vcf`: one row per called site, `FILTER=PASS`
-when `RE_PROB >= 0.5`, with `RE_PROB`, `VAF`, `DEPTH`, strand, and evidence
-annotations. Open `out/report.html` in a browser for the interactive report.
+Each run lands in a sample-scoped directory `<out>/<sample>/` (override the
+sample name with `--sample`). The main output is `<out>/<sample>/sites.vcf`:
+one row per called site, `FILTER=PASS` when `RE_PROB >= 0.5`, with `RE_PROB`,
+`VAF`, `DEPTH`, strand, and evidence annotations. Open
+`<out>/<sample>/report.html` in a browser for the interactive report.
+
+An interrupted run resumes with one command — no flags, it re-reads the
+frozen parameters and continues from the first broken stage (an intact
+alignment is never re-run):
+
+```sh
+esperanto resume <out>/<sample>/
+```
 
 The bundled model targets human hg38. References whose `chr1` length matches
 neither hg38 (248956422) nor a small test genome (< 10 Mb) are rejected.
@@ -149,6 +159,7 @@ esperanto <COMMAND> [OPTIONS]
 | `score` | RE_PROB scoring: encoder + pileup veto gate + 5-fold ensemble |
 | `run` | Full pipeline: qc → map → sort → scan → filter → score → vcf + HTML report |
 | `report` | Regenerate the HTML report for an existing run directory |
+| `resume` | Continue an interrupted run from the first broken stage |
 | `delete` | Remove local reference/index data or the model bundle (interactive confirm) |
 | `update` | Check for a newer release and install it (interactive confirm) |
 
@@ -164,6 +175,7 @@ Common options:
 | `--l1-bundle PATH` | `map`, `run` | override the auto-detected L1 engine bundle |
 | `--batch N` | `score`, `run` | score batch size (default 64) |
 | `--device auto|cpu|gpu` | `score`, `run` | score device; `auto` asks once when a CUDA GPU is detected (GPU builds only) |
+| `--sample NAME` | `run` | sample directory name under `--out` (default: derived from the R1/BAM file name) |
 
 When an option is omitted, inputs are resolved automatically (first hit wins):
 
@@ -193,10 +205,10 @@ discovery.
 
 | File | Content |
 |---|---|
-| `out/scan/candidates.bed` | candidate sites (coordinate, strand, evidence, score, depth, allele frequency) |
-| `out/score/scores.tsv` | `chrom`, `pos`, `RE_PROB` for every scored site |
-| `out/sites.vcf` | final calls |
-| `out/report.html` | self-contained interactive report (metrics, genome explorer, gene search, recoded proteins) |
+| `<out>/<sample>/scan/candidates.bed` | candidate sites (coordinate, strand, evidence, score, depth, allele frequency) |
+| `<out>/<sample>/score/scores.tsv` | `chrom`, `pos`, `RE_PROB` for every scored site |
+| `<out>/<sample>/sites.vcf` | final calls |
+| `<out>/<sample>/report.html` | self-contained interactive report (metrics, genome explorer, gene search, recoded proteins) |
 
 ## Guarantees
 

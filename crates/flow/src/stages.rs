@@ -42,6 +42,13 @@ fn anyhow_stage_err(stage: &'static str) -> impl FnOnce(anyhow::Error) -> FlowEr
 /// before `out_dir` is created.
 pub fn run(params: &RunParams) -> Result<(), FlowError> {
     let entry = params.entry()?;
+    preflight(params, entry)?;
+    fs::create_dir_all(&params.out_dir)?;
+    run_from(params, entry, crate::resume::Stage::first_for(entry))
+}
+
+/// Entry + guardrail checks shared by fresh runs and resumes.
+pub fn preflight(params: &RunParams, entry: Entry) -> Result<(), FlowError> {
     guard::check_species(&params.fasta)?;
     match entry {
         Entry::FastqSe | Entry::FastqPe => {
@@ -57,28 +64,46 @@ pub fn run(params: &RunParams) -> Result<(), FlowError> {
             }
         }
     }
-    fs::create_dir_all(&params.out_dir)?;
+    Ok(())
+}
 
+/// Stage machine: execute from `start` onward, reloading upstream artifacts
+/// instead of rebuilding them. `run` covers the full sequence; `resume`
+/// enters at the first invalid stage (see `crate::resume::walk`).
+pub fn run_from(
+    params: &RunParams,
+    entry: Entry,
+    start: crate::resume::Stage,
+) -> Result<(), FlowError> {
+    use crate::resume::Stage;
+    let map_dir = params.out_dir.join("map");
     let mut current_bam: PathBuf;
     let mut baln: Option<PathBuf> = None;
     match entry {
-        Entry::FastqSe => {
-            let (clean1, _) = stage_qc(params, entry)?;
-            current_bam = stage_map(params, entry, &clean1, None)?;
-            stage_rescue_collapsed(params, &current_bam)?;
-            current_bam = stage_sort(&current_bam, params)?;
-            current_bam = stage_sort(&current_bam, params)?;
-            // The SE mapper writes .baln; use it as the scan fast channel.
-            baln = Some(params.out_dir.join("map").join("align.baln"));
-        }
-        Entry::FastqPe => {
-            let (clean1, clean2) = stage_qc(params, entry)?;
-            current_bam = stage_map(params, entry, &clean1, clean2.as_deref())?;
-            stage_rescue_collapsed(params, &current_bam)?;
-            current_bam = stage_sort(&current_bam, params)?;
-            current_bam = stage_sort(&current_bam, params)?;
-            // The PE mapper does not write .baln (legacy parity); scan reads the BAM.
-            baln = None;
+        Entry::FastqSe | Entry::FastqPe => {
+            let (clean1, clean2) = if start <= Stage::Qc {
+                stage_qc(params, entry)?
+            } else {
+                qc_outputs(params, entry)
+            };
+            if start <= Stage::Map {
+                // map_stage runs the collapsed rescue before returning.
+                current_bam = stage_map(params, entry, &clean1, clean2.as_deref())?;
+            } else {
+                current_bam = map_dir.join("raw.bam");
+                if start == Stage::Rescue {
+                    stage_rescue_collapsed(params, &current_bam)?;
+                }
+            }
+            if start <= Stage::Sort {
+                current_bam = stage_sort(&current_bam, params)?;
+            } else {
+                current_bam = map_dir.join("sorted.bam");
+            }
+            if entry == Entry::FastqSe {
+                // The SE mapper writes .baln; use it as the scan fast channel.
+                baln = Some(map_dir.join("align.baln"));
+            }
         }
         Entry::Bam | Entry::BamSites => {
             if let Some(bam) = &params.bam {
@@ -95,20 +120,52 @@ pub fn run(params: &RunParams) -> Result<(), FlowError> {
             None => return Err(FlowError::Entry("BamSites entry requires --sites".into())),
         },
         _ => {
-            let bed = stage_scan(params, entry, &current_bam, baln)?;
-            let fstats = crate::filter::CallFilter::default().apply_to_bed(&bed)?;
-            eprintln!(
-                "[filter] {} candidates -> {} kept (low_depth {} no_signal {})",
-                fstats.input, fstats.kept, fstats.low_depth, fstats.no_signal
-            );
-            bed_to_sites(&bed)?
+            let bed = params.out_dir.join("scan").join("candidates.bed");
+            if start <= Stage::Scan {
+                let bed = stage_scan(params, entry, &current_bam, baln)?;
+                let fstats = crate::filter::CallFilter::default().apply_to_bed(&bed)?;
+                eprintln!(
+                    "[filter] {} candidates -> {} kept (low_depth {} no_signal {})",
+                    fstats.input, fstats.kept, fstats.low_depth, fstats.no_signal
+                );
+                bed_to_sites(&bed)?
+            } else {
+                bed_to_sites(&bed)?
+            }
         }
     };
 
-    let probs = stage_score(params, &current_bam, &sites)?;
-    vcf::write_vcf(params, entry, &sites, &probs)?;
+    if start <= Stage::Vcf {
+        let probs = if start <= Stage::Score {
+            stage_score(params, &current_bam, &sites)?
+        } else {
+            load_scores(&params.out_dir.join("score").join("scores.tsv"))?
+        };
+        vcf::write_vcf(params, entry, &sites, &probs)?;
+    }
     stage_report(params);
     Ok(())
+}
+
+/// scores.tsv → probs bridge for resumes that skip the score stage.
+fn load_scores(path: &Path) -> Result<Vec<f64>, FlowError> {
+    let text = fs::read_to_string(path)?;
+    let mut probs = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let p = line
+            .split('\t')
+            .nth(2)
+            .and_then(|v| v.parse::<f64>().ok())
+            .ok_or_else(|| FlowError::BedParse {
+                line: i + 1,
+                msg: "scores.tsv expects 'chrom<TAB>pos<TAB>prob'".into(),
+            })?;
+        probs.push(p);
+    }
+    Ok(probs)
 }
 
 /// Report stage (best-effort): pack the finished run directory into a
@@ -175,15 +232,21 @@ fn stage_qc(params: &RunParams, entry: Entry) -> Result<(PathBuf, Option<PathBuf
         ..Default::default()
     };
     esperanto_qc::run(&qp).map_err(stage_err("qc"))?;
+    Ok(qc_outputs(params, entry))
+}
+
+/// qc output paths without running qc (resume reload path).
+fn qc_outputs(params: &RunParams, entry: Entry) -> (PathBuf, Option<PathBuf>) {
+    let dir = params.out_dir.join("qc");
     let stem1 = stem_of(&params.r1[0]);
     match entry {
-        Entry::FastqSe => Ok((dir.join(format!("{stem1}.clean.fq.gz")), None)),
+        Entry::FastqSe => (dir.join(format!("{stem1}.clean.fq.gz")), None),
         _ => {
             let stem2 = stem_of(&params.r2[0]);
-            Ok((
+            (
                 dir.join(format!("{stem1}.clean_R1.fq.gz")),
                 Some(dir.join(format!("{stem2}.clean_R2.fq.gz"))),
-            ))
+            )
         }
     }
 }

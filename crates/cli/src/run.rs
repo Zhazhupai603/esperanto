@@ -47,8 +47,11 @@ pub struct RunArgs {
     #[arg(long, default_value = "unstranded", value_parser = ["unstranded", "stranded"])]
     lib: String,
     /// Output root directory.
-    #[arg(long)]
+#[arg(long)]
     out: PathBuf,
+    /// Sample name for the run directory (default: derived from the R1/BAM file name).
+    #[arg(long)]
+    sample: Option<String>,
     /// Worker threads (0 = all cores).
     #[arg(long, default_value_t = 0)]
     threads: usize,
@@ -61,7 +64,8 @@ pub struct RunArgs {
 }
 
 pub fn run(a: RunArgs) -> anyhow::Result<()> {
-    let bundle = crate::resolve::bundle(&a.bundle)?;
+    let sample = a.sample.clone().unwrap_or_else(|| derive_sample(&a));
+let bundle = crate::resolve::bundle(&a.bundle)?;
     let mut index = a.index;
     let mut fasta = a.fasta;
     let mut gtf = a.gtf;
@@ -78,6 +82,15 @@ pub fn run(a: RunArgs) -> anyhow::Result<()> {
         .as_ref()
         .and_then(|idx| crate::resolve::l1_bundle(&a.l1_bundle, idx));
     let fasta = crate::resolve::require_fasta(fasta)?;
+    let out_dir = a.out.join(&sample);
+    if out_dir.join("run.json").exists() {
+        anyhow::bail!(
+            "run directory {} already exists; use `esperanto resume {}` to continue it",
+            out_dir.display(),
+            out_dir.display()
+        );
+    }
+    std::fs::create_dir_all(&out_dir)?;
     let params = esperanto_flow::RunParams {
         r1: a.r1,
         r2: a.r2,
@@ -95,12 +108,84 @@ pub fn run(a: RunArgs) -> anyhow::Result<()> {
         } else {
             LibType::Unstranded
         },
-        out_dir: a.out,
+        out_dir: out_dir.clone(),
         threads: crate::resolve::threads(a.threads),
         batch: a.batch,
         device: a.device.resolve(),
         device_ask: Some(DeviceAsk::new(crate::confirm::ask_use_gpu)),
     };
+    let _lock = esperanto_flow::resume::RunLock::acquire(&out_dir)?;
+    esperanto_flow::resume::write_run_json(&out_dir, &sample, &params)?;
     esperanto_flow::run_pipeline(&params)?;
+    eprintln!("[run] sample directory: {}", out_dir.display());
     Ok(())
+}
+
+/// Sample name from the first input file name: strip compression/format
+/// suffixes, a trailing `.bam`, and a trailing mate marker (`_R1/_R2/_1/_2`).
+fn derive_sample(a: &RunArgs) -> String {
+    let src = a.r1.first().or(a.bam.as_ref());
+    let Some(src) = src else { return "sample".to_string() };
+    let mut name = src
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    while let Some(s) = name
+        .strip_suffix(".gz")
+        .or_else(|| name.strip_suffix(".fastq"))
+        .or_else(|| name.strip_suffix(".fq"))
+        .or_else(|| name.strip_suffix(".bam"))
+    {
+        name = s.to_string();
+    }
+    for suf in ["_R1", "_R2", "_1", "_2"] {
+        if let Some(s) = name.strip_suffix(suf) {
+            name = s.to_string();
+            break;
+        }
+    }
+    if name.is_empty() {
+        "sample".to_string()
+    } else {
+        name
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::derive_sample;
+    use super::RunArgs;
+
+    fn args(r1: &str) -> RunArgs {
+        RunArgs {
+            r1: vec![r1.into()],
+            r2: Vec::new(),
+            bam: None,
+            sites: None,
+            index: None,
+            fasta: None,
+            gtf: None,
+            gnomad: None,
+            bundle: None,
+            caduceus: None,
+            l1_bundle: None,
+            lib: "unstranded".to_string(),
+            out: "out".into(),
+            sample: None,
+            threads: 0,
+            batch: 64,
+            device: crate::confirm::DeviceArg::Auto,
+        }
+    }
+
+    #[test]
+    fn derive_sample_strips_formats_and_mate_markers() {
+        assert_eq!(derive_sample(&args("APOE4_070938_1_1.fq.gz")), "APOE4_070938_1");
+        assert_eq!(derive_sample(&args("sample_R1.fastq.gz")), "sample");
+        assert_eq!(derive_sample(&args("lane.fq")), "lane");
+        let mut b = args("x");
+        b.r1 = Vec::new();
+        b.bam = Some("tumor.sorted.bam".into());
+        assert_eq!(derive_sample(&b), "tumor.sorted");
+    }
 }

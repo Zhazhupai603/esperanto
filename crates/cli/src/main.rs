@@ -10,6 +10,7 @@ mod pile;
 mod qc;
 mod report;
 mod resolve;
+mod resume;
 mod confirm;
 mod delete;
 mod run;
@@ -44,8 +45,10 @@ Index(index::IndexArgs),
     Score(score::ScoreArgs),
     /// Full pipeline: qc → map → sort → scan → score → vcf.
     Run(run::RunArgs),
-    /// Regenerate the standalone HTML report for a finished run directory.
+/// Regenerate the standalone HTML report for a finished run directory.
     Report(report::ReportArgs),
+    /// Continue an interrupted run from the first broken stage.
+    Resume(resume::ResumeArgs),
     /// One-step reference environment: detect or download reference files
     /// in the refs directory, then build the index in place.
     Setup(setup::SetupArgs),
@@ -66,6 +69,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Score(a) => score::run(a),
         Cmd::Run(a) => run::run(a),
         Cmd::Report(a) => report::run(a),
+        Cmd::Resume(a) => resume::run(a),
         Cmd::Setup(a) => setup::run(a),
         Cmd::Delete(a) => delete::run(a),
         Cmd::Update(a) => update::run(a),
