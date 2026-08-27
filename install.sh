@@ -11,7 +11,14 @@ set -eu
 
 VERSION="v1.0.2"
 ARCH="linux-x86_64"
-PKG="esperanto-1.0.2-${ARCH}"
+
+# Machines with a working NVIDIA driver get the GPU-enabled build.
+VARIANT=""
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+    VARIANT="-gpu"
+fi
+
+PKG="esperanto-1.0.2-${ARCH}${VARIANT}"
 TARBALL="${PKG}.tar.gz"
 BASE_URL="https://github.com/Zhazhupai603/esperanto/releases/download/${VERSION}"
 
@@ -30,13 +37,25 @@ if [ -n "${ESPERANTO_TARBALL:-}" ]; then
     cp "$ESPERANTO_TARBALL" "$tmp/$TARBALL"
 else
     echo "==> downloading $BASE_URL/$TARBALL"
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$BASE_URL/$TARBALL" -o "$tmp/$TARBALL"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q "$BASE_URL/$TARBALL" -O "$tmp/$TARBALL"
-    else
-        echo "error: need curl or wget" >&2
-        exit 1
+    dl() {
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL "$1" -o "$2"
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q "$1" -O "$2"
+        else
+            echo "error: need curl or wget" >&2
+            exit 1
+        fi
+    }
+    if ! dl "$BASE_URL/$TARBALL" "$tmp/$TARBALL"; then
+        if [ -n "$VARIANT" ]; then
+            echo "==> GPU build unavailable for $VERSION; falling back to the CPU build"
+            PKG="esperanto-${VERSION#v}-${ARCH}"
+            TARBALL="${PKG}.tar.gz"
+            dl "$BASE_URL/$TARBALL" "$tmp/$TARBALL"
+        else
+            exit 1
+        fi
     fi
 fi
 

@@ -3,6 +3,16 @@
 All notable changes to ESPERANTO are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- The installer detects a working NVIDIA driver and downloads the
+  GPU-enabled build automatically, falling back to the CPU build when the
+  GPU asset is unavailable. On a GPU-enabled build, `--device auto` asks
+  once whether to use a detected GPU; machines without a GPU are never
+  asked and stay on the CPU path.
+
 ## [1.0.2] - 2026-08-27
 
 ### Added

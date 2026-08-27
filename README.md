@@ -46,20 +46,20 @@ The installer places:
 
 Re-run the same command to upgrade.
 
-GPU builds: the score stage can use a CUDA GPU (measured ~1.9× over a 4-core
-CPU at 20k sites). Build with `cargo build --release --features gpu` — needs
-the CUDA toolkit at build time and its runtime libraries on the target
-machine. The default build is CPU-only and needs neither.
+GPU acceleration: the installer detects a working NVIDIA driver and picks
+the GPU-enabled build automatically (CPU-only machines get the CPU build).
+At runtime the score stage detects a CUDA GPU and asks once whether to
+use it; without a GPU nothing is asked and the CPU path runs (measured
+~1.9× over a 4-core CPU at 20k sites; numerics match the CPU path within
+3e-4 per site):
 
-On a GPU build, the scoring device is chosen at runtime:
+- `--device auto` (default): ask once when a GPU is detected, CPU otherwise
+- `--device cpu`: force the CPU path (never asks)
+- `--device gpu`: require a CUDA GPU (clear error when none initializes)
 
-```sh
-esperanto run --r1 reads.fq.gz --out out/ --device gpu
-```
-
-`--device auto` (default) asks once when a CUDA GPU is detected, `cpu` forces
-the CPU path, and `gpu` requires a CUDA GPU (a CPU-only build fails here with
-a rebuild hint).
+Source builds default to CPU-only and run everywhere; include the CUDA
+channel with `cargo build --release --features gpu` (needs the CUDA toolkit
+at build time and an NVIDIA driver at run time).
 
 Build from source (stable Rust toolchain):
 
@@ -174,7 +174,7 @@ Common options:
 | `--bundle PATH` | `score`, `run` | override the auto-detected model bundle |
 | `--l1-bundle PATH` | `map`, `run` | override the auto-detected L1 engine bundle |
 | `--batch N` | `score`, `run` | score batch size (default 64) |
-| `--device auto|cpu|gpu` | `score`, `run` | score device; `auto` asks once when a CUDA GPU is detected (GPU builds only) |
+| `--device auto|cpu|gpu` | `score`, `run` | score device; `auto` uses a detected CUDA GPU, CPU otherwise |
 | `--sample NAME` | `run` | sample directory name under `--out` (default: derived from the R1/BAM file name) |
 
 When an option is omitted, inputs are resolved automatically (first hit wins):
