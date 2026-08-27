@@ -15,7 +15,7 @@ pub mod stages;
 pub mod vcf;
 
 pub use error::FlowError;
-pub use params::{Entry, RunParams};
+pub use params::{DeviceAsk, Entry, RunParams};
 pub use stages::map_stage;
 
 /// Run the pipeline selected by `params.entry()`.

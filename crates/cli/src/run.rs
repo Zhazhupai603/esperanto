@@ -3,7 +3,10 @@
 use std::path::PathBuf;
 
 use clap::Args;
+use esperanto_flow::DeviceAsk;
 use esperanto_scan::LibType;
+
+use crate::confirm::DeviceArg;
 
 #[derive(Args)]
 pub struct RunArgs {
@@ -52,6 +55,9 @@ pub struct RunArgs {
     /// score batch size.
     #[arg(long, default_value_t = 64)]
     batch: usize,
+    /// Encoder device: auto (ask when a CUDA GPU is detected), cpu, or gpu.
+    #[arg(long, value_enum, default_value_t = DeviceArg::Auto)]
+    device: DeviceArg,
 }
 
 pub fn run(a: RunArgs) -> anyhow::Result<()> {
@@ -92,6 +98,8 @@ pub fn run(a: RunArgs) -> anyhow::Result<()> {
         out_dir: a.out,
         threads: crate::resolve::threads(a.threads),
         batch: a.batch,
+        device: a.device.resolve(),
+        device_ask: Some(DeviceAsk::new(crate::confirm::ask_use_gpu)),
     };
     esperanto_flow::run_pipeline(&params)?;
     Ok(())

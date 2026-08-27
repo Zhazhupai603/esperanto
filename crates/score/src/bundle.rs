@@ -26,6 +26,9 @@ pub enum ScoreError {
     Hts(#[from] rust_htslib::errors::Error),
     #[error("token id {0} out of range [0,16)")]
     Token(i64),
+    #[cfg(feature = "gpu")]
+    #[error("gpu: {0}")]
+    Gpu(#[from] candle_core::Error),
 }
 
 #[derive(Debug, Clone, Copy)]

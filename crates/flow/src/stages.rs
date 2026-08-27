@@ -690,6 +690,10 @@ fn stage_score(
         None => score_pipeline::resolve_encoder_from_bundle(&params.bundle)
             .map_err(anyhow_stage_err("score"))?,
     };
+    let ask: Option<&(dyn Fn() -> bool + Send + Sync)> = params
+        .device_ask
+        .as_ref()
+        .map(|a| a.fn_ref());
     let probs = score_pipeline::score_sites_batched(
         bam,
         &params.fasta,
@@ -699,6 +703,8 @@ fn stage_score(
         params.threads,
         params.batch.max(1),
         None,
+        params.device,
+        ask,
     )
     .map_err(anyhow_stage_err("score"))?;
 

@@ -16,3 +16,16 @@ thiserror.workspace = true
 anyhow.workspace = true
 faer.workspace = true
 esperanto-pile = { path = "../pile" }
+
+candle-core = { workspace = true, optional = true }
+
+[features]
+gpu = ["dep:candle-core", "candle-core/cuda"]
+
+[[example]]
+name = "gpu_parity"
+required-features = ["gpu"]
+
+[[example]]
+name = "gpu_smoke"
+required-features = ["gpu"]

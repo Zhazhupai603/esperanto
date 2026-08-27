@@ -8,6 +8,8 @@
 //! Finally: residual = hidden + residual; out = RMSNorm_f(residual).
 
 use crate::bundle::{take_matrix, take_vector, ScoreError};
+#[cfg(feature = "gpu")]
+pub mod gpu_encoder;
 use crate::mamba::{MambaWeights, D_INNER, D_STATE, DT_RANK};
 use half::f16;
 use ndarray::{s, Array1, Array2, Axis};

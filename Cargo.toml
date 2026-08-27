@@ -30,6 +30,9 @@ blake3 = "1"
 flate2 = { version = "1", features = ["zlib-ng"] }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 tar = "0.4"
+crossterm = "0.29"
+candle-core = "0.9"
+candle-nn = "0.9"
 rust-htslib = "0.49"
 clap = { version = "4", features = ["derive"] }
 sha2 = "0.10"

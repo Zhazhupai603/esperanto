@@ -25,6 +25,9 @@ pub fn threads(t: usize) -> usize {
 /// The user-data refs directory (`~/.local/share/esperanto/refs`,
 /// `ESPERANTO_HOME`/`XDG_DATA_HOME` aware) — the fixed `setup` folder.
 pub fn home_refs_dir() -> PathBuf {
+    if let Ok(v) = std::env::var("ESPERANTO_REFS") {
+        return PathBuf::from(v);
+    }
     home_data_dir()
         .unwrap_or_else(|| PathBuf::from("refs"))
         .join("refs")

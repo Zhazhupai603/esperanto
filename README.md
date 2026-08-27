@@ -46,6 +46,11 @@ The installer places:
 
 Re-run the same command to upgrade.
 
+GPU builds: the score stage can use a CUDA GPU (measured ~1.9× over a 4-core
+CPU at 20k sites). Build with `cargo build --release --features gpu` — needs
+the CUDA toolkit at build time and its runtime libraries on the target
+machine. The default build is CPU-only and needs neither.
+
 Build from source (stable Rust toolchain):
 
 ```sh
@@ -133,6 +138,8 @@ esperanto <COMMAND> [OPTIONS]
 | `score` | RE_PROB scoring: encoder + pileup veto gate + 5-fold ensemble |
 | `run` | Full pipeline: qc → map → sort → scan → filter → score → vcf + HTML report |
 | `report` | Regenerate the HTML report for an existing run directory |
+| `delete` | Remove local reference/index data or the model bundle (interactive confirm) |
+| `update` | Check for a newer release and install it (interactive confirm) |
 
 Each subcommand supports `--help`.
 
@@ -145,6 +152,7 @@ Common options:
 | `--bundle PATH` | `score`, `run` | override the auto-detected model bundle |
 | `--l1-bundle PATH` | `map`, `run` | override the auto-detected L1 engine bundle |
 | `--batch N` | `score`, `run` | score batch size (default 64) |
+| `--device auto|cpu|gpu` | `score`, `run` | score device; `auto` asks once when a CUDA GPU is detected (GPU builds only) |
 
 When an option is omitted, inputs are resolved automatically (first hit wins):
 

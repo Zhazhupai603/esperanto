@@ -3,6 +3,18 @@
 All notable changes to ESPERANTO are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `--device auto|cpu|gpu` on `score` and `run`: a CUDA channel for the score
+  encoder (cargo feature `gpu`). On `auto`, a detected GPU triggers a one-time
+  interactive ask; `cpu` forces the CPU path; `gpu` errors clearly when the
+  build lacks GPU support or no CUDA device initializes. On a 4-core box the
+  GPU channel measured ~1.9× faster than CPU scoring; numerics match the CPU
+  path within 3e-4 per site.
+- `delete` and `update` subcommands (interactive confirm for both).
+
 ## [1.0.1] - 2026-08-27
 
 ### Added

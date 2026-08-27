@@ -10,10 +10,13 @@ mod pile;
 mod qc;
 mod report;
 mod resolve;
+mod confirm;
+mod delete;
 mod run;
 mod scan;
 mod score;
 mod setup;
+mod update;
 
 use clap::{Parser, Subcommand};
 
@@ -46,6 +49,10 @@ Index(index::IndexArgs),
     /// One-step reference environment: detect or download reference files
     /// in the refs directory, then build the index in place.
     Setup(setup::SetupArgs),
+    /// Remove local reference/index data or the model bundle (asks first).
+    Delete(delete::DeleteArgs),
+    /// Check for a newer release; download and install it (asks first).
+    Update(update::UpdateArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -60,5 +67,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Run(a) => run::run(a),
         Cmd::Report(a) => report::run(a),
         Cmd::Setup(a) => setup::run(a),
+        Cmd::Delete(a) => delete::run(a),
+        Cmd::Update(a) => update::run(a),
     }
 }
