@@ -51,6 +51,16 @@ CPU at 20k sites). Build with `cargo build --release --features gpu` — needs
 the CUDA toolkit at build time and its runtime libraries on the target
 machine. The default build is CPU-only and needs neither.
 
+On a GPU build, the scoring device is chosen at runtime:
+
+```sh
+esperanto run --r1 reads.fq.gz --out out/ --device gpu
+```
+
+`--device auto` (default) asks once when a CUDA GPU is detected, `cpu` forces
+the CPU path, and `gpu` requires a CUDA GPU (a CPU-only build fails here with
+a rebuild hint).
+
 Build from source (stable Rust toolchain):
 
 ```sh
@@ -76,7 +86,8 @@ must match FASTA contig names, and the species guardrail must hold), and
 builds the index in place. It also installs the scoring model bundle when
 none is present.
 
-After setup, the analysis needs no reference flags at all:
+After setup, no reference flags are needed — the index, FASTA, GTF, and L1
+engine bundle are all auto-resolved from the refs directory:
 
 ```sh
 esperanto run --r1 reads.fq.gz --out out/

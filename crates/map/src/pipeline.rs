@@ -503,6 +503,7 @@ fn write_unmapped_mate<W: Write>(
     w.write_all(b"@")
         .and_then(|_| w.write_all(&rec.name))
         .and_then(|_| write!(w, "/{which}"))
+        .and_then(|_| w.write_all(b"\n"))
         .and_then(|_| w.write_all(&rec.seq))
         .and_then(|_| w.write_all(b"\n+\n"))
         .and_then(|_| w.write_all(&rec.qual))
@@ -778,4 +779,27 @@ pub fn try_track2(
     };
     *aln = Some(new_aln);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PE unmapped records must stay 4-line well-formed: the rescue stage
+    /// re-parses unmapped.fq.gz line-wise, and a name line glued to the
+    /// sequence shifts every downstream field.
+    #[test]
+    fn write_unmapped_mate_is_four_line_wellformed() {
+        let rec = FastqRecord {
+            name: b"READ".to_vec(),
+            seq: b"ACGT".to_vec(),
+            qual: b"IIII".to_vec(),
+        };
+        let mut buf = Vec::new();
+        write_unmapped_mate(&mut buf, &rec, 1).expect("write");
+        assert_eq!(buf, b"@READ/1\nACGT\n+\nIIII\n");
+        let mut buf = Vec::new();
+        write_unmapped_mate(&mut buf, &rec, 2).expect("write");
+        assert_eq!(buf, b"@READ/2\nACGT\n+\nIIII\n");
+    }
 }
