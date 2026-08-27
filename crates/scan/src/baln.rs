@@ -33,7 +33,7 @@ pub struct BalnRecord {
     pub cigar: Vec<u32>,    // (len<<4)|code, as bam_set1 expects
     pub seq_ascii: Vec<u8>, // decoded to ASCII ACGTN
     pub qual: Vec<u8>,      // raw phred [0,93] (BAM-disk convention, same as htslib qual())
-    /// EK:Z aux (edit-evidence string; None when absent). call_v2 dirty-read gating depends on it.
+    /// EK:Z aux (edit-evidence string; None when absent). The caller's dirty-read gating depends on it.
     pub ek: Option<String>,
 }
 

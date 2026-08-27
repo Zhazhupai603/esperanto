@@ -1,4 +1,4 @@
-//! Scatter-count pileup engine (v14 call_v2) — replaces htslib bam_plp.
+//! Scatter-count pileup engine — replaces the htslib bam_plp walk.
 //!
 //! Math: instead of a per-column state machine (~100ns/entry), scatter each
 //! read's contribution directly into block-local arrays (~2-3ns/base):
@@ -120,10 +120,10 @@ fn scatter_one_record(
     has_fasta: bool,
     acc: &mut BlockAcc,
 ) {
-    // v14.2 orientation final review (decided by per-site control measurements): per the SAM spec, BAM SEQ for
+    // Orientation review (decided by per-site control measurements): per the SAM spec, BAM SEQ for
     // minus-strand reads is already reference-forward (SAM spec "segments are represented on the forward genomic
     // strand"; STAR output verified by direct comparison against the reference via samtools view), so the htslib
-    // pileup reads it forward directly. v14's "RC fix" rested on the wrong premise that "SEQ is as-sequenced":
+    // pileup reads it forward directly. An earlier "RC fix" rested on the wrong premise that "SEQ is as-sequenced":
     // after RC, minus-strand read bases were mirror-shifted against reference positions and complement-flipped →
     // measured minus-strand rev_freq stuck at ~1.0 (every minus-strand read miscounted as a mismatch) and var_freq
     // inflated (0.75 vs true 0.5). The correct semantics = pass-through (consistent with htslib pileup / esperanto-pile).
@@ -306,7 +306,7 @@ pub fn scatter_block(
     Ok(acc)
 }
 
-/// Scatter one contig block [cs, ce) — .baln source (v14 binary input).
+/// Scatter one contig block [cs, ce) — .baln binary source.
 /// idx/max_span come from `BalnReader::build_index` (shared read-only across block tasks); each task has
 /// its own file handle + seek. The block window uses overlap semantics (pos ∈ [cs−max_span, ce) and
 /// pos+span > cs), aligned with htslib fetch overlap detection; scattering goes through the same

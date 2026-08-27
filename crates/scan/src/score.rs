@@ -1,5 +1,5 @@
 //! Soft score CALL_SCORE (0–1): logistic-style weighted sum; weights come from a versioned spec JSON.
-//! To be clear: this is not the v05 model, only a candidate-ranking score (DESIGN §1.2c).
+//! To be clear: this is not the deep scoring model, only a candidate-ranking score (DESIGN §1.2c).
 
 use crate::error::CallError;
 use serde::Deserialize;

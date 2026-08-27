@@ -36,7 +36,7 @@ pub struct ScanArgs {
     /// Minimum call score (marking only, per scan contract).
     #[arg(long)]
     min_call_score: Option<f64>,
-    /// Override scoring spec JSON (builtin v2 default).
+    /// Override scoring spec JSON (crate-bundled default).
     #[arg(long)]
     spec: Option<PathBuf>,
     /// Worker threads (0 = all cores).

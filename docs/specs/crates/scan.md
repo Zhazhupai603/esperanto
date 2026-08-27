@@ -1,6 +1,6 @@
-# scan — strand-resolved candidate editing-site discovery (call_v2 scatter engine)
+# scan — strand-resolved candidate editing-site discovery (scatter engine)
 
-Genome-wide scan from BAM or .baln, emitting candidates.bed (10-column contract). **No hard filtering**: strand-resolved statistics + soft score call_score (0–1) + evidence code EVID all pass through (var_freq/fwd_freq/rev_freq pass through), to be consumed downstream with thresholds. Semantic source: the legacy esperanto-scan (call_v2 default engine; the legacy htslib v1 engine is deprecated and not ported).
+Genome-wide scan from BAM or .baln, emitting candidates.bed (10-column contract). **No hard filtering**: strand-resolved statistics + soft score call_score (0–1) + evidence code EVID all pass through (var_freq/fwd_freq/rev_freq pass through), to be consumed downstream with thresholds. Semantic source: the scatter caller is the only engine.
 
 ## Inputs
 

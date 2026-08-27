@@ -1,4 +1,4 @@
-//! call_v2 driver — wires the scatter engine to scoring + candidates.bed output.
+//! Call driver — wires the scatter engine to scoring + candidates.bed output.
 //!
 //! Per (contig, 32Mbp chunk): load refseq (cached) → scatter_block → per-site
 //! feature assembly → spec.score → Candidate. Semantics mirror process_column
@@ -35,7 +35,7 @@ fn load_refseq(
     // P0 (observed on STAR BAMs): when the fasta lacks this contig, htslib faidx_fetch_seq64 sets a negative length,
     // and rust-htslib 0.49 fetch_seq calls Vec::from_raw_parts(len as usize) internally, panicking on
     // capacity overflow — the Result semantics break down (.ok() cannot catch it). Pre-check against the .fai list
-    // (same as legacy count.rs / v10 contract): missing → None; this contig degrades to
+    // (missing → None; this contig degrades to
     // majority pseudo-ref counting, never panics.
     if !count::fasta_has_contig(fa, chrom) {
         return None;
@@ -242,8 +242,8 @@ fn emit_chunk(
     Ok(())
 }
 
-/// v2 entry: scatter engine + identical scoring/output contract.
-pub fn run_call_v2(params: &CallParams) -> Result<crate::CallStats, CallError> {
+/// Engine entry: scatter + scoring/output contract.
+pub fn run_call(params: &CallParams) -> Result<crate::CallStats, CallError> {
     let spec = CallSpec::load(params.spec.as_deref())?;
     let gtf = params
         .gtf
@@ -256,7 +256,7 @@ pub fn run_call_v2(params: &CallParams) -> Result<crate::CallStats, CallError> {
         .map(annot::GnomadIndex::load)
         .transpose()?;
 
-    // v14: .baln fast path — build the coordinate index in a single pass (Arc shared across block tasks); the contig list
+    // .baln fast path — build the coordinate index in a single pass (Arc shared across block tasks); the contig list
     // and derived lengths come from the index; the BAM path is unchanged (both sources share the emit/score/output contract).
     let baln_idx: Option<std::sync::Arc<crate::baln::BalnIndex>> = params
         .baln
@@ -379,7 +379,7 @@ pub fn run_call_v2(params: &CallParams) -> Result<crate::CallStats, CallError> {
     });
 
     eprintln!(
-        "[v2 timing] refseq={:.1}s scatter={:.1}s emit={:.1}s",
+        "[scan timing] refseq={:.1}s scatter={:.1}s emit={:.1}s",
         T_REFSEQ.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
         T_SCATTER.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
         T_EMIT.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9

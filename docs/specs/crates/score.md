@@ -30,7 +30,7 @@ ESPEMBC2 format (magic + cache_id + half_window + append records); incompatible 
 
 ## Out of scope (1.0.0)
 
-- corrected_sites.tsv feature source (legacy v14; the EM closed loop depends on the realign crate): not ported; registered in BACKLOG.
+- corrected_sites.tsv feature source (the EM closed loop depends on the realign crate): not ported; registered in BACKLOG.
 - report stage: deferred to 1.1 (design finalized).
 
 ## Dependencies

@@ -1,4 +1,4 @@
-//! esperanto-scan — strand-resolved candidate editing-site caller (call_v2 scatter engine).
+//! esperanto-scan — strand-resolved candidate editing-site caller (scatter engine).
 //!
 //! Role (spec: docs/specs/crates/scan.md): genome-wide scan from BAM/.baln, emitting
 //! candidates.bed (10-column contract). No hard filters: strand-resolved statistics, the soft score
@@ -9,7 +9,7 @@
 
 pub mod annot;
 pub mod baln;
-pub mod call_v2;
+pub mod call;
 pub mod count;
 pub mod error;
 pub mod out;
@@ -65,7 +65,7 @@ pub struct CallStats {
     pub gnomad_hits: usize,
 }
 
-/// Sole engine entry point: the call_v2 scatter engine (the legacy htslib v1 path is deprecated and not ported).
+/// Sole engine entry point: the scatter caller.
 pub fn run_call(params: &CallParams) -> Result<CallStats, CallError> {
-    call_v2::run_call_v2(params)
+    call::run_call(params)
 }
