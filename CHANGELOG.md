@@ -3,7 +3,7 @@
 All notable changes to ESPERANTO are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [1.0.2] - 2026-08-27
 
 ### Added
 
@@ -30,6 +30,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), version
 
 ### Fixed
 
+- PE `unmapped.fq.gz` was malformed (name line glued to the sequence),
+  crashing the rescue stage with a seq/qual length mismatch.
 - The pipeline no longer runs the coordinate sort and the collapsed rescue
   twice per run (both were executed redundantly after the map stage).
 - The Phred+64 rejection message now names the actual threshold (lowest

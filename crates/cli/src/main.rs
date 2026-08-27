@@ -21,7 +21,7 @@ mod update;
 
 use clap::{Parser, Subcommand};
 
-/// ESPERANTO RNA editing analysis (1.0.0).
+/// ESPERANTO RNA editing analysis.
 #[derive(Parser)]
 #[command(name = "esperanto", version, about, propagate_version = true)]
 struct Cli {

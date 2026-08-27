@@ -9,9 +9,9 @@
 #   ESPERANTO_TARBALL local tarball path (skips download when set)
 set -eu
 
-VERSION="v1.0.1"
+VERSION="v1.0.2"
 ARCH="linux-x86_64"
-PKG="esperanto-1.0.1-${ARCH}"
+PKG="esperanto-1.0.2-${ARCH}"
 TARBALL="${PKG}.tar.gz"
 BASE_URL="https://github.com/Zhazhupai603/esperanto/releases/download/${VERSION}"
 
