@@ -69,7 +69,14 @@ let has_cpaidx = params
         .as_ref()
         .is_some_and(|i| i.with_extension("cpaidx").is_file());
     let start = resume::walk(&a.dir, entry, has_cpaidx, params.gtf.is_some());
-    let report_done = params.gtf.is_none() || resume::valid_nonempty(&a.dir.join("report.html"));
+    let report_done = params.gtf.is_none() || {
+        let sample = a
+            .dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        resume::valid_nonempty(&a.dir.join(format!("{sample}.report.html")))
+    };
     if start == resume::Stage::Report && report_done {
         eprintln!("[resume] nothing to do: all stage artifacts are valid");
         return Ok(());

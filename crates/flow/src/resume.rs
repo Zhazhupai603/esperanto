@@ -410,6 +410,15 @@ fn qc_clean_ok(qc_dir: &Path, suffixes: &[&str]) -> bool {
     })
 }
 
+/// The report artifact: `<sample>.report.html`, non-empty. The sample name
+/// is the directory name (report contract).
+fn valid_report(out_dir: &Path) -> bool {
+    let Some(sample) = out_dir.file_name() else {
+        return false;
+    };
+    valid_nonempty(&out_dir.join(format!("{}.report.html", sample.to_string_lossy())))
+}
+
 /// Walk qc → report and return the first stage whose artifacts fail
 /// validation; `Report` when everything is intact.
 pub fn walk(out_dir: &Path, entry: Entry, has_cpaidx: bool, has_gtf: bool) -> Stage {
@@ -451,7 +460,7 @@ pub fn walk(out_dir: &Path, entry: Entry, has_cpaidx: bool, has_gtf: bool) -> St
     if first <= Stage::Vcf && !valid_vcf(&out_dir.join("sites.vcf")) {
         return Stage::Vcf;
     }
-    if has_gtf && !valid_nonempty(&out_dir.join("report.html")) {
+    if has_gtf && !valid_report(out_dir) {
         return Stage::Report;
     }
     Stage::Report
@@ -485,7 +494,13 @@ pub fn clean_stage(out_dir: &Path, stage: Stage) {
         let _ = fs::remove_file(out_dir.join("sites.vcf"));
     }
     if stage <= Stage::Report {
-        let _ = fs::remove_file(out_dir.join("report.html"));
+        if let Ok(d) = fs::read_dir(out_dir) {
+            for e in d.filter_map(|e| e.ok()) {
+                if e.file_name().to_string_lossy().ends_with(".report.html") {
+                    let _ = fs::remove_file(e.path());
+                }
+            }
+        }
     }
 }
 
@@ -571,7 +586,14 @@ mod tests {
         fs::create_dir_all(&score).unwrap();
         fs::write(score.join("scores.tsv"), "chr1\t100\t0.9\n").unwrap();
         fs::write(root.join("sites.vcf"), "##fileformat=VCFv4.2\n").unwrap();
-        fs::write(root.join("report.html"), "<html>").unwrap();
+        fs::write(
+            root.join(format!(
+                "{}.report.html",
+                root.file_name().unwrap().to_string_lossy()
+            )),
+            "<html>",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -627,7 +649,11 @@ mod tests {
         assert_eq!(walk(&d, Entry::FastqPe, true, true), Stage::Vcf);
         // Missing report with a GTF -> Report.
         full_pe_dir(&d);
-        fs::remove_file(d.join("report.html")).unwrap();
+        fs::remove_file(d.join(format!(
+            "{}.report.html",
+            d.file_name().unwrap().to_string_lossy()
+        )))
+        .unwrap();
         assert_eq!(walk(&d, Entry::FastqPe, true, true), Stage::Report);
         // No GTF -> report optional -> still Report (nothing to do).
         assert_eq!(walk(&d, Entry::FastqPe, true, false), Stage::Report);
@@ -644,7 +670,12 @@ mod tests {
         assert!(!d.join("scan").exists());
         assert!(!d.join("score").exists());
         assert!(!d.join("sites.vcf").exists());
-        assert!(!d.join("report.html").exists());
+        assert!(!d
+            .join(format!(
+                "{}.report.html",
+                d.file_name().unwrap().to_string_lossy()
+            ))
+            .exists());
         // Rescue keeps raw.bam but drops the merge leftover and cascades.
         full_pe_dir(&d);
         fs::write(d.join("map").join("raw.merged.bam"), b"x").unwrap();

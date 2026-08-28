@@ -62,6 +62,9 @@ struct DataPack {
     chroms: Vec<ChromLen>,
     heat5: BTreeMap<String, Vec<f64>>,
     heat1: BTreeMap<String, Vec<f64>>,
+    /// Rescued (hyperedited) read counts per window, same binning as heat5/heat1.
+    resc5: BTreeMap<String, Vec<u64>>,
+    resc1: BTreeMap<String, Vec<u64>>,
     sites: BTreeMap<String, Vec<SiteRow>>,
     recodings: Vec<Recoding>,
     genes: Vec<GeneOut>,
@@ -248,7 +251,35 @@ fn mkheat(sites: &[Site], chroms: &[ChromLen], win: i64) -> BTreeMap<String, Vec
         .collect()
 }
 
-/// Generate `<out>/report.html`; returns its path.
+/// Rescued-read counts per `win`-sized window from `map/rescued.bed`
+/// (`chrom<TAB>pos` 0-based rows, one per rescued placement). A missing or
+/// unparsable sidecar yields empty maps (pre-sidecar runs stay reportable).
+fn rescued_heat(out_dir: &Path, chroms: &[ChromLen], win: i64) -> BTreeMap<String, Vec<u64>> {
+    let mut vals: BTreeMap<String, Vec<u64>> = chroms
+        .iter()
+        .map(|c| (c.chrom.clone(), vec![0u64; (c.len / win + 1) as usize]))
+        .collect();
+    let Ok(text) = std::fs::read_to_string(out_dir.join("map").join("rescued.bed")) else {
+        return BTreeMap::new();
+    };
+    for line in text.lines() {
+        let Some((chrom, pos)) = line.split_once('\t') else {
+            continue;
+        };
+        let Ok(pos) = pos.parse::<i64>() else {
+            continue;
+        };
+        if let Some(v) = vals.get_mut(chrom) {
+            let i = (pos / win) as usize;
+            if i < v.len() {
+                v[i] += 1;
+            }
+        }
+    }
+    vals
+}
+
+/// Generate `<out>/<sample>.report.html`; returns its path.
 pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<PathBuf> {
     let mut sites = read_sites(&out_dir.join("sites.vcf"))?;
     let ann = Annotation::load(gtf)?;
@@ -373,11 +404,14 @@ pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<Path
 
     let heat5 = mkheat(&sites, &chroms, 5_000_000);
     let heat1 = mkheat(&sites, &chroms, 1_000_000);
+    let resc5 = rescued_heat(out_dir, &chroms, 5_000_000);
+    let resc1 = rescued_heat(out_dir, &chroms, 1_000_000);
+    let sample = out_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "run".to_string());
     let pack = DataPack {
-        sample: out_dir
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "run".to_string()),
+        sample: sample.clone(),
         metrics: Metrics {
             events: sites.len() as u64,
             pass: sites.iter().filter(|s| s.pass_).count() as u64,
@@ -389,12 +423,14 @@ pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<Path
         chroms,
         heat5,
         heat1,
+        resc5,
+        resc1,
         sites: per_chrom,
         recodings,
         genes: gene_out,
     };
     let html = render(&pack)?;
-    let out_path = out_dir.join("report.html");
+    let out_path = out_dir.join(format!("{sample}.report.html"));
     std::fs::write(&out_path, &html).with_context(|| format!("writing {}", out_path.display()))?;
     Ok(out_path)
 }
@@ -452,6 +488,8 @@ mod tests {
             chroms: vec![],
             heat5: BTreeMap::new(),
             heat1: BTreeMap::new(),
+            resc5: BTreeMap::new(),
+            resc1: BTreeMap::new(),
             sites: BTreeMap::new(),
             recodings: vec![],
             genes: vec![],

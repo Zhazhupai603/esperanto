@@ -151,6 +151,16 @@
     overflow: hidden;
     display: flex;
   }
+  .resc-track {
+    flex-grow: 1;
+    height: 8px;
+    background: #fdf7f7;
+    border-radius: 3px;
+    overflow: hidden;
+    display: flex;
+    margin-top: 2px;
+  }
+  .resc-legend { color: #dc2626; margin-left: 12px; font-weight: 600; }
   .heat-cell {
     height: 100%;
     cursor: pointer;
@@ -449,6 +459,7 @@
             <span>Low</span>
             <div class="legend-strip"></div>
             <span>High</span>
+            <span class="resc-legend">■ hyperedited</span>
           </div>
         </div>
         
@@ -553,6 +564,14 @@
 
     function formatPercent(num) {
       return (num * 100).toFixed(1) + '%';
+    }
+
+    function interpolateRed(v, max) {
+      const t = max > 0 ? v / max : 0;
+      const r = Math.round(255 + (220 - 255) * t);
+      const g = Math.round(245 + (38 - 245) * t);
+      const b = Math.round(245 + (38 - 245) * t);
+      return `rgb(${r},${g},${b})`;
     }
 
     function interpolateColor(val, maxVal) {
@@ -674,11 +693,27 @@
           return `<rect x="${i * cellWidth}%" y="0" width="${cellWidth}%" height="100%" fill="${color}" class="heat-cell" style="stroke:#ffffff;stroke-width:1;vector-effect:non-scaling-stroke" onmouseenter="showTooltip(event, '${tip}')" onmouseleave="hideTooltip()" onmousemove="showTooltip(event, '${tip}')" />`;
         }).join('');
         
+        const rvals = (reportData.resc5 || {})[c.chrom] || [];
+        const hasResc = rvals.some(v => v > 0);
+        let maxResc = 0;
+        rvals.forEach(v => { const l = Math.log1p(v); if (l > maxResc) maxResc = l; });
+        const rcells = hasResc ? rvals.map((v, i) => {
+          const color = interpolateRed(Math.log1p(v), maxResc);
+          const startMb = i * 5;
+          const tip = `${c.chrom}: ${startMb}-${startMb + 5} Mb | rescued (hyperedited) reads: ${v}`;
+          return `<rect x="${i * cellWidth}%" y="0" width="${cellWidth}%" height="100%" fill="${color}" style="stroke:#ffffff;stroke-width:1;vector-effect:non-scaling-stroke" onmouseenter="showTooltip(event, '${tip}')" onmouseleave="hideTooltip()" onmousemove="showTooltip(event, '${tip}')" />`;
+        }).join('') : '';
+        const rescTrack = hasResc ? `
+            <div class="resc-track" title="rescued (hyperedited) reads per 5 Mb">
+              <svg width="100%" height="100%" preserveAspectRatio="none">${rcells}</svg>
+            </div>` : '';
         return `
           <div class="heat-row" onclick="window.location.hash = '#/${c.chrom}'">
             <div class="heat-label">${c.chrom}</div>
-            <div class="heat-track">
-              <svg width="100%" height="100%" preserveAspectRatio="none">${cells}</svg>
+            <div style="flex-grow:1; display:flex; flex-direction:column;">
+              <div class="heat-track">
+                <svg width="100%" height="100%" preserveAspectRatio="none">${cells}</svg>
+              </div>${rescTrack}
             </div>
             <div class="heat-arrow">›</div>
           </div>
@@ -731,8 +766,13 @@
       const chromLen = (reportData.chroms.find(c => c.chrom === chrom) || {}).len || 0;
       const maxMb = Math.ceil(chromLen / 1000000);
 
+      const rvals = (reportData.resc1 || {})[chrom] || [];
+      let maxResc = 0;
+      rvals.forEach(v => { const l = Math.log1p(v); if (l > maxResc) maxResc = l; });
+      const hasResc = rvals.some(v => v > 0);
+
       l2State = {
-        chrom, vals, maxHeat, maxMb,
+        chrom, vals, maxHeat, maxMb, rvals, maxResc, hasResc,
         origXMin: 0, origXMax: maxMb,
         xMin: 0, xMax: maxMb
       };
@@ -741,7 +781,10 @@
         <div class="heat-container" id="l2-track-container" style="position: relative; overflow: hidden; touch-action: none; padding-bottom: 24px;">
           <div class="heat-row" style="cursor: default;">
             <div class="heat-label">${chrom}</div>
-            <div class="heat-track" id="l2-track" style="position: relative;"></div>
+            <div style="flex-grow:1; display:flex; flex-direction:column;">
+              <div class="heat-track" id="l2-track" style="position: relative;"></div>
+              <div class="resc-track" id="l2-resc-track" style="position: relative; display: none;"></div>
+            </div>
           </div>
           <div class="heat-row" style="cursor: default; margin-top: 4px;">
             <div class="heat-label"></div>
@@ -801,6 +844,24 @@
       }).join('');
       
       track.innerHTML = `<svg width="100%" height="100%" preserveAspectRatio="none">${cells}</svg>`;
+      
+      const rtrack = document.getElementById('l2-resc-track');
+      if (rtrack) {
+        if (!l2State.hasResc) {
+          rtrack.style.display = 'none';
+        } else {
+          rtrack.style.display = '';
+          const rcells = l2State.rvals.map((v, i) => {
+            if (i + 1 < xMin || i > xMax) return '';
+            const color = interpolateRed(Math.log1p(v), l2State.maxResc);
+            const tip = `${chrom}: ${i}-${i+1} Mb — rescued (hyperedited) reads: ${v}`;
+            const xPct = ((i - xMin) / mbSpan) * 100;
+            const wPct = (1 / mbSpan) * 100;
+            return `<rect x="${xPct}%" y="0" width="${wPct}%" height="100%" fill="${color}" style="stroke:#ffffff;stroke-width:1;vector-effect:non-scaling-stroke" onmouseenter="showTooltip(event, '${tip}')" onmouseleave="hideTooltip()" onmousemove="showTooltip(event, '${tip}')" />`;
+          }).join('');
+          rtrack.innerHTML = `<svg width="100%" height="100%" preserveAspectRatio="none">${rcells}</svg>`;
+        }
+      }
       
       const rawStep = mbSpan / 5;
       const pow = Math.pow(10, Math.floor(Math.log10(rawStep)));

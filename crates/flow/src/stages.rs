@@ -177,7 +177,7 @@ fn stage_report(params: &RunParams) {
             Ok(p) => eprintln!("[report] written: {}", p.display()),
             Err(e) => eprintln!("[report] warning: report generation failed: {e}"),
         },
-        None => eprintln!("[report] warning: no GTF available; skipped report.html"),
+        None => eprintln!("[report] warning: no GTF available; skipped the HTML report"),
     }
 }
 
@@ -499,8 +499,24 @@ fn rescue_collapsed(
             rescued_names.insert(name);
         }
     }
-    if rescued.is_empty() {
-        return Ok(());
+if rescued.is_empty() {
+return Ok(());
+    }
+
+    // Placement sidecar for the report's hyperedited-region track: one
+    // `chrom<TAB>pos` row (0-based) per rescued read, written before any
+    // merge step so an interruption still leaves the raw data on disk.
+    {
+        let mut text = String::new();
+        use std::fmt::Write as _;
+        for (_, _, _, a) in &rescued {
+            let _ = writeln!(
+                text,
+                "{}\t{}",
+                cidx.reference.contigs[a.contig as usize].name, a.pos
+            );
+        }
+        fs::write(map_dir.join("rescued.bed"), text)?;
     }
 
     // Rewrite unmapped.fq.gz without the rescued reads.

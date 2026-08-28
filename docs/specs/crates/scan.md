@@ -5,6 +5,9 @@ Genome-wide scan from BAM or .baln, emitting candidates.bed (10-column contract)
 ## Inputs
 
 - `--bam`: aligned BAM (requires .bai/.csi). Skips unmapped (0x4) / secondary (0x100) / supplementary (0x800).
+- Reads tagged `RE:Z:collapsed` (collapsed-rescue placements) count toward depth/bq/mapq/junction
+  accumulators only; their bases are alphabet-ambiguous (A==G, T==C) and never contribute variant
+  evidence (`sites` counts). Same rule on the .baln path.
 - `--baln`: binary fast path from the map product; **byte-identical output** with the BAM path (both sources share the same scatter kernel; block-window overlap semantics aligned with htslib fetch: pos ∈ [cs−max_span, ce) and pos+span > cs). contig-derived lengths are corrected against .fai (derived values used when fasta is absent or the contig is missing).
 - `--fasta` (optional): reference base / homopolymer / junction direction voting; absent or contig missing → majority pseudo-ref (all sites on that contig fully counted, hp=0, junction does not vote). A fasta missing a contig must be pre-checked against the .fai list; it must not panic.
 - `--gtf` (optional): strand-decision evidence, priority 3.

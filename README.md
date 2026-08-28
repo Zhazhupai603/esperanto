@@ -21,10 +21,13 @@ dependencies beyond a reference FASTA and its index.
 - Unmapped reads get a second pass against a collapsed-alphabet index (A==G,
   T==C), which recovers hyperedited reads; survivors are written back with
   MAPQ 0 and an `RE:Z:collapsed` tag
-- Every run ends with a self-contained HTML report (`<out>/<sample>/report.html`, opens
+- Every run ends with a self-contained HTML report (`<out>/<sample>/<sample>.report.html`, opens
   in any browser): sample metrics, a drill-down genome explorer (chromosome →
   1 Mb window → per-base site track), gene search, and the recoded-protein
   table (amino-acid changes from A-to-I edits)
+- Collapsed-rescue reads count toward coverage but never vote on candidate
+  variants (their bases are alphabet-ambiguous); their placements feed a
+  region-level hyperedited-density track in the report
 - Strand-resolved candidate calling from BAM or the binary `.baln` channel
 - Site scoring with a frozen Caduceus-Mamba model (pileup veto gate, 5-fold
   ensemble); AUROC 0.998 on the frozen evaluation corpus
@@ -129,7 +132,7 @@ Each run lands in a sample-scoped directory `<out>/<sample>/` (override the
 sample name with `--sample`). The main output is `<out>/<sample>/sites.vcf`:
 one row per called site, `FILTER=PASS` when `RE_PROB >= 0.5`, with `RE_PROB`,
 `VAF`, `DEPTH`, strand, and evidence annotations. Open
-`<out>/<sample>/report.html` in a browser for the interactive report.
+`<out>/<sample>/<sample>.report.html` in a browser for the interactive report.
 
 An interrupted run resumes with one command — no flags, it re-reads the
 frozen parameters and continues from the first broken stage (an intact
@@ -208,7 +211,7 @@ discovery.
 | `<out>/<sample>/scan/candidates.bed` | candidate sites (coordinate, strand, evidence, score, depth, allele frequency) |
 | `<out>/<sample>/score/scores.tsv` | `chrom`, `pos`, `RE_PROB` for every scored site |
 | `<out>/<sample>/sites.vcf` | final calls |
-| `<out>/<sample>/report.html` | self-contained interactive report (metrics, genome explorer, gene search, recoded proteins) |
+| `<out>/<sample>/<sample>.report.html` | self-contained interactive report (metrics, genome explorer with a red hyperedited-region track, gene search, recoded proteins) |
 
 ## Guarantees
 

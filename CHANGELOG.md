@@ -5,7 +5,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), version
 
 ## [Unreleased]
 
+### Added
+
+- The HTML report is named `<sample>.report.html` and gains a red
+  region-level hyperedited-density track (rescued-read counts per window)
+  under the signal tracks in the genome explorer.
+
 ### Changed
+
+- Collapsed-rescue reads (`RE:Z:collapsed`) no longer contribute variant
+  evidence to candidate calling — their bases are alphabet-ambiguous and
+  produced millions of spurious low-quality candidates on rescue-heavy
+  samples. They still count toward depth. Candidate volume drops to the
+  real scale and the score stage shrinks from hours to minutes on such
+  samples.
+
 
 - The installer detects a working NVIDIA driver and downloads the
   GPU-enabled build automatically, falling back to the CPU build when the

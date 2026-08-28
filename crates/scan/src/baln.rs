@@ -35,10 +35,13 @@ pub struct BalnRecord {
     pub qual: Vec<u8>,      // raw phred [0,93] (BAM-disk convention, same as htslib qual())
     /// EK:Z aux (edit-evidence string; None when absent). The caller's dirty-read gating depends on it.
     pub ek: Option<String>,
+    /// RE:Z aux (rescue provenance; `collapsed` marks an alphabet-ambiguous placement).
+    pub re: Option<String>,
 }
 
-/// Parse EK:Z from the aux region (BAM aux TLV: tag[2]+type[1]+value).
-fn parse_ek_aux(aux: &[u8]) -> Option<String> {
+/// Parse a `Z`-type string aux field from the aux region (BAM aux TLV:
+/// tag[2]+type[1]+value). Returns the string value of the first `want` tag.
+fn aux_string(aux: &[u8], want: &[u8; 2]) -> Option<String> {
     let mut i = 0usize;
     while i + 3 <= aux.len() {
         let tag = &aux[i..i + 2];
@@ -54,7 +57,7 @@ fn parse_ek_aux(aux: &[u8]) -> Option<String> {
                 while e < aux.len() && aux[e] != 0 {
                     e += 1;
                 }
-                if tag == b"EK" {
+                if tag == want {
                     return Some(
                         String::from_utf8_lossy(&aux[vstart..e.min(aux.len())]).into_owned(),
                     );
@@ -171,7 +174,8 @@ fn parse_block(buf: &[u8]) -> BalnRecord {
         let packed = &d[off..off + seq_packed_len];
         off += seq_packed_len;
         let qual = d[off..off + l_seq].to_vec();
-        let ek = parse_ek_aux(&d[off + l_seq..]);
+        let ek = aux_string(&d[off + l_seq..], b"EK");
+        let re = aux_string(&d[off + l_seq..], b"RE");
         let mut seq_ascii = Vec::with_capacity(l_seq);
         for i in 0..l_seq {
             let byte = packed[i / 2];
@@ -193,6 +197,7 @@ fn parse_block(buf: &[u8]) -> BalnRecord {
             seq_ascii,
             qual,
             ek,
+            re,
         }
     }
 }

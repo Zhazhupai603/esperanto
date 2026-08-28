@@ -28,6 +28,12 @@ fn base_idx(b: u8) -> Option<usize> {
     }
 }
 
+/// True when the record carries the collapsed-rescue provenance tag
+/// (`RE:Z:collapsed`): repeat-family placement with alphabet-ambiguous bases.
+fn is_collapsed(rec: &bam::Record) -> bool {
+    matches!(rec.aux(b"RE"), Ok(bam::record::Aux::String(v)) if v == "collapsed")
+}
+
 /// Parse EK aux tag for (mm, ea). Absent → None (caller treats read as dirty).
 fn ek_counts(rec: &bam::record::Record) -> Option<(u32, u32)> {
     let aux = rec.aux(b"EK").ok()?;
@@ -111,6 +117,7 @@ fn scatter_one_record(
     is_rev: bool,
     mapq: u64,
     dirty: bool,
+    collapsed: bool,
     cigar: &[(char, i64)],
     seq_raw: &[u8],
     qual_raw: &[u8],
@@ -216,7 +223,10 @@ fn scatter_one_record(
                         if n_minus > 0 {
                             acc.junc_minus[p] += n_minus;
                         }
-                        if dirty {
+                        // Collapsed-rescue reads (RE:Z:collapsed) carry A/G-
+                        // and T/C-ambiguous bases: they count toward depth
+                        // but must never vote on a variant.
+                        if dirty && !collapsed {
                             let rb = if has_fasta {
                                 refseq.get(os as usize + k).copied().unwrap_or(b'N')
                             } else {
@@ -284,6 +294,7 @@ pub fn scatter_block(
         let is_rev = rec.is_reverse();
         let mapq = u64::from(rec.mapq());
         let dirty = !has_fasta || ek_counts(&rec).is_none_or(|(mm, ea)| mm + ea > 0);
+        let collapsed = is_collapsed(&rec);
         let cigar = rec.cigar();
         let ops: Vec<(char, i64)> = cigar.iter().map(|c| (c.char(), c.len() as i64)).collect();
         // rec.seq() returns a borrowed view; as_bytes() yields a temporary Vec — bind first, then pass the reference.
@@ -293,6 +304,7 @@ pub fn scatter_block(
             is_rev,
             mapq,
             dirty,
+            collapsed,
             &ops,
             &seq_bytes,
             rec.qual(),
@@ -351,11 +363,13 @@ pub fn scatter_block_baln(
                 .and_then(ek_str_counts)
                 .is_none_or(|(mm, ea)| mm + ea > 0);
         let ops: Vec<(char, i64)> = rec.cigar.iter().filter_map(|&c| baln_cigar_op(c)).collect();
+        let collapsed = rec.re.as_deref() == Some("collapsed");
         scatter_one_record(
             rec.pos,
             rec.flag & 0x10 != 0,
             u64::from(rec.mapq),
             dirty,
+            collapsed,
             &ops,
             &rec.seq_ascii,
             &rec.qual,
