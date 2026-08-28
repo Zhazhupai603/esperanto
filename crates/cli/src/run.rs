@@ -56,7 +56,7 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 0)]
     threads: usize,
     /// score batch size.
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, default_value_t = 256)]
     batch: usize,
     /// Encoder device: auto (ask when a CUDA GPU is detected), cpu, or gpu.
     #[arg(long, value_enum, default_value_t = DeviceArg::Auto)]

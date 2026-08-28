@@ -250,9 +250,23 @@ pub fn run_pe(
         Some(sink) => Some(bam::create_writer(sink, &header, threads).map_err(io_err)?),
         None => None,
     };
-    // Legacy parity: run_pe never writes .baln — the driver still creates
-    // the sink file (0 bytes), matching the old pipeline.
-    drop(out.baln.take());
+    // .baln fast channel (for call) — PE writes it too, same layout as SE.
+    let mut baln_writer = match out.baln.take() {
+        Some(w) => {
+            let mut bw = std::io::BufWriter::with_capacity(8 << 20, w);
+            let names: Vec<String> = out
+                .index
+                .reference
+                .contigs
+                .iter()
+                .map(|c| c.name.clone())
+                .collect();
+            crate::baln::write_header(&mut bw, &names).map_err(io_err)?;
+            std::io::Write::flush(&mut bw).map_err(io_err)?;
+            Some(bw)
+        }
+        None => None,
+    };
     let mut unm = GzEncoder::new(&mut out.unmapped_fq, Compression::new(1));
     let mut stats = StatsAcc::new();
     let mut discoveries: Discoveries = Vec::new();
@@ -390,10 +404,17 @@ pub fn run_pe(
                 bam::write_record(w, &header, &ra).map_err(io_err)?;
                 bam::write_record(w, &header, &rb).map_err(io_err)?;
             }
+            if let Some(bw) = &mut baln_writer {
+                crate::baln::write_record(&mut *bw, &ra).map_err(io_err)?;
+                crate::baln::write_record(&mut *bw, &rb).map_err(io_err)?;
+            }
         }
     }
     if let Some(w) = bam_writer {
         w.into_inner().finish().map_err(io_err)?;
+    }
+    if let Some(mut bw) = baln_writer {
+        std::io::Write::flush(&mut bw).map_err(io_err)?;
     }
     unm.finish().map_err(io_err2)?;
     let mode = if out.config.rna { "rna-pe" } else { "dna-pe" };

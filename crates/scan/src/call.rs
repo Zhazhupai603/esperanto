@@ -261,7 +261,7 @@ pub fn run_call(params: &CallParams) -> Result<crate::CallStats, CallError> {
     let baln_idx: Option<std::sync::Arc<crate::baln::BalnIndex>> = params
         .baln
         .as_deref()
-        .map(crate::baln::BalnReader::build_index)
+        .map(crate::baln::build_index)
         .transpose()?
         .map(std::sync::Arc::new);
     let contigs: Vec<(String, u32)> = match &baln_idx {

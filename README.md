@@ -176,7 +176,8 @@ Common options:
 | `--lib stranded` | `scan`, `run` | stranded (dUTP-style) libraries; default `unstranded` |
 | `--bundle PATH` | `score`, `run` | override the auto-detected model bundle |
 | `--l1-bundle PATH` | `map`, `run` | override the auto-detected L1 engine bundle |
-| `--batch N` | `score`, `run` | score batch size (default 64) |
+| `--baln PATH` | `score` | experimental: read pileup records from the `.baln` channel instead of the BAM |
+| `--batch N` | `score`, `run` | score batch size (default 256) |
 | `--device auto|cpu|gpu` | `score`, `run` | score device; `auto` uses a detected CUDA GPU, CPU otherwise |
 | `--sample NAME` | `run` | sample directory name under `--out` (default: derived from the R1/BAM file name) |
 

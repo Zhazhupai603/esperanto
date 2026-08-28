@@ -111,6 +111,18 @@ pub enum PileError {
     /// Record iteration failed (corrupt BAM stream).
     #[error("failed to read BAM record: {0}")]
     Read(#[from] rust_htslib::errors::Error),
+
+    /// I/O failure (includes the `.baln` channel).
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// True when the record carries the collapsed-rescue provenance tag
+/// (`RE:Z:collapsed`): a repeat-family placement whose bases are
+/// alphabet-ambiguous (A==G, T==C). These records are excluded from pileup
+/// feature extraction — consistent with the scan evidence rule.
+fn is_collapsed(rec: &Record) -> bool {
+    matches!(rec.aux(b"RE"), Ok(rust_htslib::bam::record::Aux::String(v)) if v == "collapsed")
 }
 
 /// Extract pileup features at a single site.
@@ -129,7 +141,7 @@ pub fn extract_pileup_features(
 ) -> Result<[f32; N_FEATURES], PileError> {
     let (tid, pos0) = resolve_site(bam, chrom, pos_1based)?;
     let records = collect_site_records(bam, tid, pos0)?;
-    Ok(run_site(pos0, &records))
+    Ok(run_site(pos0, records))
 }
 
 /// Extract pileup features for many sites in one pass.
@@ -174,46 +186,238 @@ pub fn extract_pileup_features_batch(
         }
 
         let last_pos0 = order[group_end - 1].1;
-        bam.fetch((g_tid, g_first_pos0, last_pos0 + 1))
-            .map_err(|source| PileError::Fetch {
-                tid: g_tid,
-                start: g_first_pos0,
-                end: last_pos0 + 1,
-                source,
-            })?;
-
-        // Sweep-line state: `active` holds records in file (push) order with
-        // `pos <= current_site_pos0`; records with `end <= pos0` are retired
-        // before evaluating each site.
-        let mut active: Vec<Record> = Vec::new();
-        let mut pending: Option<Record> = None;
-        {
-            let mut records = bam.records();
-            for &(_tid, pos0, orig_idx) in &order[group_start..group_end] {
-                loop {
-                    let rec = match pending.take() {
-                        Some(r) => r,
-                        None => match records.next() {
-                            Some(Ok(r)) => r,
-                            Some(Err(e)) => return Err(PileError::Read(e)),
-                            None => break,
-                        },
-                    };
-                    if rec.pos() <= pos0 {
-                        active.push(rec);
-                    } else {
-                        pending = Some(rec);
-                        break;
-                    }
-                }
-                active.retain(|r| r.pos() + cigar_rlen(r) > pos0);
-                out[orig_idx] = run_site(pos0, &active);
-            }
-        }
+        sweep_group_bam(
+            bam,
+            g_tid,
+            g_first_pos0,
+            last_pos0,
+            &order[group_start..group_end],
+            &mut out,
+        )?;
 
         group_start = group_end;
     }
 
+    Ok(out)
+}
+
+/// Streaming pileup over one site group: one engine instance walks the
+/// record stream once, emitting columns in position order; every matching
+/// site takes its features from the emitted column. Collapsed-rescue
+/// records never enter the engine. Returns true when a MAXCNT drop
+/// occurred — streaming and per-site modes can diverge at saturated
+/// columns, so the caller must fall back to the per-site sweep.
+fn stream_core<R: PileRecord>(
+    records: impl Iterator<Item = Result<R, PileError>>,
+    group: &[(i32, i64, usize)],
+    out: &mut [[f32; N_FEATURES]],
+) -> Result<bool, PileError> {
+    let mut plp: EventPlp<R> = EventPlp::new();
+    let mut records = records.peekable();
+    for &(tid, pos0, orig_idx) in group {
+        // Feed every record starting at or before the site (stream is
+        // (tid,pos)-sorted, same order the per-column engine consumes).
+        loop {
+            let take = match records.peek() {
+                Some(Ok(r)) => r.tid() < tid || (r.tid() == tid && r.pos() <= pos0),
+                Some(Err(_)) => true,
+                None => false,
+            };
+            if !take {
+                break;
+            }
+            let r = records.next().expect("peeked")?;
+            plp.retire_until(r.tid(), r.pos());
+            if !r.is_collapsed() {
+                plp.push(r);
+            }
+        }
+        plp.retire_until(tid, pos0);
+        out[orig_idx] = plp.features_at(pos0);
+        if plp.dropped_maxcnt {
+            return Ok(true);
+        }
+    }
+    Ok(plp.dropped_maxcnt)
+}
+
+/// BAM sweep for one site group: single streaming pass; on a MAXCNT drop
+/// (rare repeat-region saturation) the region is re-fetched and the group
+/// is redone with the exact per-site semantics.
+fn sweep_group_bam(
+    bam: &mut IndexedReader,
+    tid: i32,
+    first_pos0: i64,
+    last_pos0: i64,
+    group: &[(i32, i64, usize)],
+    out: &mut [[f32; N_FEATURES]],
+) -> Result<(), PileError> {
+    let fetch = |bam: &mut IndexedReader| {
+        bam.fetch((tid, first_pos0, last_pos0 + 1))
+            .map_err(|source| PileError::Fetch {
+                tid,
+                start: first_pos0,
+                end: last_pos0 + 1,
+                source,
+            })
+    };
+    fetch(bam)?;
+    let dropped = stream_core(
+        bam.records().map(|r| r.map_err(PileError::Read)),
+        group,
+        out,
+    )?;
+    if dropped {
+        fetch(bam)?;
+        let records = bam
+            .records()
+            .map(|r| r.map_err(PileError::Read))
+            .collect::<Result<Vec<_>, _>>()?;
+        legacy_sweep_group(records, group, out)?;
+    }
+    Ok(())
+}
+
+/// `.baln` sweep for one site group: same structure as
+/// [`sweep_group_bam`]; the fallback re-reads the window.
+fn sweep_group_baln(
+    index: &esperanto_bamio::baln::BalnIndex,
+    file: &std::fs::File,
+    tid: i32,
+    first_pos0: i64,
+    last_pos0: i64,
+    group: &[(i32, i64, usize)],
+    out: &mut [[f32; N_FEATURES]],
+) -> Result<(), PileError> {
+    let raw = baln_window_records(index, file, tid, first_pos0, last_pos0)?;
+    let dropped = stream_core(raw.into_iter().map(Ok), group, out)?;
+    if dropped {
+        let raw = baln_window_records(index, file, tid, first_pos0, last_pos0)?;
+        legacy_sweep_group(raw, group, out)?;
+    }
+    Ok(())
+}
+
+/// Records overlapping `[first_pos0, last_pos0]` from the `.baln` channel
+/// (index window `pos < last+1 && pos+span > first`, htslib fetch overlap
+/// semantics).
+fn baln_window_records(
+    index: &esperanto_bamio::baln::BalnIndex,
+    file: &std::fs::File,
+    tid: i32,
+    first_pos0: i64,
+    last_pos0: i64,
+) -> Result<Vec<BalnPileRecord>, PileError> {
+    let lo_pos = first_pos0 - index.max_span;
+    let lo = index
+        .idx
+        .partition_point(|e| (e.0, e.1) < (tid, lo_pos));
+    let hi = index
+        .idx
+        .partition_point(|e| (e.0, e.1) < (tid, last_pos0 + 1));
+    let mut raw: Vec<BalnPileRecord> = Vec::new();
+    for &(t, pos, off, span) in &index.idx[lo..hi] {
+        if t != tid || pos + span <= first_pos0 {
+            continue;
+        }
+        let Some(rec) = esperanto_bamio::baln::read_record_at(file, off)? else {
+            continue;
+        };
+        raw.push(BalnPileRecord::new(rec)?);
+    }
+    Ok(raw)
+}
+
+fn legacy_sweep_group<R: PileRecord>(
+    records: impl IntoIterator<Item = R>,
+    group: &[(i32, i64, usize)],
+    out: &mut [[f32; N_FEATURES]],
+) -> Result<(), PileError> {
+    let mut active: Vec<R> = Vec::new();
+    let mut pending: Option<R> = None;
+    let mut records = records.into_iter();
+    for &(_tid, pos0, orig_idx) in group {
+        loop {
+            let rec = match pending.take() {
+                Some(r) => r,
+                None => match records.next() {
+                    Some(r) => r,
+                    None => break,
+                },
+            };
+            if rec.pos() <= pos0 {
+                if !rec.is_collapsed() {
+                    active.push(rec);
+                }
+            } else {
+                pending = Some(rec);
+                break;
+            }
+        }
+        active.retain(|r| r.pos() + r.ref_len() > pos0);
+        out[orig_idx] = run_site(pos0, active.iter().cloned());
+    }
+    Ok(())
+}
+
+/// Extract pileup features for many sites from the `.baln` fast channel.
+///
+/// Same grouping, sweep and engine as the BAM path; the coordinate index
+/// selects exactly the records htslib fetch would deliver, so features are
+/// bit-identical to [`extract_pileup_features_batch`]. Output order follows
+/// the input `sites` order.
+pub fn extract_pileup_features_batch_baln(
+    index: &esperanto_bamio::baln::BalnIndex,
+    file: &std::fs::File,
+    sites: &[(&str, i64)],
+) -> Result<Vec<[f32; N_FEATURES]>, PileError> {
+    if sites.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tid_of = |chrom: &str| -> Result<i32, PileError> {
+        index
+            .contigs
+            .iter()
+            .position(|c| c == chrom)
+            .map(|i| i as i32)
+            .ok_or_else(|| PileError::ContigNotFound(chrom.to_string()))
+    };
+    let mut order: Vec<(i32, i64, usize)> = Vec::with_capacity(sites.len());
+    for (i, (chrom, pos_1based)) in sites.iter().enumerate() {
+        if *pos_1based < 1 {
+            return Err(PileError::InvalidPosition(*pos_1based));
+        }
+        order.push((tid_of(chrom)?, pos_1based - 1, i));
+    }
+    order.sort_by_key(|&(tid, pos0, _)| (tid, pos0));
+
+    let mut out: Vec<[f32; N_FEATURES]> = vec![[0.0; N_FEATURES]; sites.len()];
+
+    let mut group_start = 0usize;
+    while group_start < order.len() {
+        let (g_tid, g_first_pos0, _) = order[group_start];
+        let mut group_end = group_start + 1;
+        while group_end < order.len() {
+            let &(tid, pos0, _) = &order[group_end];
+            let &(_, prev_pos0, _) = &order[group_end - 1];
+            if tid != g_tid || pos0 - prev_pos0 > MERGE_GAP {
+                break;
+            }
+            group_end += 1;
+        }
+        let last_pos0 = order[group_end - 1].1;
+        sweep_group_baln(
+            index,
+            file,
+            g_tid,
+            g_first_pos0,
+            last_pos0,
+            &order[group_start..group_end],
+            &mut out,
+        )?;
+
+        group_start = group_end;
+    }
     Ok(out)
 }
 
@@ -249,30 +453,377 @@ fn collect_site_records(
         })?;
     let mut records = Vec::new();
     for rec in bam.records() {
-        records.push(rec?);
+        let rec = rec?;
+        if !is_collapsed(&rec) {
+            records.push(rec);
+        }
     }
     Ok(records)
 }
 
+/// Record abstraction for the pileup engine: implemented by htslib
+/// `Record` (BAM source) and by [`BalnPileRecord`] (`.baln` source), so the
+/// engine runs without re-encoding either representation.
+pub trait PileRecord: Clone {
+    /// Reference id (-1 = unmapped).
+    fn tid(&self) -> i32;
+    /// Mate reference id.
+    fn mtid(&self) -> i32;
+    /// 0-based leftmost position.
+    fn pos(&self) -> i64;
+    /// Mate position.
+    fn mpos(&self) -> i64;
+    /// Template length (signed).
+    fn insert_size(&self) -> i64;
+    /// SAM flags.
+    fn flags(&self) -> u16;
+    /// Mapping quality.
+    fn mapq(&self) -> u8;
+    /// Read name (no trailing NUL).
+    fn qname(&self) -> &[u8];
+    /// Sequence length.
+    fn seq_len(&self) -> usize;
+    /// Raw phred qualities (BAM-disk convention).
+    fn qual(&self) -> &[u8];
+    /// ASCII base at query position `i`.
+    fn base_at(&self, i: usize) -> u8;
+    /// CIGAR op count.
+    fn cigar_len(&self) -> usize;
+    /// CIGAR op at `i`.
+    fn cigar_at(&self, i: usize) -> Cigar;
+    /// Reference span (M/D/N/=/X consumption).
+    fn ref_len(&self) -> i64;
+    /// True for collapsed-rescue records (alphabet-ambiguous bases).
+    fn is_collapsed(&self) -> bool;
+}
+
+impl PileRecord for Record {
+    fn tid(&self) -> i32 { self.tid() }
+    fn mtid(&self) -> i32 { self.mtid() }
+    fn pos(&self) -> i64 { self.pos() }
+    fn mpos(&self) -> i64 { self.mpos() }
+    fn insert_size(&self) -> i64 { self.insert_size() }
+    fn flags(&self) -> u16 { self.flags() }
+    fn mapq(&self) -> u8 { self.mapq() }
+    fn qname(&self) -> &[u8] { self.qname() }
+    fn seq_len(&self) -> usize { self.seq_len() }
+    fn qual(&self) -> &[u8] { self.qual() }
+    fn base_at(&self, i: usize) -> u8 { self.seq()[i] }
+    fn cigar_len(&self) -> usize { self.cigar_len() }
+    fn cigar_at(&self, i: usize) -> Cigar { self.cigar()[i] }
+    fn ref_len(&self) -> i64 { cigar_rlen(self) }
+    fn is_collapsed(&self) -> bool { is_collapsed(self) }
+}
+
+/// `.baln` record prepared for the pileup engine: fields plus the decoded
+/// CIGAR (computed once at conversion; no sequence re-encoding).
+#[derive(Clone)]
+pub struct BalnPileRecord {
+    rec: esperanto_bamio::baln::BalnRecord,
+    cigar: Vec<Cigar>,
+}
+
+impl BalnPileRecord {
+    /// Convert a parsed `.baln` record (cheap: CIGAR words to enums only).
+    pub fn new(rec: esperanto_bamio::baln::BalnRecord) -> Result<BalnPileRecord, PileError> {
+        let mut cigar = Vec::with_capacity(rec.cigar.len());
+        for &c in &rec.cigar {
+            let len = c >> 4;
+            cigar.push(match c & 0xF {
+                0 => Cigar::Match(len),
+                1 => Cigar::Ins(len),
+                2 => Cigar::Del(len),
+                3 => Cigar::RefSkip(len),
+                4 => Cigar::SoftClip(len),
+                5 => Cigar::HardClip(len),
+                6 => Cigar::Pad(len),
+                7 => Cigar::Equal(len),
+                8 => Cigar::Diff(len),
+                other => {
+                    return Err(PileError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("baln record: unknown cigar op code {other}"),
+                    )))
+                }
+            });
+        }
+        Ok(BalnPileRecord { rec, cigar })
+    }
+}
+
+impl PileRecord for BalnPileRecord {
+    fn tid(&self) -> i32 { self.rec.tid }
+    fn mtid(&self) -> i32 { self.rec.mtid }
+    fn pos(&self) -> i64 { self.rec.pos }
+    fn mpos(&self) -> i64 { self.rec.mpos }
+    fn insert_size(&self) -> i64 { self.rec.isize }
+    fn flags(&self) -> u16 { self.rec.flag }
+    fn mapq(&self) -> u8 { self.rec.mapq }
+    fn qname(&self) -> &[u8] { &self.rec.name }
+    fn seq_len(&self) -> usize { self.rec.l_seq }
+    fn qual(&self) -> &[u8] { &self.rec.qual }
+    fn base_at(&self, i: usize) -> u8 { self.rec.seq_ascii[i] }
+    fn cigar_len(&self) -> usize { self.cigar.len() }
+    fn cigar_at(&self, i: usize) -> Cigar { self.cigar[i] }
+    fn ref_len(&self) -> i64 {
+        self.cigar
+            .iter()
+            .map(|c| match c {
+                Cigar::Match(n) | Cigar::Del(n) | Cigar::RefSkip(n) | Cigar::Equal(n)
+                | Cigar::Diff(n) => *n as i64,
+                _ => 0,
+            })
+            .sum()
+    }
+    fn is_collapsed(&self) -> bool { self.rec.re.as_deref() == Some("collapsed") }
+}
+
 /// Run the pileup engine over one site's record sequence and extract features.
-fn run_site(pos0: i64, records: &[Record]) -> [f32; N_FEATURES] {
-    let mut plp = Plp::new();
+fn run_site<R: PileRecord>(pos0: i64, records: impl IntoIterator<Item = R>) -> [f32; N_FEATURES] {
+    let mut plp: Plp<R> = Plp::new();
+    let mut it = records.into_iter();
     loop {
-        match plp.auto(records) {
-            // Stream fully drained without emitting the target column.
-            None => return [0.0; N_FEATURES],
-            Some(col) if col.pos == pos0 => return features_from_column(&plp, &col),
-            // Columns are emitted at strictly increasing positions; passing
-            // the target means it had no coverage (covering reads were all
-            // dropped, or the column was empty and got skipped).
-            Some(col) if col.pos > pos0 => return [0.0; N_FEATURES],
-            Some(_) => {}
+        match plp.next() {
+            Some(col) => {
+                if col.pos == pos0 {
+                    return features_from_column(&plp, &col);
+                }
+                // Columns are emitted at strictly increasing positions;
+                // passing the target means it had no coverage.
+                if col.pos > pos0 {
+                    return [0.0; N_FEATURES];
+                }
+            }
+            None => {
+                if plp.is_eof && plp.order.is_empty() {
+                    return [0.0; N_FEATURES];
+                }
+                match it.next() {
+                    Some(r) => plp.push(r),
+                    None => plp.is_eof = true,
+                }
+            }
         }
     }
 }
 
+// ---------------------------------------------------------------------------
+// Event-driven engine (fast path)
+// ---------------------------------------------------------------------------
+
+/// Event-driven pileup engine: records stream in (tid,pos) order; nodes
+/// retire through an end-keyed heap (O(log n) per event) and columns are
+/// built ONLY at site positions (O(depth) per site, not per position).
+/// Semantics equal the per-column engine outside MAXCNT saturation:
+/// pairing/tweaks happen at push time identically, and the live set at a
+/// site column is `start <= pos && end > pos` in both engines. Feature
+/// arithmetic is integer accumulation, so entry order is irrelevant.
+/// Any buffer-full push sets `dropped_maxcnt` (a superset of the exact
+/// drop rule); the caller must then redo the group with the exact
+/// per-site engine.
+struct EventPlp<R: PileRecord> {
+    nodes: Vec<Option<Node<R>>>,
+    free: Vec<usize>,
+    /// (Reverse(tid), Reverse(end), idx) min-heap for retirement.
+    by_end: std::collections::BinaryHeap<std::cmp::Reverse<(i32, i64, usize)>>,
+    /// qname -> node waiting for its mate (same table as Plp).
+    waiting: HashMap<Vec<u8>, usize>,
+    live: usize,
+    tid: i32,
+    max_tid: i32,
+    max_pos: i64,
+    dropped_maxcnt: bool,
+}
+
+impl<R: PileRecord> EventPlp<R> {
+    fn new() -> Self {
+        EventPlp {
+            nodes: Vec::new(),
+            free: Vec::new(),
+            by_end: std::collections::BinaryHeap::new(),
+            waiting: HashMap::new(),
+            live: 0,
+            tid: -1,
+            max_tid: -1,
+            max_pos: -1,
+            dropped_maxcnt: false,
+        }
+    }
+
+    /// Retire every node whose (tid, end) passed `pos` on `tid`.
+    fn retire_until(&mut self, tid: i32, pos: i64) {
+        loop {
+            let should_retire = match self.by_end.peek() {
+                Some(std::cmp::Reverse((t, e, _))) => {
+                    *t < tid || (*t == tid && *e <= pos)
+                }
+                None => false,
+            };
+            if !should_retire {
+                break;
+            }
+            let std::cmp::Reverse((_, _, idx)) = self.by_end.pop().expect("peeked");
+            if let Some(node) = self.nodes[idx].take() {
+                overlap_remove(&mut self.waiting, node.rec.qname());
+                self.free.push(idx);
+                self.live -= 1;
+            }
+        }
+    }
+
+    /// `bam_plp_push` minus the per-column bookkeeping.
+    fn push(&mut self, rec: R) {
+        if rec.tid() < 0 || rec.flags() & FLAG_UNMAP != 0 {
+            overlap_remove(&mut self.waiting, rec.qname());
+            return;
+        }
+        // Superset of the exact MAXCNT drop rule (never misses a saturated
+        // push): any buffer-full push flags the group for the exact
+        // per-site redo.
+        if self.live + 1 > MAXCNT {
+            self.dropped_maxcnt = true;
+        }
+        let beg = rec.pos();
+        let end = beg + rec.ref_len();
+        self.max_tid = rec.tid();
+        self.max_pos = beg;
+        let idx = match self.free.pop() {
+            Some(i) => i,
+            None => {
+                self.nodes.push(None);
+                self.nodes.len() - 1
+            }
+        };
+        let tid = rec.tid();
+        self.tid = tid;
+        self.by_end
+            .push(std::cmp::Reverse((tid, end, idx)));
+        self.nodes[idx] = Some(Node {
+            tid,
+            beg,
+            end,
+            rec,
+            qual: None,
+            cstate: CigarState { k: -1, x: 0, y: 0 },
+        });
+        self.live += 1;
+        self.overlap_push(idx);
+    }
+
+    /// Pairing identical to Plp::overlap_push.
+    fn overlap_push(&mut self, idx: usize) {
+        let (rec_flags, rec_mtid, rec_tid, rec_isize, rec_mpos, rec_seq_len, rec_qname, node_end) = {
+            let node = match self.nodes[idx].as_ref() {
+                Some(n) => n,
+                None => return,
+            };
+            (
+                node.rec.flags(),
+                node.rec.mtid(),
+                node.rec.tid(),
+                node.rec.insert_size(),
+                node.rec.mpos(),
+                node.rec.seq_len(),
+                node.rec.qname().to_vec(),
+                node.end,
+            )
+        };
+        if rec_flags & FLAG_MATE_UNMAP != 0 || rec_flags & FLAG_PROPER_PAIR == 0 {
+            return;
+        }
+        if (rec_mtid >= 0 && rec_tid != rec_mtid)
+            || (rec_isize.abs() >= 2 * rec_seq_len as i64 && rec_mpos >= node_end)
+        {
+            return;
+        }
+        if let Some(&a_idx) = self.waiting.get(&rec_qname) {
+            self.waiting.remove(&rec_qname);
+            let (a, b) = if a_idx < idx {
+                let (x, y) = self.nodes.split_at_mut(idx);
+                (&mut x[a_idx], &mut y[0])
+            } else {
+                let (x, y) = self.nodes.split_at_mut(a_idx);
+                (&mut y[0], &mut x[idx])
+            };
+            if let (Some(an), Some(bn)) = (a.as_mut(), b.as_mut()) {
+                tweak_overlap_quality(an, bn);
+            }
+        } else {
+            self.waiting.insert(rec_qname, idx);
+        }
+    }
+
+    /// Build the feature vector at one site column (live set already
+    /// retired to `end > pos0`).
+    fn features_at(&mut self, pos0: i64) -> [f32; N_FEATURES] {
+        let mut depth: u64 = 0;
+        let mut base_counts: [u64; 4] = [0; 4];
+        let mut qual_sum: u64 = 0;
+        let mut mapq_sum: u64 = 0;
+        let mut forward: u64 = 0;
+        for slot in self.nodes.iter_mut() {
+            let node = match slot.as_mut() {
+                Some(n) => n,
+                None => continue,
+            };
+            if node.tid != self.tid || node.beg > pos0 {
+                continue;
+            }
+            let qpos = match resolve_at_site(&node.rec, pos0, &mut node.cstate) {
+                Some(q) => q as usize,
+                None => continue,
+            };
+            let rec = &node.rec;
+            let seq_len = rec.seq_len();
+            if qpos >= seq_len {
+                continue;
+            }
+            let qual_slice = node.qual.as_deref().unwrap_or_else(|| rec.qual());
+            let qual = if qpos < qual_slice.len() {
+                qual_slice[qpos]
+            } else if qpos < seq_len {
+                0xFF
+            } else {
+                0
+            };
+            if qual < MIN_BASE_QUALITY {
+                continue;
+            }
+            depth += 1;
+            match rec.base_at(qpos) {
+                b'A' | b'a' => base_counts[0] += 1,
+                b'C' | b'c' => base_counts[1] += 1,
+                b'G' | b'g' => base_counts[2] += 1,
+                b'T' | b't' => base_counts[3] += 1,
+                _ => {}
+            }
+            if qpos < qual_slice.len() {
+                qual_sum += u64::from(qual_slice[qpos]);
+            }
+            mapq_sum += u64::from(rec.mapq());
+            if rec.flags() & FLAG_REVERSE == 0 {
+                forward += 1;
+            }
+        }
+        if depth == 0 {
+            return [0.0; N_FEATURES];
+        }
+        let n = depth as f32;
+        [
+            depth as f32,
+            base_counts[0] as f32,
+            base_counts[1] as f32,
+            base_counts[2] as f32,
+            base_counts[3] as f32,
+            qual_sum as f32 / n,
+            forward as f32 / n,
+            mapq_sum as f32 / n,
+        ]
+    }
+}
+
 /// Compute the 8 features from one emitted column (entries in push order).
-fn features_from_column(plp: &Plp, col: &Column) -> [f32; N_FEATURES] {
+fn features_from_column<R: PileRecord>(plp: &Plp<R>, col: &Column) -> [f32; N_FEATURES] {
     let mut depth: u64 = 0;
     let mut base_counts: [u64; 4] = [0; 4];
     let mut qual_sum: u64 = 0;
@@ -290,7 +841,7 @@ fn features_from_column(plp: &Plp, col: &Column) -> [f32; N_FEATURES] {
             Some(n) => n,
             None => continue, // unreachable: entries reference live nodes
         };
-        let rec = node.rec;
+        let rec = &node.rec;
         let seq_len = rec.seq_len();
         // Spec quality rule: qpos >= l_qseq -> quality treated as 0 (filtered
         // below); this also guards sequence/quality slice access.
@@ -315,7 +866,7 @@ fn features_from_column(plp: &Plp, col: &Column) -> [f32; N_FEATURES] {
         // counts toward depth / mean quality / strand / MAPQ — including N
         // and other non-ACGT codes. Only the four base buckets are ACGT-only.
         depth += 1;
-        let base = rec.seq()[qpos];
+        let base = rec.base_at(qpos);
         match base {
             b'A' | b'a' => base_counts[0] += 1,
             b'C' | b'c' => base_counts[1] += 1,
@@ -393,9 +944,8 @@ struct CigarState {
 /// The incremental stepping is contractual: a zero-length D/N op makes the
 /// cursor rest on it for one column (reporting a deletion), a quirk that a
 /// random-access "which op contains pos" walk does not reproduce.
-fn resolve_cigar2(rec: &Record, pos: i64, s: &mut CigarState) -> Option<u32> {
-    let cigar = rec.cigar();
-    let n = cigar.len() as i64;
+fn resolve_cigar2<R: PileRecord>(rec: &R, pos: i64, s: &mut CigarState) -> Option<u32> {
+    let n = rec.cigar_len() as i64;
     if s.k == -1 {
         // Find the first M/D/N/=/X op, accumulating query offsets over I/S.
         let mut k: i64 = 0;
@@ -403,13 +953,13 @@ fn resolve_cigar2(rec: &Record, pos: i64, s: &mut CigarState) -> Option<u32> {
         let mut y: i64 = 0;
         let mut found = false;
         while k < n {
-            match cigar[k as usize] {
+            match rec.cigar_at(k as usize) {
                 Cigar::Match(_) | Cigar::Del(_) | Cigar::RefSkip(_)
                 | Cigar::Equal(_) | Cigar::Diff(_) => {
                     found = true;
                     break;
                 }
-                Cigar::Ins(_) | Cigar::SoftClip(_) => y += cigar[k as usize].len() as i64,
+                Cigar::Ins(_) | Cigar::SoftClip(_) => y += rec.cigar_at(k as usize).len() as i64,
                 Cigar::HardClip(_) | Cigar::Pad(_) => {}
             }
             k += 1;
@@ -423,7 +973,7 @@ fn resolve_cigar2(rec: &Record, pos: i64, s: &mut CigarState) -> Option<u32> {
         s.x = x;
         s.y = y;
     } else {
-        let cur = cigar[s.k as usize];
+        let cur = rec.cigar_at(s.k as usize);
         let l = cur.len() as i64;
         if pos - s.x >= l {
             // Advance exactly one ref-consuming op, scanning past I/S/H/P.
@@ -435,10 +985,10 @@ fn resolve_cigar2(rec: &Record, pos: i64, s: &mut CigarState) -> Option<u32> {
             s.x += l;
             let mut k = s.k + 1;
             while k < n {
-                match cigar[k as usize] {
+                match rec.cigar_at(k as usize) {
                     Cigar::Match(_) | Cigar::Del(_) | Cigar::RefSkip(_)
                     | Cigar::Equal(_) | Cigar::Diff(_) => break,
-                    Cigar::Ins(_) | Cigar::SoftClip(_) => s.y += cigar[k as usize].len() as i64,
+                    Cigar::Ins(_) | Cigar::SoftClip(_) => s.y += rec.cigar_at(k as usize).len() as i64,
                     Cigar::HardClip(_) | Cigar::Pad(_) => {}
                 }
                 k += 1;
@@ -450,20 +1000,35 @@ fn resolve_cigar2(rec: &Record, pos: i64, s: &mut CigarState) -> Option<u32> {
             s.k = k;
         }
     }
-    match cigar[s.k as usize] {
+    match rec.cigar_at(s.k as usize) {
         Cigar::Match(_) | Cigar::Equal(_) | Cigar::Diff(_) => Some((s.y + (pos - s.x)) as u32),
         // D / N
         _ => None,
     }
 }
 
+/// Site-granular resolve: `resolve_cigar2` advances at most one
+/// ref-consuming op per call (its per-column contract), so a jump to a far
+/// site may need several calls. Returns the final answer once the cursor's
+/// current op covers `pos` (or cannot advance further).
+fn resolve_at_site<R: PileRecord>(rec: &R, pos: i64, s: &mut CigarState) -> Option<u32> {
+    loop {
+        let prev = (s.k, s.x);
+        let out = resolve_cigar2(rec, pos, s);
+        let cur_len = rec.cigar_at(s.k as usize).len() as i64;
+        if pos - s.x < cur_len || (s.k, s.x) == prev {
+            return out;
+        }
+    }
+}
+
 /// One buffered read. `qual` is the (lazily copied) quality overlay written
 /// by the PE overlap tweak; `None` means original qualities.
-struct Node<'a> {
-tid: i32,
-beg: i64,
-end: i64,
-rec: &'a Record,
+struct Node<R: PileRecord> {
+    tid: i32,
+    beg: i64,
+    end: i64,
+    rec: R,
     qual: Option<Vec<u8>>,
     cstate: CigarState,
 }
@@ -483,8 +1048,8 @@ struct Column {
 
 /// The `bam_plp` engine: push/emit state machine with the PE overlap waiting
 /// table, interleaved exactly per `bam_plp64_auto`.
-struct Plp<'a> {
-    nodes: Vec<Option<Node<'a>>>,
+struct Plp<R: PileRecord> {
+    nodes: Vec<Option<Node<R>>>,
     free: Vec<usize>,
     /// Buffered node indices in push order (mirrors the C linked list).
     order: VecDeque<usize>,
@@ -495,10 +1060,12 @@ struct Plp<'a> {
     max_tid: i32,
     max_pos: i64,
     is_eof: bool,
-    feed_next: usize,
+    /// Set when the MAXCNT rule discarded a record (streaming vs per-site
+    /// modes can diverge at saturated columns; callers must fall back).
+    dropped_maxcnt: bool,
 }
 
-impl<'a> Plp<'a> {
+impl<R: PileRecord> Plp<R> {
     fn new() -> Self {
         Plp {
             nodes: Vec::new(),
@@ -510,32 +1077,13 @@ impl<'a> Plp<'a> {
             max_tid: -1,
             max_pos: -1,
             is_eof: false,
-            feed_next: 0,
+            dropped_maxcnt: false,
         }
     }
 
     /// `bam_plp64_auto`: try next() first; only when no column can come out
     /// (`max_pos <= pos`, pre-EOF) push records one at a time, retrying
     /// next() after each push; at end of stream push EOF once, then drain.
-    fn auto(&mut self, records: &'a [Record]) -> Option<Column> {
-        if let Some(col) = self.next() {
-            return Some(col);
-        }
-        if self.is_eof {
-            return None;
-        }
-        while self.feed_next < records.len() {
-            let rec = &records[self.feed_next];
-            self.feed_next += 1;
-            self.push(rec);
-            if let Some(col) = self.next() {
-                return Some(col);
-            }
-        }
-        self.is_eof = true; // push(NULL)
-        self.next()
-    }
-
     /// `bam_plp64_next`: emit the next non-empty column, retiring finished
     /// nodes; returns None while the current position may still receive
     /// reads (`max_pos <= pos`, or the drained EOF buffer).
@@ -564,7 +1112,7 @@ impl<'a> Plp<'a> {
                         if node.tid < self.tid || (node.tid == self.tid && node.end <= self.pos) {
                             retired_qname = Some(node.rec.qname().to_vec());
                         } else if node.tid == self.tid && node.beg <= self.pos {
-                            resolved = Some(resolve_cigar2(node.rec, self.pos, &mut node.cstate));
+                            resolved = Some(resolve_cigar2(&node.rec, self.pos, &mut node.cstate));
                         }
                     }
                     None => {
@@ -624,7 +1172,7 @@ impl<'a> Plp<'a> {
     }
 
     /// `bam_plp_push` with a real record.
-    fn push(&mut self, rec: &'a Record) {
+    fn push(&mut self, rec: R) {
         if rec.tid() < 0 {
             overlap_remove(&mut self.waiting, rec.qname());
             return;
@@ -639,12 +1187,13 @@ impl<'a> Plp<'a> {
         // while same-start reads stream in; htslib compares its pool count
         // (sentinel included) against maxcnt, i.e. alive + 1 > MAXCNT.
         if self.tid == rec.tid() && self.pos == rec.pos() && self.order.len() + 1 > MAXCNT {
+            self.dropped_maxcnt = true;
             overlap_remove(&mut self.waiting, rec.qname());
             return;
         }
 
         let beg = rec.pos();
-        let end = beg + cigar_rlen(rec);
+        let end = beg + rec.ref_len();
         // Input comes from a region iterator, so the C unsorted-input checks
         // cannot trigger and are not replicated.
         self.max_tid = rec.tid();
@@ -681,7 +1230,7 @@ impl<'a> Plp<'a> {
             Some(n) => n,
             None => return,
         };
-        let rec = node.rec;
+        let rec = &node.rec;
         let flags = rec.flags();
         // mapped mates in proper pairs only
         if flags & FLAG_MATE_UNMAP != 0 || flags & FLAG_PROPER_PAIR == 0 {
@@ -738,14 +1287,15 @@ struct TweakCursor {
 /// `cigar_iref2iseq_set`: find the first aligned (M/=/X) base at the given
 /// reference offset. Returns None when the position is not covered by an
 /// aligned op (htslib returns -1: "no overlap").
-fn cig_set(rec: &Record, pos_offset: i64) -> Option<TweakCursor> {
+fn cig_set<R: PileRecord>(rec: &R, pos_offset: i64) -> Option<TweakCursor> {
     if pos_offset < 0 {
         return None;
     }
     let mut pos = pos_offset;
     let mut iseq: i64 = 0;
     let mut iref: i64 = 0;
-    for (k, c) in rec.cigar().iter().enumerate() {
+    for k in 0..rec.cigar_len() {
+        let c = rec.cigar_at(k);
         match c {
             Cigar::SoftClip(_) => {
                 iseq += c.len() as i64;
@@ -785,10 +1335,9 @@ fn cig_set(rec: &Record, pos_offset: i64) -> Option<TweakCursor> {
 
 /// `cigar_iref2iseq_next`: advance the cursor to the next aligned base.
 /// Returns false when the CIGAR is exhausted (htslib returns -1).
-fn cig_next(rec: &Record, cur: &mut TweakCursor) -> bool {
-    let cigar = rec.cigar();
-    while cur.op < cigar.len() {
-        let op = cigar[cur.op];
+fn cig_next<R: PileRecord>(rec: &R, cur: &mut TweakCursor) -> bool {
+    while cur.op < rec.cigar_len() {
+        let op = rec.cigar_at(cur.op);
         match op {
             Cigar::Match(_) | Cigar::Equal(_) | Cigar::Diff(_) => {
                 let len = op.len() as i64;
@@ -828,9 +1377,9 @@ fn cig_next(rec: &Record, cur: &mut TweakCursor) -> bool {
 /// quality overlays are written — including partial writes on early exit,
 /// matching the in-place C mutation. Bad CIGARs are tolerated by returning
 /// early (never panicking).
-fn tweak_overlap_quality(a: &mut Node, b: &mut Node) {
-    let a_rec = a.rec;
-    let b_rec = b.rec;
+fn tweak_overlap_quality<R: PileRecord>(a: &mut Node<R>, b: &mut Node<R>) {
+    let a_rec = &a.rec;
+    let b_rec = &b.rec;
 
     // Start at the right read's start; both cursors walk to that position.
     let iref_start = b_rec.pos();
@@ -893,12 +1442,10 @@ fn tweak_overlap_quality(a: &mut Node, b: &mut Node) {
             // `continue` like upstream.
             let a_abs = a_rec.pos() + a_cur.iref;
             let b_abs = b_rec.pos() + b_cur.iref;
-            let a_cigar = a_rec.cigar();
-            let b_cigar = b_rec.cigar();
-            let prev_is_del = |c: &TweakCursor, cigar: &rust_htslib::bam::record::CigarStringView| -> bool {
-                c.op > 0 && matches!(cigar[c.op - 1], Cigar::Del(_))
+            let prev_is_del = |c: &TweakCursor, rec: &R| -> bool {
+                c.op > 0 && matches!(rec.cigar_at(c.op - 1), Cigar::Del(_))
             };
-            if a_abs < b_abs && prev_is_del(&b_cur, &b_cigar) {
+            if a_abs < b_abs && prev_is_del(&b_cur, b_rec) {
                 // Del in B moved it ahead of A: chase A forward.
                 loop {
                     let i = a_cur.iseq as usize;
@@ -919,7 +1466,7 @@ fn tweak_overlap_quality(a: &mut Node, b: &mut Node) {
                         break;
                     }
                 }
-            } else if prev_is_del(&a_cur, &a_cigar) {
+            } else if prev_is_del(&a_cur, a_rec) {
                 // Del in A moved it ahead of B: chase B forward.
                 loop {
                     let i = b_cur.iseq as usize;
@@ -959,7 +1506,7 @@ fn tweak_overlap_quality(a: &mut Node, b: &mut Node) {
 
         let ai = a_cur.iseq as usize;
         let bi = b_cur.iseq as usize;
-        if a_rec.seq()[ai] == b_rec.seq()[bi] {
+        if a_rec.base_at(ai) == b_rec.base_at(bi) {
             // Confident match: sum of qualities capped at 200; keep the
             // selected end's sum, zero the other.
             let sum = a_qual[ai] as i32 + b_qual[bi] as i32;

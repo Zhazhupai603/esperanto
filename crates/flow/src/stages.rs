@@ -100,10 +100,15 @@ pub fn run_from(
             } else {
                 current_bam = map_dir.join("sorted.bam");
             }
-            if entry == Entry::FastqSe {
-                // The SE mapper writes .baln; use it as the scan fast channel.
-                baln = Some(map_dir.join("align.baln"));
-            }
+            // The mapper writes .baln for SE and PE alike; use it as the
+            // scan fast channel. A missing or stub (0-byte, pre-channel
+            // run directories) .baln falls back to the BAM.
+            let baln_path = map_dir.join("align.baln");
+            baln = baln_path
+                .metadata()
+                .map(|m| m.len() > 12)
+                .unwrap_or(false)
+                .then_some(baln_path);
         }
         Entry::Bam | Entry::BamSites => {
             if let Some(bam) = &params.bam {
@@ -784,6 +789,7 @@ fn stage_score(
         None,
         params.device,
         ask,
+        None,
     )
     .map_err(anyhow_stage_err("score"))?;
 

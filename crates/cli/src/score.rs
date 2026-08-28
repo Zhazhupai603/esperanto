@@ -20,6 +20,9 @@ pub struct ScoreArgs {
     /// Reference FASTA (default: refs discovery).
     #[arg(long)]
     fasta: Option<PathBuf>,
+    /// Optional .baln fast channel for the pileup pass (default: BAM).
+    #[arg(long)]
+    baln: Option<PathBuf>,
     /// Model bundle root (default: zero-config 5-level fallback).
     #[arg(long)]
     bundle: Option<PathBuf>,
@@ -33,7 +36,7 @@ pub struct ScoreArgs {
     #[arg(long, default_value_t = 0)]
     threads: usize,
     /// Batch size.
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, default_value_t = 256)]
     batch: usize,
     /// Encoder device: auto (ask when a CUDA GPU is detected), cpu, or gpu.
     #[arg(long, value_enum, default_value_t = DeviceArg::Auto)]
@@ -67,6 +70,7 @@ pub fn run(a: ScoreArgs) -> anyhow::Result<()> {
         None,
         a.device.resolve(),
         Some(&ask),
+        a.baln.as_deref(),
     )?;
     let mut buf = String::new();
     for ((chrom, pos), prob) in sites.iter().zip(&probs) {

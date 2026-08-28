@@ -21,7 +21,7 @@ BAM + sites → RE_PROB TSV (chrom pos prob; row order = input sites row order).
 ## Pipeline (determinism contract)
 
 - Reference preload: contigs involved in sites are loaded into memory once (uppercase); **species guardrail**: chr1 length in .fai must be == 248956422 (hg38) or < 10 Mb (synthetic/test reference), otherwise the run is refused.
-- Sites are sorted by (chrom, pos) and cut into batches (default 64), batch-level rayon (0 = all cores); within a batch: pileup → gate → kept sites embedded in EMBED_SLICE=128 sub-batches → fused head; results written back by original index — **thread count and batch size do not change values**.
+- Sites are sorted by (chrom, pos); pileup features for all sites come from one region-sweep pass (MERGE_GAP groups, one IndexedReader per worker), then sites are cut into batches (default 256), batch-level rayon (0 = all cores); within a batch: gate → kept sites embedded in EMBED_SLICE=128 sub-batches → fused head; results written back by original index — **thread count and batch size do not change values**.
 - Output: TSV `chrom\tpos\tprob` (f64 Display); row order = input order.
 
 ## Embedding cache (optional optimization)

@@ -20,7 +20,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), version
   real scale and the score stage shrinks from hours to minutes on such
   samples.
 
+- The pileup engine is now event-driven: records stream once per region
+  (nodes retire through an end-keyed heap, columns are built only at site
+  positions, and a MAXCNT-saturated group falls back to the exact per-site
+  sweep). Pileup time on candidate-dense real data drops by ~20x with
+  bit-identical features elsewhere.
 
+### Added
+
+- Paired-end runs now write the `.baln` fast channel too (previously a
+  zero-byte stub), and the scan stage uses it for PE entries with a BAM
+  fallback for stub/absent files; `score --baln` is available as an
+  experimental pileup source.
+
+### Changed
+
+- Score runs its pileup pass as a single region sweep per worker instead
+  of per-64-site fetches, and the default score batch is 256 (numerics are
+  unchanged by construction: identical sites, identical record sets,
+  identical model). Pileup features now skip `RE:Z:collapsed` records,
+  matching the scan evidence rule; on rescue-heavy samples the depth
+  features (and downstream gate/score inputs) change accordingly.
+ dev/pile-stream
 - The installer detects a working NVIDIA driver and downloads the
   GPU-enabled build automatically, falling back to the CPU build when the
   GPU asset is unavailable. On a GPU-enabled build, `--device auto` asks

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+esperanto-bamio = { path = "../bamio" }
 ndarray.workspace = true
 half.workspace = true
 serde.workspace = true

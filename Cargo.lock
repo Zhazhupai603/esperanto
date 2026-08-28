@@ -832,6 +832,7 @@ dependencies = [
 name = "esperanto-pile"
 version = "1.0.2"
 dependencies = [
+ "esperanto-bamio",
  "rust-htslib",
  "thiserror 2.0.20",
 ]
@@ -860,6 +861,7 @@ dependencies = [
 name = "esperanto-scan"
 version = "1.0.2"
 dependencies = [
+ "esperanto-bamio",
  "flate2",
  "rayon",
  "rust-htslib",
@@ -874,6 +876,7 @@ version = "1.0.2"
 dependencies = [
  "anyhow",
  "candle-core",
+ "esperanto-bamio",
  "esperanto-pile",
  "faer",
  "half",

@@ -46,7 +46,7 @@ Parallel over (contig, 32 Mbp blocks); each read's contribution is scattered dir
 
 ## Dependencies
 
-rust-htslib (BAM path + faidx), thiserror, serde/serde_json (spec), rayon, flate2 (annotation gz). Does not depend on other esperanto crates (the .baln format is parsed self-contained).
+rust-htslib (BAM path + faidx), thiserror, serde/serde_json (spec), rayon, flate2 (annotation gz), esperanto-bamio (canonical `.baln` reader, shared with score/pileup).
 
 ## Self-checks
 

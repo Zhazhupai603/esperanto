@@ -25,11 +25,6 @@ use crate::encoder::{fetch_window_mem_hw, tokenize};
 use crate::head::{gate_prob_ensemble, re_prob_ensemble};
 
 /// Batch-level worker: one per rayon thread (BAM reader + reused encoding buffers).
-struct ScoreBatchWorker {
-    bam: rust_htslib::bam::IndexedReader,
-    bufs: EmbedBatchBufs,
-}
-
 /// Compute device for the encoder stage (CLI `--device`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum DeviceChoice {
@@ -111,17 +106,14 @@ struct ChunkCpuWork {
     toks: Vec<i64>,
 }
 
-/// Producer half of `process_chunk`: pileup + gate + cache split + tokenize (no embed, no head).
+/// Producer half of `process_chunk`: gate + cache split + tokenize (no embed, no head).
+/// Pileup features arrive precomputed from the region-sweep pass (phase 1) —
+/// the veto gate consumes them ahead of caching/encoding.
 fn process_chunk_cpu_half(
     ctx: &ChunkCtx,
-    bam: &mut rust_htslib::bam::IndexedReader,
     chunk: &[(String, i64)],
+    piles: Vec<[f32; esperanto_pile::N_FEATURES]>,
 ) -> Result<ChunkCpuWork, String> {
-    // Sites in a chunk are fetched in one batch grouped by coordinate (same record set as per-site);
-    // pileup is moved ahead of caching/encoding -- it is the veto gate's input.
-    let refs: Vec<(&str, i64)> = chunk.iter().map(|(c, p)| (c.as_str(), *p)).collect();
-    let piles = esperanto_pile::extract_pileup_features_batch(bam, &refs)
-        .map_err(|e| format!("pileup batch: {e}"))?;
     // Veto gate: gate RE_PROB < threshold -> skip the encoder and emit the gate probability directly;
     // kept sites take the original path (embed + fusion head, numerically bit-identical to no-gate).
     let mut final_probs: Vec<Option<f64>> = Vec::with_capacity(chunk.len());
@@ -228,14 +220,103 @@ fn process_chunk_rest(
 /// Process one (chrom,pos)-sorted batch chunk end to end (CPU mode: both halves in sequence).
 /// Shared verbatim by the CPU and GPU modes (only the `embedder` differs); output order
 /// follows `chunk`.
+/// Phase-1 pileup: features for every site via region groups (MERGE_GAP
+/// runs capped at 16k sites), parallel across workers with one
+/// IndexedReader each. Results follow `sorted` order.
+fn pileup_all(
+    bam: &Path,
+    baln: Option<&Path>,
+    sorted: &[(String, i64)],
+    threads: usize,
+) -> Result<Vec<[f32; esperanto_pile::N_FEATURES]>> {
+    if sorted.is_empty() {
+        return Ok(Vec::new());
+    }
+    const GROUP_CAP: usize = 16_384;
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    for i in 1..=sorted.len() {
+        let boundary = i == sorted.len()
+            || i - start >= GROUP_CAP
+            || sorted[i].0 != sorted[i - 1].0
+            || sorted[i].1 - sorted[i - 1].1 > esperanto_pile::MERGE_GAP;
+        if boundary {
+            groups.push((start, i));
+            start = i;
+        }
+    }
+    let pool = match threads {
+        0 => rayon::ThreadPoolBuilder::new().build(),
+        n => rayon::ThreadPoolBuilder::new().num_threads(n).build(),
+    }
+    .context("build pileup thread pool")?;
+    // Fast channel: `.baln` is uncompressed flat binary and pread-shareable —
+    // one file handle serves every group, no BGZF, no per-worker readers.
+    if let Some(baln) = baln {
+        // The coordinate index is built once per run and shared read-only;
+        // the file handle is pread-shared across group workers.
+        let bindex = esperanto_bamio::baln::BalnReader::build_index(baln)
+            .map_err(|e| anyhow!("baln index {}: {e}", baln.display()))?;
+        let bfile = std::fs::File::open(baln)?;
+        let per_group: Vec<Result<Vec<[f32; esperanto_pile::N_FEATURES]>, String>> = pool
+            .install(|| {
+                groups
+                    .par_iter()
+                    .map(|&(lo, hi)| {
+                        let refs: Vec<(&str, i64)> = sorted[lo..hi]
+                            .iter()
+                            .map(|(c, p)| (c.as_str(), *p))
+                            .collect();
+                        esperanto_pile::extract_pileup_features_batch_baln(&bindex, &bfile, &refs)
+                            .map_err(|e| format!("pileup group (baln): {e}"))
+                    })
+                    .collect()
+            });
+        let mut out = Vec::with_capacity(sorted.len());
+        for (gi, g) in per_group.into_iter().enumerate() {
+            let g = g.map_err(|e| anyhow!("pileup group {gi}: {e}"))?;
+            out.extend_from_slice(&g);
+        }
+        return Ok(out);
+    }
+    let per_group: Vec<Result<Vec<[f32; esperanto_pile::N_FEATURES]>, String>> = pool.install(|| {
+        groups
+            .par_iter()
+            .map_init(
+                || -> Result<rust_htslib::bam::IndexedReader, String> {
+                    rust_htslib::bam::IndexedReader::from_path(bam).map_err(|e| format!("open bam: {e}"))
+                },
+                |r, &(lo, hi)| {
+                    let r = match r.as_mut() {
+                        Ok(r) => r,
+                        Err(e) => return Err(e.clone()),
+                    };
+                    let refs: Vec<(&str, i64)> = sorted[lo..hi]
+                        .iter()
+                        .map(|(c, p)| (c.as_str(), *p))
+                        .collect();
+                    esperanto_pile::extract_pileup_features_batch(r, &refs)
+                        .map_err(|e| format!("pileup group: {e}"))
+                },
+            )
+            .collect()
+    });
+    let mut out = Vec::with_capacity(sorted.len());
+    for (gi, g) in per_group.into_iter().enumerate() {
+        let g = g.map_err(|e| anyhow!("pileup group {gi}: {e}"))?;
+        out.extend_from_slice(&g);
+    }
+    Ok(out)
+}
+
 fn process_chunk(
     ctx: &ChunkCtx,
-    bam: &mut rust_htslib::bam::IndexedReader,
+    piles: Vec<[f32; esperanto_pile::N_FEATURES]>,
     bufs: &mut EmbedBatchBufs,
     embedder: &Embedder,
     chunk: &[(String, i64)],
 ) -> Result<Vec<f64>, String> {
-    let work = process_chunk_cpu_half(ctx, bam, chunk)?;
+    let work = process_chunk_cpu_half(ctx, chunk, piles)?;
     process_chunk_rest(ctx, work, bufs, embedder, chunk)
 }
 
@@ -289,6 +370,8 @@ pub fn score_sites_batched(
     // Invoked at most once per call, only for `Auto` when a GPU is actually available
     // (the CLI's interactive once-per-process selector; `None` = never ask -> CPU).
     device_ask: Option<&(dyn Fn() -> bool + Send + Sync)>,
+    // Optional `.baln` fast channel for the pileup pass (falls back to BAM).
+    baln: Option<&Path>,
 ) -> Result<Vec<f64>> {
     let bundle = load_bundle(bundle).context("load bundle")?;
     // The veto gate is mandatory for score (bundle contract; no switch, no fallback).
@@ -397,6 +480,18 @@ pub fn score_sites_batched(
         emb_cache,
     };
 
+    // Phase 1: region-sweep pileup for every site. Grouping follows the
+    // pile crate's MERGE_GAP runs (each group = one fetch + sweep, same
+    // record set per site as the per-batch calls), so every BGZF region is
+    // decompressed once per worker instead of once per 64-site batch.
+    let tp = std::time::Instant::now();
+    let piles_all = pileup_all(bam, baln, &sorted, threads)?;
+    eprintln!(
+        "[score] pileup: {} sites, {:.1}s",
+        sorted.len(),
+        tp.elapsed().as_secs_f64()
+    );
+
     let nb = sorted.len().div_ceil(batch);
     let t0 = std::time::Instant::now();
     let results: Vec<Result<Vec<f64>, String>> = if use_gpu {
@@ -427,35 +522,22 @@ pub fn score_sites_batched(
             let next_bi = std::sync::atomic::AtomicUsize::new(0);
             let sorted_ref = &sorted;
             let ctx_ref = &ctx;
+            let piles_ref = &piles_all;
             std::thread::scope(|s| {
                 let workers: Vec<_> = (0..pileup_threads)
                     .map(|_| {
                         let tx = tx.clone();
                         let next_bi = &next_bi;
-                        s.spawn(move || {
-                            // One reader per pileup thread (ScoreBatchWorker pattern); a failed
-                            // open reports an error for every batch this worker would have run.
-                            let (mut reader, open_err) =
-                                match rust_htslib::bam::IndexedReader::from_path(bam) {
-                                    Ok(r) => (Some(r), None),
-                                    Err(e) => (None, Some(format!("open bam: {e}"))),
-                                };
-                            loop {
-                                let bi = next_bi.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if bi >= nb {
-                                    break;
-                                }
-                                let lo = bi * batch;
-                                let hi = (lo + batch).min(sorted_ref.len());
-                                let work = match &mut reader {
-                                    Some(r) => {
-                                        process_chunk_cpu_half(ctx_ref, r, &sorted_ref[lo..hi])
-                                    }
-                                    None => Err(open_err.clone().expect("set when reader is None")),
-                                };
-                                if tx.send((bi, work)).is_err() {
-                                    break; // receiver gone; stop cleanly
-                                }
+                        s.spawn(move || loop {
+                            let bi = next_bi.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if bi >= nb {
+                                break;
+                            }
+                            let lo = bi * batch;
+                            let hi = (lo + batch).min(sorted_ref.len());
+                            let work = process_chunk_cpu_half(ctx_ref, &sorted_ref[lo..hi], piles_ref[lo..hi].to_vec());
+                            if tx.send((bi, work)).is_err() {
+                                break; // receiver gone; stop cleanly
                             }
                         })
                     })
@@ -505,24 +587,17 @@ pub fn score_sites_batched(
         pool.install(|| {
             (0..nb)
                 .into_par_iter()
-                .map_init(
-                    || -> Result<ScoreBatchWorker, String> {
-                        Ok(ScoreBatchWorker {
-                            bam: rust_htslib::bam::IndexedReader::from_path(bam)
-                                .map_err(|e| format!("open bam: {e}"))?,
-                            bufs: Default::default(),
-                        })
-                    },
-                    |w, bi| {
-                        let w = match w.as_mut() {
-                            Ok(w) => w,
-                            Err(e) => return Err(e.clone()),
-                        };
-                        let lo = bi * batch;
-                        let hi = (lo + batch).min(sorted.len());
-                        process_chunk(&ctx, &mut w.bam, &mut w.bufs, &embedder, &sorted[lo..hi])
-                    },
-                )
+                .map_init(EmbedBatchBufs::default, |bufs, bi| {
+                    let lo = bi * batch;
+                    let hi = (lo + batch).min(sorted.len());
+                    process_chunk(
+                        &ctx,
+                        piles_all[lo..hi].to_vec(),
+                        bufs,
+                        &embedder,
+                        &sorted[lo..hi],
+                    )
+                })
                 .collect()
         })
     };
