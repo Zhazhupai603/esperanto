@@ -3,7 +3,7 @@
 All notable changes to ESPERANTO are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [1.0.3] - 2026-08-29
 
 ### Added
 

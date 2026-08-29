@@ -2,7 +2,7 @@
 
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Language: Rust](https://img.shields.io/badge/language-Rust-orange.svg)
-![Version](https://img.shields.io/badge/version-1.0.2-green.svg)
+![Version](https://img.shields.io/badge/version-1.0.3-green.svg)
 
 ESPERANTO is a command-line toolkit for detecting RNA editing (A-to-I) sites from
 RNA-seq data. It runs quality control, splice-aware alignment, candidate calling,

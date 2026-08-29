@@ -3,3 +3,5 @@
 target/
 .ruff_cache/
 worknotes/
+.playwright-mcp/
+*.png
