@@ -3,22 +3,12 @@
 All notable changes to ESPERANTO are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows [SemVer](https://semver.org/).
 
-## [Unreleased]
-
-### Changed
-
-- Large reference downloads run as parallel resumable chunks (6 streams,
-  per-chunk retry, mirror fallback); a dropped connection resumes where
-  it stopped instead of restarting. The mouse reference is staged on
-  demand at the first `--hybrid` run instead of during setup, and setup
-  no longer downloads the (optional) mouse annotation.
-
 ## [1.0.3] - 2026-08-29
 
 ### Added
 
-- Hybrid references for knock-in mouse models: `setup` stages both the
-  human and mouse references, and `run --hybrid GENE[,GENE...]` splices the
+- Hybrid references for knock-in mouse models: `run --hybrid
+  GENE[,GENE...]` stages the mouse reference on demand and splices the
   selected human gene loci (full locus incl. introns) onto the mouse
   baseline, building the hybrid index on first use and reusing it on later
   runs (bare `--hybrid` opens an interactive gene picker). Scoring routes
@@ -30,6 +20,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), version
   guardrail and the report's contig list.
 
 ### Changed
+- Large reference downloads run as parallel resumable chunks (6 streams,
+  per-chunk retry, mirror fallback); a dropped connection resumes where
+  it stopped instead of restarting. The mouse reference is staged on
+  demand at the first `--hybrid` run instead of during setup, and setup
+  no longer downloads the (optional) mouse annotation.
 
 - The HTML report is named `<sample>.report.html` and gains a red
   region-level hyperedited-density track (rescued-read counts per window)

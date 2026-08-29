@@ -271,7 +271,7 @@ pub fn run(a: SetupArgs) -> anyhow::Result<()> {
 
     eprintln!("[setup] done. Run with:");
     eprintln!("  esperanto run --r1 <reads.fq.gz> --out out/");
-    eprintln!("  esperanto run --r1 <reads.fq.gz> --out out/ --hybrid APOE4   (knock-in mouse)");
+    eprintln!("  esperanto run --r1 <reads.fq.gz> --out out/ --hybrid APOE    (knock-in mouse)");
     Ok(())
 }
 
