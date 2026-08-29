@@ -18,8 +18,10 @@ const RELEASE_TARBALL_URL: &str = "https://github.com/Zhazhupai603/esperanto/rel
 /// Mouse reference (GENCODE GRCm39 primary assembly), always staged so
 /// hybrid runs can splice human loci onto it on demand.
 const MOUSE_FA_URL: &str = "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M36/GRCm39.primary_assembly.genome.fa.gz";
-/// Mouse transcript annotation (GENCODE vM36 basic).
+/// Mouse transcript annotation (GENCODE vM36 basic, GRCm39).
 const MOUSE_GTF_URL: &str = "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M36/gencode.vM36.basic.annotation.gtf.gz";
+/// Mouse transcript annotation for mm10/GRCm38 baselines (GENCODE vM25).
+const MOUSE_GTF_M25_URL: &str = "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M25/gencode.vM25.basic.annotation.gtf.gz";
 
 #[derive(Args)]
 pub struct SetupArgs {
@@ -236,9 +238,22 @@ pub fn run(a: SetupArgs) -> anyhow::Result<()> {
         eprintln!("[setup] mouse reference downloaded (staged for hybrid runs)");
     }
     let mouse_fasta = mouse_fa.expect("mouse fasta set above");
-    if mouse_gtf.is_none() && !dir.join("gencode.vM36.basic.annotation.gtf").exists() {
-        let gtf_gz = dir.join("gencode.vM36.basic.annotation.gtf.gz");
-        download(MOUSE_GTF_URL, &gtf_gz)?;
+    if mouse_gtf.is_none() {
+        // The GTF release must match the staged mouse assembly
+        // (GRCm38/mm10 <-> vM25, GRCm39 <-> vM36); mismatched coordinates
+        // silently shift the junction library.
+        let (rel, url) = if mouse_fasta
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().to_lowercase().contains("mm10"))
+        {
+            ("vM25", MOUSE_GTF_M25_URL)
+        } else {
+            ("vM36", MOUSE_GTF_URL)
+        };
+        let gtf_gz = dir.join(format!("gencode.{rel}.basic.annotation.gtf.gz"));
+        if !dir.join(format!("gencode.{rel}.basic.annotation.gtf")).exists() {
+            download(url, &gtf_gz)?;
+        }
         mouse_gtf = Some(gunzip_in_place(&gtf_gz)?);
     }
     if mouse_gtf.is_none() {

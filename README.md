@@ -134,7 +134,7 @@ one row per called site, `FILTER=PASS` when `RE_PROB >= 0.5`, with `RE_PROB`,
 `VAF`, `DEPTH`, strand, and evidence annotations. Open
 `<out>/<sample>/<sample>.report.html` in a browser for the interactive report.
 
-Knock-in mouse models (e.g. APOE4 KI): setup stages both the human and
+Knock-in mouse models (e.g. APOE knock-in): setup stages both the human and
 mouse references (and both model bundles), and `run --hybrid GENE[,GENE...]`
 splices the selected human gene loci onto the mouse baseline — building
 the hybrid index on first use and reusing it on later runs. Scoring routes
@@ -143,9 +143,11 @@ the mouse model (installed bundles only; without a mouse bundle,
 mouse-contig sites are reported UNSCORED with VAF/depth):
 
 ```sh
-esperanto run --r1 reads_R1.fq.gz --r2 reads_R2.fq.gz --out runs/ --hybrid APOE4
+esperanto run --r1 reads_R1.fq.gz --r2 reads_R2.fq.gz --out runs/ --hybrid APOE
 ```
 
+Symbols follow the annotation's gene names: the human APOE locus is `APOE`
+(the ε2/ε3/ε4 alleles are haplotypes of the same gene, not separate symbols).
 An interrupted run resumes with one command — no flags, it re-reads the
 frozen parameters and continues from the first broken stage (an intact
 alignment is never re-run):

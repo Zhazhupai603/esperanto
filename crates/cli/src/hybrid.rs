@@ -38,13 +38,23 @@ pub fn resolve(genes: Option<Vec<String>>) -> anyhow::Result<PathBuf> {
     let mut sorted = genes.clone();
     sorted.sort();
     sorted.dedup();
-    let key = format!("grcm39+{}", sorted.join("+"));
+    // Baseline tag follows the staged mouse assembly (name-carried):
+    // mm10-named files keep mm10 coordinates, grcm39-named keep grcm39.
+    let baseline = if mouse_fa
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().to_lowercase().contains("mm10"))
+    {
+        "mm10"
+    } else {
+        "grcm39"
+    };
+    let key = format!("{baseline}+{}", sorted.join("+"));
     let dir = refs.join("hybrid").join(&key);
     if dir.join("species.json").is_file() && dir.join("hybrid.paidx").is_file() {
         eprintln!("[hybrid] {} found; reusing the built index", dir.display());
         return Ok(dir);
     }
-    build(&dir, &human_fa, &human_gtf, &mouse_fa, mouse_gtf, &sorted)?;
+    build(&dir, baseline, &human_fa, &human_gtf, &mouse_fa, mouse_gtf, &sorted)?;
     eprintln!("[hybrid] built {} -> {}", key, dir.display());
     Ok(dir)
 }
@@ -59,6 +69,20 @@ fn tagged(dir: &Path, species: &str, exts: &[&str]) -> anyhow::Result<PathBuf> {
                 .is_some_and(|n| crate::resolve::species_of(&n.to_string_lossy()) == Some(species))
         })
         .collect();
+    if hits.is_empty() && species == "human" {
+        // Default installs carry an unmarked human GTF (gencode.vXX);
+        // accept a single unmarked file when nothing species-tagged exists.
+        let unmarked: Vec<PathBuf> = crate::resolve::find_all(dir, exts)?
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| crate::resolve::species_of(&n.to_string_lossy()).is_none())
+            })
+            .collect();
+        if unmarked.len() == 1 {
+            return Ok(unmarked.into_iter().next().expect("len 1"));
+        }
+    }
     match hits.len() {
         1 => Ok(hits.into_iter().next().expect("len 1")),
         0 => bail!(
@@ -156,6 +180,7 @@ fn gene_spans(gtf: &Path, wanted: &[String]) -> anyhow::Result<Vec<Locus>> {
 /// species.json, and the full index set.
 fn build(
     dir: &Path,
+    baseline: &str,
     human_fa: &Path,
     human_gtf: &Path,
     mouse_fa: &Path,
@@ -232,7 +257,7 @@ fn build(
     std::fs::write(&hybrid_gtf, &gtf_out).context("write hybrid gtf")?;
 
     // --- species.json ---
-    let mut manifest = esperanto_flow::manifest::SpeciesManifest::single("hybrid", "grcm39");
+    let mut manifest = esperanto_flow::manifest::SpeciesManifest::single("hybrid", baseline);
     manifest.human_loci = owner.clone();
     let fai_text = std::fs::read_to_string(dir.join("hybrid.fa.fai"))?;
     for line in fai_text.lines() {
