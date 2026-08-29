@@ -58,7 +58,7 @@ pub fn write_vcf(
     params: &RunParams,
     entry: Entry,
     sites: &[(String, i64)],
-    probs: &[f64],
+    probs: &[Option<f64>],
 ) -> Result<(), FlowError> {
     let bed_rows: Option<Vec<BedInfo>> = match entry {
         Entry::BamSites => None,
@@ -106,16 +106,23 @@ pub fn write_vcf(
     out.push_str("##INFO=<ID=EVID,Number=1,Type=String,Description=\"Evidence type (scan)\">\n");
     out.push_str("##FILTER=<ID=PASS,Description=\"RE_PROB >= 0.5\">\n");
     out.push_str("##FILTER=<ID=LOW_SCORE,Description=\"RE_PROB < 0.5\">\n");
+    out.push_str("##FILTER=<ID=UNSCORED,Description=\"site on a contig with no matching model (hybrid reference)\">\n");
     out.push_str("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n");
 
     for (i, ((chrom, pos), prob)) in sites.iter().zip(probs).enumerate() {
-        let filter = if *prob >= 0.5 { "PASS" } else { "LOW_SCORE" };
-        let mut info = format!("RE_PROB={prob}");
+        let (filter, mut info) = match prob {
+            Some(p) => (
+                if *p >= 0.5 { "PASS" } else { "LOW_SCORE" },
+                format!("RE_PROB={p}"),
+            ),
+            None => ("UNSCORED", String::new()),
+        };
         if let Some(rows) = &bed_rows {
             let r = &rows[i];
+            let sep = if info.is_empty() { "" } else { ";" };
             let _ = write!(
                 info,
-                ";VAF={};DEPTH={};STRAND={};EVID={}",
+                "{sep}VAF={};DEPTH={};STRAND={};EVID={}",
                 r.vaf, r.depth, r.strand, r.evid
             );
         }

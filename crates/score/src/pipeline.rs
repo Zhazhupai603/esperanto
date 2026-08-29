@@ -356,6 +356,16 @@ pub fn parse_sites(text: &str) -> Result<Vec<(String, i64)>> {
     Ok(out)
 }
 
+/// Species-guard mode for [`score_sites_batched`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReferenceCheck {
+    /// Default: the fasta's chr1 must match hg38 (or be a small synthetic reference).
+    #[default]
+    Guardrail,
+    /// Hybrid reference verified upstream against its species.json manifest.
+    TrustedHybrid,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn score_sites_batched(
     bam: &Path,
@@ -372,6 +382,8 @@ pub fn score_sites_batched(
     device_ask: Option<&(dyn Fn() -> bool + Send + Sync)>,
     // Optional `.baln` fast channel for the pileup pass (falls back to BAM).
     baln: Option<&Path>,
+    // Species-guard mode (Guardrail for all standalone callers).
+    reference_check: ReferenceCheck,
 ) -> Result<Vec<f64>> {
     let bundle = load_bundle(bundle).context("load bundle")?;
     // The veto gate is mandatory for score (bundle contract; no switch, no fallback).
@@ -420,8 +432,11 @@ pub fn score_sites_batched(
             .with_context(|| format!("read {}.fai", fasta.display()))?;
         // Species guard: the bundle is a human hg38 model; if a real-size reference's chr1 length
         // does not match, refuse to run (hg38 chr1 = 248,956,422); small (<10Mb) is treated as a
-        // synthetic/test reference and the check is skipped.
-        if let Some(l) = fai_text.lines().find(|l| l.starts_with("chr1\t")) {
+        // synthetic/test reference and the check is skipped. TrustedHybrid skips the chr1 check:
+        // the caller verified the hybrid reference against its species.json manifest.
+        if reference_check == ReferenceCheck::TrustedHybrid {
+            // verified upstream; skip the chr1 heuristic
+        } else if let Some(l) = fai_text.lines().find(|l| l.starts_with("chr1\t")) {
             let len: u64 = l
                 .split('\t')
                 .nth(1)

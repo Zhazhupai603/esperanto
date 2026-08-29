@@ -626,6 +626,9 @@
         { label: 'Recoded proteins', value: formatNumber(reportData.metrics.recodings), tip: 'Number of amino acid changes caused by editing.' },
         { label: 'Rescued hyperedited reads', value: formatNumber(reportData.metrics.rescued), tip: 'Reads with dense editing rescued by the hyperediting pipeline.' }
       ];
+      if (reportData.metrics.unscored > 0) {
+        metrics.push({ label: 'Unscored (no matching model)', value: formatNumber(reportData.metrics.unscored), tip: 'Sites on contigs without a matching scoring model (hybrid reference).' });
+      }
       
       document.getElementById('metrics-container').innerHTML = metrics.map(m => `
         <div class="card">
@@ -1033,7 +1036,7 @@
                     <tr ${highlightPos === s[0] ? 'style="background: var(--accent-muted);"' : ''}>
                       <td>${formatNumber(s[0])}</td>
                       <td>${s[5] || '-'}</td>
-                      <td>${s[1].toFixed(3)}</td>
+                      <td>${s[1] == null ? 'NA' : s[1].toFixed(3)}</td>
                       <td>${s[2].toFixed(3)}</td>
                       <td>${s[3]}</td>
                       <td><span class="badge ${s[4] ? 'pass' : 'fail'}">${s[4] ? 'Pass' : 'Filtered'}</span></td>
@@ -1091,7 +1094,7 @@
         const cy = height - padBottom - (vaf * (height - padding - padBottom));
         const r = 3 + (depth / maxDepth) * 5;
         const fill = pass ? 'var(--accent)' : '#d1d5db';
-        const tip = `Pos: ${formatNumber(pos)} | Gene: ${gene || 'Intergenic'} | Prob: ${prob.toFixed(3)} | VAF: ${vaf.toFixed(3)} | Depth: ${depth}`;
+        const tip = `Pos: ${formatNumber(pos)} | Gene: ${gene || 'Intergenic'} | Prob: ${prob == null ? 'NA' : prob.toFixed(3)} | VAF: ${vaf.toFixed(3)} | Depth: ${depth}`;
         
         let highlight = '';
         if (highlightPos && pos === highlightPos) {

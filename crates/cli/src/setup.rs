@@ -15,6 +15,11 @@ const GENCODE_GTF_URL: &str =
 /// Release tarball providing the model bundle when none is installed
 /// (same pin as install.sh).
 const RELEASE_TARBALL_URL: &str = "https://github.com/Zhazhupai603/esperanto/releases/download/v1.0.0/esperanto-1.0.0-linux-x86_64.tar.gz";
+/// Mouse reference (GENCODE GRCm39 primary assembly), always staged so
+/// hybrid runs can splice human loci onto it on demand.
+const MOUSE_FA_URL: &str = "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M36/GRCm39.primary_assembly.genome.fa.gz";
+/// Mouse transcript annotation (GENCODE vM36 basic).
+const MOUSE_GTF_URL: &str = "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M36/gencode.vM36.basic.annotation.gtf.gz";
 
 #[derive(Args)]
 pub struct SetupArgs {
@@ -26,34 +31,6 @@ pub struct SetupArgs {
 /// The fixed setup folder (`ESPERANTO_REFS` honored): shared resolver.
 fn refs_dir() -> PathBuf {
     crate::resolve::home_refs_dir()
-}
-
-/// The single file in `dir` matching one of `exts` (exact, case-sensitive).
-/// `None` when absent; an error listing the matches when ambiguous.
-fn find_one(dir: &Path, exts: &[&str]) -> anyhow::Result<Option<PathBuf>> {
-    let mut hits: Vec<PathBuf> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.is_file()
-                && exts.iter().any(|x| {
-                    p.file_name()
-                        .is_some_and(|n| n.to_string_lossy().ends_with(x))
-                })
-        })
-        .collect();
-    hits.sort();
-    if hits.len() > 1 {
-        anyhow::bail!(
-            "multiple candidate files in {}: {}; keep exactly one",
-            dir.display(),
-            hits.iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-    Ok(hits.pop())
 }
 
 /// Decompress a `.gz` file next to itself; the archive is removed.
@@ -83,7 +60,7 @@ fn download(url: &str, dest: &Path) -> anyhow::Result<()> {
 
 /// Write the standard `<fasta>.fai` (name, length, offset, line bases,
 /// line width) without depending on external tools.
-fn write_fai(fasta: &Path) -> anyhow::Result<()> {
+pub(crate) fn write_fai(fasta: &Path) -> anyhow::Result<()> {
     let data = std::fs::read(fasta)?;
     let mut fai = String::new();
     let mut i = 0usize;
@@ -140,61 +117,195 @@ pub fn run(a: SetupArgs) -> anyhow::Result<()> {
     std::fs::create_dir_all(&dir)?;
     eprintln!("[setup] refs directory: {}", dir.display());
 
-    // --- locate or fetch the reference files ---
-    let mut fasta = find_one(&dir, &[".fa", ".fasta"])?;
-    let mut gtf = find_one(&dir, &[".gtf"])?;
-    if fasta.is_none() {
-        if let Some(gz) = find_one(&dir, &[".fa.gz", ".fasta.gz"])? {
-            eprintln!("[setup] decompressing {}", gz.display());
-            fasta = Some(gunzip_in_place(&gz)?);
+    // --- decompress any gzipped reference files in place (archives removed) ---
+    for gz in crate::resolve::find_all(&dir, &[".fa.gz", ".fasta.gz", ".gtf.gz"])? {
+        eprintln!("[setup] decompressing {}", gz.display());
+        gunzip_in_place(&gz)?;
+    }
+
+    // --- split FASTA files by species (names carry the species tag; an
+    // unmarked file is accepted only as the single fasta in the directory) ---
+    let mut human_fa: Option<PathBuf> = None;
+    let mut mouse_fa: Option<PathBuf> = None;
+    let mut untagged: Vec<PathBuf> = Vec::new();
+    for p in crate::resolve::find_all(&dir, &[".fa", ".fasta"])? {
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match crate::resolve::species_of(&name) {
+            Some("human") => {
+                if human_fa.replace(p).is_some() {
+                    anyhow::bail!(
+                        "multiple human FASTA files in {}; keep exactly one",
+                        dir.display()
+                    );
+                }
+            }
+            Some("mouse") => {
+                if mouse_fa.replace(p).is_some() {
+                    anyhow::bail!(
+                        "multiple mouse FASTA files in {}; keep exactly one",
+                        dir.display()
+                    );
+                }
+            }
+            _ => untagged.push(p),
         }
     }
-    if gtf.is_none() {
-        if let Some(gz) = find_one(&dir, &[".gtf.gz"])? {
-            eprintln!("[setup] decompressing {}", gz.display());
-            gtf = Some(gunzip_in_place(&gz)?);
+    if !untagged.is_empty() {
+        if untagged.len() == 1 && human_fa.is_none() && mouse_fa.is_none() {
+            human_fa = untagged.pop(); // legacy single-species directory
+        } else {
+            anyhow::bail!(
+                "unrecognizable FASTA name(s) in {}: {}; use a species-tagged name (e.g. hg38.fa / grcm39.fa)",
+                dir.display(),
+                untagged
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
     }
-    if fasta.is_none() && gtf.is_none() {
-        // Nothing placed: fetch the defaults. The downloaded archives are
-        // removed after decompression; the plain files stay (they are the
-        // runtime reference).
+    let mut human_gtf: Option<PathBuf> = None;
+    let mut mouse_gtf: Option<PathBuf> = None;
+    for p in crate::resolve::find_all(&dir, &[".gtf"])? {
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match crate::resolve::species_of(&name) {
+            Some("human") => {
+                if human_gtf.replace(p).is_some() {
+                    anyhow::bail!(
+                        "multiple human GTF files in {}; keep exactly one",
+                        dir.display()
+                    );
+                }
+            }
+            Some("mouse") => {
+                if mouse_gtf.replace(p).is_some() {
+                    anyhow::bail!(
+                        "multiple mouse GTF files in {}; keep exactly one",
+                        dir.display()
+                    );
+                }
+            }
+            _ => {
+                // Unmarked GTF attaches to the only species present.
+                if mouse_fa.is_some() && human_fa.is_none() {
+                    mouse_gtf = Some(p);
+                } else if human_fa.is_some() && mouse_gtf.is_none() {
+                    human_gtf = Some(p);
+                } else {
+                    anyhow::bail!(
+                        "unrecognizable GTF name {} in {}; use a species-tagged name",
+                        p.display(),
+                        dir.display()
+                    );
+                }
+            }
+        }
+    }
+
+    // --- fetch whatever is missing (human default as today; the mouse
+    // reference is always staged so `run --hybrid` can splice onto it) ---
+    let mut fetched_human = false;
+    if human_fa.is_none() {
         let fa_gz = dir.join("GRCh38.primary_assembly.genome.fa.gz");
         download(HG38_FA_URL, &fa_gz)?;
-        fasta = Some(gunzip_in_place(&fa_gz)?);
+        human_fa = Some(gunzip_in_place(&fa_gz)?);
+        fetched_human = true;
+    }
+    if fetched_human && human_gtf.is_none() {
         let gtf_gz = dir.join("gencode.v44.basic.annotation.gtf.gz");
         download(GENCODE_GTF_URL, &gtf_gz)?;
-        gtf = Some(gunzip_in_place(&gtf_gz)?);
+        human_gtf = Some(gunzip_in_place(&gtf_gz)?);
     }
-    let Some(fasta) = fasta else {
-        anyhow::bail!(
-            "GTF found but no FASTA in {}; add the matching reference FASTA",
-            dir.display()
-        );
-    };
-    if gtf.is_none() {
+    if human_gtf.is_none() {
         eprintln!(
             "[setup] no GTF in {}; building the genomic index only (add a GTF and re-run to enable the L1 engine)",
             dir.display()
         );
     }
+    if mouse_fa.is_none() {
+        let fa_gz = dir.join("GRCm39.primary_assembly.genome.fa.gz");
+        download(MOUSE_FA_URL, &fa_gz)?;
+        mouse_fa = Some(gunzip_in_place(&fa_gz)?);
+        eprintln!("[setup] mouse reference downloaded (staged for hybrid runs)");
+    }
+    let mouse_fasta = mouse_fa.expect("mouse fasta set above");
+    if mouse_gtf.is_none() && !dir.join("gencode.vM36.basic.annotation.gtf").exists() {
+        let gtf_gz = dir.join("gencode.vM36.basic.annotation.gtf.gz");
+        download(MOUSE_GTF_URL, &gtf_gz)?;
+        mouse_gtf = Some(gunzip_in_place(&gtf_gz)?);
+    }
+    if mouse_gtf.is_none() {
+        eprintln!("[setup] no mouse GTF in {}; hybrid runs will build a genomic-only mouse baseline", dir.display());
+    }
 
-    // --- .fai when missing ---
+    // --- human reference: fai, validation, index (unchanged behavior) ---
+    let fasta = human_fa.expect("human fasta set above");
     let fai = fasta.with_extension("fa.fai");
     if !fai.is_file() {
         eprintln!("[setup] writing {}", fai.display());
         write_fai(&fasta)?;
     }
+    validate_pair(&fasta, human_gtf.as_deref(), None)?;
 
-    // --- validation: files parse, contigs agree, guardrail holds ---
-    let reference = esperanto_map::fasta::parse_fasta(&fasta)
+    // --- index build ---
+    let stem = fasta
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow::anyhow!("bad fasta name {}", fasta.display()))?;
+    let paidx = dir.join(format!("{stem}.paidx"));
+    if paidx.is_file() && !a.force {
+        eprintln!(
+            "[setup] {} exists; skipping (use --force to rebuild)",
+            paidx.display()
+        );
+    } else {
+        crate::index::build_all(&fasta, human_gtf.as_deref(), &paidx, 15, 5)?;
+    }
+
+    // --- mouse baseline: fai + validation only (hybrid indexes are built
+    // on demand at run time) ---
+    let mfai = mouse_fasta.with_extension("fa.fai");
+    if !mfai.is_file() {
+        eprintln!("[setup] writing {}", mfai.display());
+        write_fai(&mouse_fasta)?;
+    }
+    validate_pair(
+        &mouse_fasta,
+        mouse_gtf.as_deref(),
+        Some(&esperanto_flow::manifest::SpeciesManifest::single("mouse", "grcm39")),
+    )?;
+
+    // --- model bundle (scoring) ---
+    ensure_model_bundle()?;
+
+    eprintln!("[setup] done. Run with:");
+    eprintln!("  esperanto run --r1 <reads.fq.gz> --out out/");
+    eprintln!("  esperanto run --r1 <reads.fq.gz> --out out/ --hybrid APOE4   (knock-in mouse)");
+    Ok(())
+}
+
+/// Validate a fasta(+gtf) pair: both parse, contig names agree, the species
+/// guardrail holds (manifest = Some for known non-human baselines).
+fn validate_pair(
+    fasta: &Path,
+    gtf: Option<&Path>,
+    manifest: Option<&esperanto_flow::manifest::SpeciesManifest>,
+) -> anyhow::Result<()> {
+    let reference = esperanto_map::fasta::parse_fasta(fasta)
         .map_err(|e| anyhow::anyhow!("FASTA {} does not parse: {e}", fasta.display()))?;
     if reference.contigs.is_empty() {
         anyhow::bail!("FASTA {} contains no sequences", fasta.display());
     }
-    esperanto_flow::guard::check_species(&fasta)
+    esperanto_flow::guard::check_species(fasta, manifest)
         .map_err(|e| anyhow::anyhow!("{}: {e}", fasta.display()))?;
-    if let Some(g) = &gtf {
+    if let Some(g) = gtf {
         let set = esperanto_tidx::TranscriptSet::parse(g)
             .map_err(|e| anyhow::anyhow!("GTF {} does not parse: {e}", g.display()))?;
         if set.is_empty() {
@@ -234,27 +345,6 @@ pub fn run(a: SetupArgs) -> anyhow::Result<()> {
         }
         eprintln!("[setup] {} transcripts, contigs agree", set.len());
     }
-
-    // --- index build ---
-    let stem = fasta
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow::anyhow!("bad fasta name {}", fasta.display()))?;
-    let paidx = dir.join(format!("{stem}.paidx"));
-    if paidx.is_file() && !a.force {
-        eprintln!(
-            "[setup] {} exists; skipping (use --force to rebuild)",
-            paidx.display()
-        );
-    } else {
-        crate::index::build_all(&fasta, gtf.as_deref(), &paidx, 15, 5)?;
-    }
-
-    // --- model bundle (scoring) ---
-    ensure_model_bundle()?;
-
-    eprintln!("[setup] done. Run with:");
-    eprintln!("  esperanto run --r1 <reads.fq.gz> --out out/");
     Ok(())
 }
 

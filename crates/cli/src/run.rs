@@ -52,6 +52,10 @@ pub struct RunArgs {
     /// Sample name for the run directory (default: derived from the R1/BAM file name).
     #[arg(long)]
     sample: Option<String>,
+    /// Knock-in mouse run: splice these human genes onto the mouse reference
+    /// (comma-separated symbols; bare --hybrid opens the interactive picker).
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    hybrid: Option<String>,
     /// Worker threads (0 = all cores).
     #[arg(long, default_value_t = 0)]
     threads: usize,
@@ -70,6 +74,20 @@ let bundle = crate::resolve::bundle(&a.bundle)?;
     let mut fasta = a.fasta;
     let mut gtf = a.gtf;
     let mut gnomad = a.gnomad;
+    let mut run_manifest: Option<esperanto_flow::manifest::SpeciesManifest> = None;
+    if let Some(h) = &a.hybrid {
+        let genes = if h.is_empty() {
+            None
+        } else {
+            Some(h.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        };
+        let dir = crate::hybrid::resolve(genes)?;
+        index = Some(dir.join("hybrid.paidx"));
+        fasta = Some(dir.join("hybrid.fa"));
+        let g = dir.join("hybrid.gtf");
+        gtf = g.is_file().then_some(g);
+        run_manifest = esperanto_flow::manifest::SpeciesManifest::read(&dir);
+    }
     if index.is_none() || fasta.is_none() || gtf.is_none() || gnomad.is_none() {
         if let Some(refs) = crate::resolve::refs() {
             refs.fill_index(&mut index);
@@ -91,6 +109,9 @@ let bundle = crate::resolve::bundle(&a.bundle)?;
         );
     }
     std::fs::create_dir_all(&out_dir)?;
+    if let Some(m) = &run_manifest {
+        m.write(&out_dir)?; // preflight guardrail + report/score contig split read it here
+    }
     let params = esperanto_flow::RunParams {
         r1: a.r1,
         r2: a.r2,
@@ -172,6 +193,7 @@ mod tests {
             lib: "unstranded".to_string(),
             out: "out".into(),
             sample: None,
+            hybrid: None,
             threads: 0,
             batch: 64,
             device: crate::confirm::DeviceArg::Auto,

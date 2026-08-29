@@ -4,6 +4,7 @@
 //! parse args → zero-config resolution → crate entry points. No scientific
 //! semantics live here.
 
+mod hybrid;
 mod index;
 mod map;
 mod pile;

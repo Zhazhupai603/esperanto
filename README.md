@@ -134,6 +134,18 @@ one row per called site, `FILTER=PASS` when `RE_PROB >= 0.5`, with `RE_PROB`,
 `VAF`, `DEPTH`, strand, and evidence annotations. Open
 `<out>/<sample>/<sample>.report.html` in a browser for the interactive report.
 
+Knock-in mouse models (e.g. APOE4 KI): setup stages both the human and
+mouse references (and both model bundles), and `run --hybrid GENE[,GENE...]`
+splices the selected human gene loci onto the mouse baseline — building
+the hybrid index on first use and reusing it on later runs. Scoring routes
+per contig: human-locus sites use the human model, mouse-contig sites use
+the mouse model (installed bundles only; without a mouse bundle,
+mouse-contig sites are reported UNSCORED with VAF/depth):
+
+```sh
+esperanto run --r1 reads_R1.fq.gz --r2 reads_R2.fq.gz --out runs/ --hybrid APOE4
+```
+
 An interrupted run resumes with one command — no flags, it re-reads the
 frozen parameters and continues from the first broken stage (an intact
 alignment is never re-run):
@@ -180,6 +192,7 @@ Common options:
 | `--batch N` | `score`, `run` | score batch size (default 256) |
 | `--device auto|cpu|gpu` | `score`, `run` | score device; `auto` uses a detected CUDA GPU, CPU otherwise |
 | `--sample NAME` | `run` | sample directory name under `--out` (default: derived from the R1/BAM file name) |
+| `--hybrid [GENES]` | `run` | knock-in mouse: splice these human gene loci onto the mouse reference (bare flag opens the interactive gene picker) |
 
 When an option is omitted, inputs are resolved automatically (first hit wins):
 

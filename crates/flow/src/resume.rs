@@ -328,14 +328,17 @@ fn valid_bed(path: &Path) -> bool {
 }
 
 /// scores.tsv: empty is legal (zero candidates); otherwise every data line
-/// is `chrom<TAB>pos<TAB>prob` with parseable numbers.
+/// is `chrom<TAB>pos<TAB>prob` with a parseable number or `NA` (unscored
+/// hybrid rows).
 fn valid_scores(path: &Path) -> bool {
     let Ok(text) = fs::read_to_string(path) else {
         return false;
     };
     text.lines().filter(|l| !l.is_empty()).all(|l| {
         match l.split('\t').collect::<Vec<_>>().as_slice() {
-            [_, pos, prob] => pos.parse::<i64>().is_ok() && prob.parse::<f64>().is_ok(),
+            [_, pos, prob] => {
+                pos.parse::<i64>().is_ok() && (*prob == "NA" || prob.parse::<f64>().is_ok())
+            }
             _ => false,
         }
     })

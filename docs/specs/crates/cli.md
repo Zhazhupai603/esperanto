@@ -109,7 +109,8 @@ Single-site and batch are mutually exclusive; giving both is an error. Output co
 | `--lib` | unstranded\|stranded | unstranded | strand specificity |
 | `--out` | PathBuf | **required** | output root |
 | `--threads` | usize | 0 | threads |
-| `--batch` | usize | 64 | score batch |
+| `--batch` | usize | 256 | score batch |
+| `--hybrid` | Option\<String\> | None | knock-in mouse run: comma-separated human gene symbols spliced onto the mouse reference; bare `--hybrid` opens the interactive gene picker |
 
 Entry derivation / species guardrail / stage paths / VCF contract all belong to the flow spec.
 

@@ -71,6 +71,7 @@ pub fn run(a: ScoreArgs) -> anyhow::Result<()> {
         a.device.resolve(),
         Some(&ask),
         a.baln.as_deref(),
+        score_pipeline::ReferenceCheck::Guardrail,
     )?;
     let mut buf = String::new();
     for ((chrom, pos), prob) in sites.iter().zip(&probs) {

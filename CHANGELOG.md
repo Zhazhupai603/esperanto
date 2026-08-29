@@ -7,6 +7,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), version
 
 ### Added
 
+- Hybrid references for knock-in mouse models: `setup` stages both the
+  human and mouse references, and `run --hybrid GENE[,GENE...]` splices the
+  selected human gene loci (full locus incl. introns) onto the mouse
+  baseline, building the hybrid index on first use and reusing it on later
+  runs (bare `--hybrid` opens an interactive gene picker). Scoring routes
+  per contig via the species.json manifest: human-locus sites use the
+  human model bundle, mouse-contig sites use the mouse model bundle
+  (donor-disjoint held-out AUROC 0.985 on 10 ENCODE B6CASTF1 brain
+  samples); without a mouse bundle installed, mouse-contig sites are
+  written UNSCORED with VAF/DEPTH. The manifest also drives the
+  guardrail and the report's contig list.
+
+### Changed
+
 - The HTML report is named `<sample>.report.html` and gains a red
   region-level hyperedited-density track (rescued-read counts per window)
   under the signal tracks in the genome explorer.
