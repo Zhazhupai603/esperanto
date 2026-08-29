@@ -22,7 +22,10 @@ pub fn resolve(genes: Option<Vec<String>>) -> anyhow::Result<PathBuf> {
     let refs = crate::resolve::home_refs_dir();
     let human_fa = tagged(&refs, "human", &[".fa", ".fasta"])?;
     let human_gtf = tagged(&refs, "human", &[".gtf"])?;
-    let mouse_fa = tagged(&refs, "mouse", &[".fa", ".fasta"])?;
+    let mouse_fa = match tagged(&refs, "mouse", &[".fa", ".fasta"]) {
+        Ok(p) => p,
+        Err(_) => stage_mouse(&refs)?,
+    };
     let mouse_gtf = tagged(&refs, "mouse", &[".gtf"]).ok(); // optional
     let genes = match genes {
         Some(g) => g,
@@ -57,6 +60,26 @@ pub fn resolve(genes: Option<Vec<String>>) -> anyhow::Result<PathBuf> {
     build(&dir, baseline, &human_fa, &human_gtf, &mouse_fa, mouse_gtf, &sorted)?;
     eprintln!("[hybrid] built {} -> {}", key, dir.display());
     Ok(dir)
+}
+
+/// Fetch + stage the mouse reference on first hybrid use (parallel
+/// download with resume, mirror fallback). Returns the fasta path.
+fn stage_mouse(refs: &Path) -> anyhow::Result<PathBuf> {
+    eprintln!("[hybrid] staging the mouse reference (first hybrid run)");
+    let gz = refs.join("GRCm39.primary_assembly.genome.fa.gz");
+    crate::fetch::from_mirrors(
+        &[
+            "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M36/GRCm39.primary_assembly.genome.fa.gz",
+            "https://hgdownload.soe.ucsc.edu/goldenPath/mm39/bigZips/mm39.fa.gz",
+        ],
+        &gz,
+    )?;
+    let fa = crate::setup::gunzip_in_place(&gz)?;
+    let fai = fa.with_extension("fa.fai");
+    if !fai.is_file() {
+        crate::setup::write_fai(&fa)?;
+    }
+    Ok(fa)
 }
 
 /// The single fasta/gtf tagged `species` in `dir`; actionable error when

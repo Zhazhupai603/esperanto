@@ -3,6 +3,16 @@
 All notable changes to ESPERANTO are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- Large reference downloads run as parallel resumable chunks (6 streams,
+  per-chunk retry, mirror fallback); a dropped connection resumes where
+  it stopped instead of restarting. The mouse reference is staged on
+  demand at the first `--hybrid` run instead of during setup, and setup
+  no longer downloads the (optional) mouse annotation.
+
 ## [1.0.3] - 2026-08-29
 
 ### Added

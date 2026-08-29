@@ -15,13 +15,6 @@ const GENCODE_GTF_URL: &str =
 /// Release tarball providing the model bundle when none is installed
 /// (same pin as install.sh).
 const RELEASE_TARBALL_URL: &str = "https://github.com/Zhazhupai603/esperanto/releases/download/v1.0.0/esperanto-1.0.0-linux-x86_64.tar.gz";
-/// Mouse reference (GENCODE GRCm39 primary assembly), always staged so
-/// hybrid runs can splice human loci onto it on demand.
-const MOUSE_FA_URL: &str = "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M36/GRCm39.primary_assembly.genome.fa.gz";
-/// Mouse transcript annotation (GENCODE vM36 basic, GRCm39).
-const MOUSE_GTF_URL: &str = "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M36/gencode.vM36.basic.annotation.gtf.gz";
-/// Mouse transcript annotation for mm10/GRCm38 baselines (GENCODE vM25).
-const MOUSE_GTF_M25_URL: &str = "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M25/gencode.vM25.basic.annotation.gtf.gz";
 
 #[derive(Args)]
 pub struct SetupArgs {
@@ -36,7 +29,7 @@ fn refs_dir() -> PathBuf {
 }
 
 /// Decompress a `.gz` file next to itself; the archive is removed.
-fn gunzip_in_place(gz: &Path) -> anyhow::Result<PathBuf> {
+pub(crate) fn gunzip_in_place(gz: &Path) -> anyhow::Result<PathBuf> {
     let plain = gz.with_extension("");
     let input = std::fs::File::open(gz)?;
     let mut dec = flate2::read::GzDecoder::new(input);
@@ -48,16 +41,7 @@ fn gunzip_in_place(gz: &Path) -> anyhow::Result<PathBuf> {
 
 /// Download `url` to `dest` (streaming; honors http_proxy/https_proxy).
 fn download(url: &str, dest: &Path) -> anyhow::Result<()> {
-    eprintln!("[setup] downloading {url}");
-    let agent = ureq::Agent::config_builder()
-        .proxy(ureq::Proxy::try_from_env())
-        .build()
-        .new_agent();
-    let resp = agent.get(url).call()?;
-    let mut reader = resp.into_body().into_reader();
-    let mut out = std::io::BufWriter::new(std::fs::File::create(dest)?);
-    std::io::copy(&mut reader, &mut out)?;
-    Ok(())
+    crate::fetch::file(url, dest)
 }
 
 /// Write the standard `<fasta>.fai` (name, length, offset, line bases,
@@ -231,34 +215,9 @@ pub fn run(a: SetupArgs) -> anyhow::Result<()> {
             dir.display()
         );
     }
-    if mouse_fa.is_none() {
-        let fa_gz = dir.join("GRCm39.primary_assembly.genome.fa.gz");
-        download(MOUSE_FA_URL, &fa_gz)?;
-        mouse_fa = Some(gunzip_in_place(&fa_gz)?);
-        eprintln!("[setup] mouse reference downloaded (staged for hybrid runs)");
-    }
-    let mouse_fasta = mouse_fa.expect("mouse fasta set above");
-    if mouse_gtf.is_none() {
-        // The GTF release must match the staged mouse assembly
-        // (GRCm38/mm10 <-> vM25, GRCm39 <-> vM36); mismatched coordinates
-        // silently shift the junction library.
-        let (rel, url) = if mouse_fasta
-            .file_name()
-            .is_some_and(|n| n.to_string_lossy().to_lowercase().contains("mm10"))
-        {
-            ("vM25", MOUSE_GTF_M25_URL)
-        } else {
-            ("vM36", MOUSE_GTF_URL)
-        };
-        let gtf_gz = dir.join(format!("gencode.{rel}.basic.annotation.gtf.gz"));
-        if !dir.join(format!("gencode.{rel}.basic.annotation.gtf")).exists() {
-            download(url, &gtf_gz)?;
-        }
-        mouse_gtf = Some(gunzip_in_place(&gtf_gz)?);
-    }
-    if mouse_gtf.is_none() {
-        eprintln!("[setup] no mouse GTF in {}; hybrid runs will build a genomic-only mouse baseline", dir.display());
-    }
+    // The mouse reference is staged on demand: the first
+    // `run --hybrid` fetches it into this directory automatically
+    // (genomic-only without a mouse GTF; place one for annotations).
 
     // --- human reference: fai, validation, index (unchanged behavior) ---
     let fasta = human_fa.expect("human fasta set above");
@@ -284,18 +243,28 @@ pub fn run(a: SetupArgs) -> anyhow::Result<()> {
         crate::index::build_all(&fasta, human_gtf.as_deref(), &paidx, 15, 5)?;
     }
 
-    // --- mouse baseline: fai + validation only (hybrid indexes are built
-    // on demand at run time) ---
-    let mfai = mouse_fasta.with_extension("fa.fai");
-    if !mfai.is_file() {
-        eprintln!("[setup] writing {}", mfai.display());
-        write_fai(&mouse_fasta)?;
+    // --- user-placed mouse baseline: fai + validation only (hybrid
+    // indexes are built on demand at run time) ---
+    if let Some(mouse_fasta) = mouse_fa {
+        let mfai = mouse_fasta.with_extension("fa.fai");
+        if !mfai.is_file() {
+            eprintln!("[setup] writing {}", mfai.display());
+            write_fai(&mouse_fasta)?;
+        }
+        let baseline = if mouse_fasta
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().to_lowercase().contains("mm10"))
+        {
+            "mm10"
+        } else {
+            "grcm39"
+        };
+        validate_pair(
+            &mouse_fasta,
+            mouse_gtf.as_deref(),
+            Some(&esperanto_flow::manifest::SpeciesManifest::single("mouse", baseline)),
+        )?;
     }
-    validate_pair(
-        &mouse_fasta,
-        mouse_gtf.as_deref(),
-        Some(&esperanto_flow::manifest::SpeciesManifest::single("mouse", "grcm39")),
-    )?;
 
     // --- model bundle (scoring) ---
     ensure_model_bundle()?;

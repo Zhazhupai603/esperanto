@@ -134,10 +134,12 @@ one row per called site, `FILTER=PASS` when `RE_PROB >= 0.5`, with `RE_PROB`,
 `VAF`, `DEPTH`, strand, and evidence annotations. Open
 `<out>/<sample>/<sample>.report.html` in a browser for the interactive report.
 
-Knock-in mouse models (e.g. APOE knock-in): setup stages both the human and
-mouse references (and both model bundles), and `run --hybrid GENE[,GENE...]`
-splices the selected human gene loci onto the mouse baseline — building
-the hybrid index on first use and reusing it on later runs. Scoring routes
+Knock-in mouse models (e.g. APOE knock-in): setup stages the human
+reference (the mouse reference is fetched automatically on the first
+hybrid run, with parallel resumable downloads), and
+`run --hybrid GENE[,GENE...]` splices the selected human gene loci onto
+the mouse baseline — building the hybrid index on first use and reusing
+it on later runs. Scoring routes
 per contig: human-locus sites use the human model, mouse-contig sites use
 the mouse model (installed bundles only; without a mouse bundle,
 mouse-contig sites are reported UNSCORED with VAF/depth):

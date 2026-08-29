@@ -13,6 +13,7 @@ mod report;
 mod resolve;
 mod resume;
 mod confirm;
+mod fetch;
 mod delete;
 mod run;
 mod scan;
