@@ -42,7 +42,7 @@ Parallel over (contig, 32 Mbp blocks); each read's contribution is scattered dir
 
 ## Output (10-column contract)
 
-`chrom  pos0  pos0+1  strand(+/-/amb)  evid  call_score(%.4f)  depth  var_freq(%.4f)  fwd_freq(%.4f)  rev_freq(%.4f)`, var_freq=var_reads/depth, fwd/rev_freq per strand (divide-by-zero guard max(1,d)). Sorted by (chrom, pos0) before writing → thread-count independent, byte-identical. An empty contig yields zero candidates.
+`chrom  pos0  pos0+1  strand(+/-/amb)  evid  call_score(%.4f)  depth  var_freq(%.4f)  fwd_freq(%.4f)  rev_freq(%.4f)`. `var_freq` = any-mismatch frequency (`var_reads/depth`). `fwd_freq` = editing-consistent frequency on the forward strand (A>G), `rev_freq` = editing-consistent frequency on the reverse strand (T>C); both are zero for a site whose reference base cannot be A-to-I edited (REF=C or REF=G). Sorted by (chrom, pos0) before writing → thread-count independent, byte-identical. An empty contig yields zero candidates.
 
 ## Dependencies
 

@@ -3,6 +3,22 @@
 All notable changes to ESPERANTO are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows [SemVer](https://semver.org/).
 
+## [1.0.4] - 2026-08-31
+
+### Changed
+
+- Collapsed-alphabet rescue now verifies every placement against the true
+  reference before accepting it, rejecting near-random matches in
+  two-letter space that inflated the mapping rate and candidate counts on
+  contaminated samples. `align_qc.json` now reports the verified, rejected,
+  and prefiltered rescue counts separately.
+- Candidate filtering now gates the recall arm on the editing-consistent
+  direction: `candidates.bed` carries the per-strand editing frequency
+  (forward A>G, reverse T>C), and the recall arm requires that signal plus
+  at least 2 mutation reads. This drops REF=C/G sites (which cannot be
+  A-to-I edited) and single-read noise before scoring, restoring the
+  A-to-I candidate distribution the model was trained on.
+
 ## [1.0.3] - 2026-08-29
 
 ### Added

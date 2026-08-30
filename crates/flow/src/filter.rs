@@ -20,8 +20,11 @@ pub struct CallFilter {
     pub min_depth: u64,
     /// High-score arm: `CALL_SCORE ≥ this` is kept directly (`None` = disabled).
     pub score_arm: Option<f64>,
-    /// Recall arm: `var_freq ≥ this` is kept (low-frequency editing sites).
+    /// Recall arm: editing-consistent frequency >= this is kept (low-frequency
+    /// editing sites; A>G forward / T>C reverse).
     pub min_vaf: f64,
+    /// Recall arm: minimum mutation reads (any non-reference base) required.
+    pub min_mutation_reads: u64,
 }
 
 impl Default for CallFilter {
@@ -30,6 +33,7 @@ impl Default for CallFilter {
             min_depth: 10,
             score_arm: Some(0.9),
             min_vaf: 0.05,
+            min_mutation_reads: 2,
         }
     }
 }
@@ -55,9 +59,16 @@ impl CallFilter {
         }
         let score: f64 = cols.get(5).and_then(|s| s.parse().ok()).unwrap_or(0.0);
         let var_freq: f64 = cols.get(7).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let fwd_freq: f64 = cols.get(8).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let rev_freq: f64 = cols.get(9).and_then(|s| s.parse().ok()).unwrap_or(0.0);
         let arm_score = self.score_arm.is_some_and(|t| score >= t);
-        let arm_vaf = var_freq >= self.min_vaf;
-        arm_score || arm_vaf
+        // Recall arm: editing-consistent signal (A>G forward / T>C reverse)
+        // with at least `min_mutation_reads` supporting reads. REF=C/G sites
+        // have fwd_freq == rev_freq == 0 and are dropped here.
+        let var_reads = var_freq * depth as f64;
+        let arm_edit = (fwd_freq >= self.min_vaf || rev_freq >= self.min_vaf)
+            && var_reads >= self.min_mutation_reads as f64;
+        arm_score || arm_edit
     }
 
     /// Filter a `candidates.bed` in place; returns drop stats.
@@ -97,5 +108,57 @@ impl CallFilter {
         }
         w.flush()?;
         Ok(st)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keep(f: &CallFilter, score: f64, depth: u64, var: f64, fwd: f64, rev: f64) -> bool {
+        let line = format!("chr1\t100\t101\tamb\tNONE\t{score}\t{depth}\t{var}\t{fwd}\t{rev}");
+        let cols: Vec<&str> = line.split('\t').collect();
+        f.keep(&cols)
+    }
+
+    #[test]
+    fn keeps_editing_direction_site() {
+        let f = CallFilter::default();
+        // A>G on the forward strand: fwd_freq 0.3, 3 mutation reads at depth 10.
+        assert!(keep(&f, 0.5, 10, 0.3, 0.3, 0.0));
+    }
+
+    #[test]
+    fn keeps_reverse_strand_editing() {
+        let f = CallFilter::default();
+        // T>C on the reverse strand: rev_freq 0.4.
+        assert!(keep(&f, 0.5, 10, 0.4, 0.0, 0.4));
+    }
+
+    #[test]
+    fn rejects_non_editing_direction() {
+        let f = CallFilter::default();
+        // REF=C/G: fwd_freq == rev_freq == 0, any-mismatch 0.5.
+        assert!(!keep(&f, 0.5, 10, 0.5, 0.0, 0.0));
+    }
+
+    #[test]
+    fn rejects_single_mutation_read() {
+        let f = CallFilter::default();
+        // One mutation read at depth 20: var_freq 0.05 -> var_reads 1 < 2.
+        assert!(!keep(&f, 0.5, 20, 0.05, 0.05, 0.0));
+    }
+
+    #[test]
+    fn keeps_high_score_arm() {
+        let f = CallFilter::default();
+        // The score arm keeps a site regardless of direction or read count.
+        assert!(keep(&f, 0.95, 10, 0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn rejects_low_depth() {
+        let f = CallFilter::default();
+        assert!(!keep(&f, 0.95, 5, 1.0, 1.0, 1.0));
     }
 }
