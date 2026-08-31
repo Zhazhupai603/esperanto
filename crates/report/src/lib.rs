@@ -35,6 +35,9 @@ const GENE_SITES_CAP: usize = 60;
 const GENE_SITE_MIN_PROB: f64 = 0.3;
 /// Minimum probability for the recoding check.
 const RECODE_MIN_PROB: f64 = 0.2;
+/// A site is flagged "hyperedited" when a rescued read lands within this
+/// many base pairs of it.
+const HYPER_PAD: i64 = 500;
 
 /// Decimal rounding that matches the reference implementation: correct
 /// decimal rounding of the exact binary value, ties to even, then back to
@@ -90,9 +93,9 @@ struct ChromLen {
     len: i64,
 }
 
-/// Site row serialized as `[pos, prob, vaf, depth, pass, gene]`.
+/// Site row serialized as `[pos, prob, vaf, depth, pass, gene, hyper]`.
 #[derive(Serialize)]
-struct SiteRow(i64, Option<f64>, f64, i64, i64, String);
+struct SiteRow(i64, Option<f64>, f64, i64, i64, String, bool);
 
 #[derive(Serialize)]
 struct Recoding {
@@ -104,6 +107,7 @@ struct Recoding {
     vaf: f64,
     depth: i64,
     pass: i64,
+    has_hyper: bool,
 }
 
 #[derive(Serialize)]
@@ -117,6 +121,7 @@ struct GeneOut {
     maxprob: f64,
     n_rec: u64,
     sites: Vec<GeneSiteOut>,
+    has_hyper: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -281,32 +286,70 @@ fn mkheat(sites: &[Site], chroms: &[ChromLen], win: i64) -> BTreeMap<String, Vec
         .collect()
 }
 
-/// Rescued-read counts per `win`-sized window from `map/rescued.bed`
-/// (`chrom<TAB>pos` 0-based rows, one per rescued placement). A missing or
-/// unparsable sidecar yields empty maps (pre-sidecar runs stay reportable).
-fn rescued_heat(out_dir: &Path, chroms: &[ChromLen], win: i64) -> BTreeMap<String, Vec<u64>> {
+/// Rescued-read placements from `map/rescued.bed` (`chrom<TAB>pos` 0-based
+/// rows, one per rescued placement), grouped by chromosome with positions
+/// sorted ascending. A missing or unparsable sidecar yields an empty map
+/// (pre-sidecar runs stay reportable).
+fn read_rescued(out_dir: &Path) -> BTreeMap<String, Vec<i64>> {
+    let Ok(text) = std::fs::read_to_string(out_dir.join("map").join("rescued.bed")) else {
+        return BTreeMap::new();
+    };
+    let mut pos: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+    for line in text.lines() {
+        let Some((chrom, p)) = line.split_once('\t') else {
+            continue;
+        };
+        let Ok(p) = p.parse::<i64>() else {
+            continue;
+        };
+        pos.entry(chrom.to_owned()).or_default().push(p);
+    }
+    for v in pos.values_mut() {
+        v.sort_unstable();
+    }
+    pos
+}
+
+/// Rescued-read counts per `win`-sized window from `read_rescued` positions.
+fn rescued_heat(
+    rescued: &BTreeMap<String, Vec<i64>>,
+    chroms: &[ChromLen],
+    win: i64,
+) -> BTreeMap<String, Vec<u64>> {
     let mut vals: BTreeMap<String, Vec<u64>> = chroms
         .iter()
         .map(|c| (c.chrom.clone(), vec![0u64; (c.len / win + 1) as usize]))
         .collect();
-    let Ok(text) = std::fs::read_to_string(out_dir.join("map").join("rescued.bed")) else {
-        return BTreeMap::new();
-    };
-    for line in text.lines() {
-        let Some((chrom, pos)) = line.split_once('\t') else {
-            continue;
-        };
-        let Ok(pos) = pos.parse::<i64>() else {
-            continue;
-        };
+    for (chrom, positions) in rescued {
         if let Some(v) = vals.get_mut(chrom) {
-            let i = (pos / win) as usize;
-            if i < v.len() {
-                v[i] += 1;
+            for &pos in positions {
+                let i = (pos / win) as usize;
+                if i < v.len() {
+                    v[i] += 1;
+                }
             }
         }
     }
     vals
+}
+
+/// True when any rescued placement lands in `[start, end]`.
+fn overlaps_rescued(
+    rescued: &BTreeMap<String, Vec<i64>>,
+    chrom: &str,
+    start: i64,
+    end: i64,
+) -> bool {
+    let Some(positions) = rescued.get(chrom) else {
+        return false;
+    };
+    let i = positions.partition_point(|&p| p < start);
+    i < positions.len() && positions[i] <= end
+}
+
+/// True when a rescued placement lands within `pad` bp of `pos`.
+fn near_rescued(rescued: &BTreeMap<String, Vec<i64>>, chrom: &str, pos: i64, pad: i64) -> bool {
+    overlaps_rescued(rescued, chrom, pos - pad, pos + pad)
 }
 
 /// Generate `<out>/<sample>.report.html`; returns its path.
@@ -316,6 +359,7 @@ pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<Path
     let mut fa = FastaIndex::open(fasta)?;
     let chroms = report_chroms(&fa, out_dir);
     let (reads_in, map_rate, rescued) = read_metrics(out_dir)?;
+    let rescued_pos = read_rescued(out_dir);
 
     // Gene annotation + aggregation + recoding in one VCF-order pass.
     let mut per_gene: Vec<GeneAcc> = Vec::new();
@@ -379,6 +423,7 @@ pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<Path
                 vaf: round_dp(s.vaf, 3),
                 depth: s.depth,
                 pass: i64::from(s.pass_),
+                has_hyper: near_rescued(&rescued_pos, &s.chrom, s.pos, HYPER_PAD),
             });
             if let Some(&gi) = gene_idx.get(s.gene.as_str()) {
                 per_gene[gi].n_rec += 1;
@@ -396,6 +441,7 @@ pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<Path
             s.depth,
             i64::from(s.pass_),
             s.gene.clone(),
+            near_rescued(&rescued_pos, &s.chrom, s.pos, HYPER_PAD),
         ));
     }
     for v in per_chrom.values_mut() {
@@ -425,6 +471,7 @@ pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<Path
                     maxprob: round_dp(pg.maxprob, 3),
                     n_rec: pg.n_rec,
                     sites: top.into_iter().take(GENE_SITES_CAP).collect(),
+                    has_hyper: overlaps_rescued(&rescued_pos, gchrom, gstart, gend),
                 },
             ))
         })
@@ -434,8 +481,8 @@ pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<Path
 
     let heat5 = mkheat(&sites, &chroms, 5_000_000);
     let heat1 = mkheat(&sites, &chroms, 1_000_000);
-    let resc5 = rescued_heat(out_dir, &chroms, 5_000_000);
-    let resc1 = rescued_heat(out_dir, &chroms, 1_000_000);
+    let resc5 = rescued_heat(&rescued_pos, &chroms, 5_000_000);
+    let resc1 = rescued_heat(&rescued_pos, &chroms, 1_000_000);
     let sample = out_dir
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -467,7 +514,8 @@ pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<Path
 }
 
 /// Lexicographic row comparison mirroring the reference list-of-lists sort:
-/// pos, prob, vaf, depth, pass, gene.
+/// pos, prob, vaf, depth, pass, gene. The trailing `hyper` flag is display
+/// metadata and never participates in ordering.
 fn cmp_site_row(a: &SiteRow, b: &SiteRow) -> std::cmp::Ordering {
     a.0.cmp(&b.0)
         .then(match (a.1, b.1) {

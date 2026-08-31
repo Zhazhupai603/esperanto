@@ -22,6 +22,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), version
   (collapsed-rescue) coverage, recovering heavily-edited sites that
   were previously missed because their pileup showed only the reference
   base.
+- The report's hyperedited-region track is now interactive: clicking a
+  region opens the per-base view of that window, where sites near a
+  rescued hyperedited read are highlighted. Genes and recoded proteins
+  whose span overlaps a hyperedited region are flagged in the gene
+  search and the recoded-protein table.
+
+### Fixed
+
+- Bundle auto-discovery still pointed at the v1.4.1 model (8-dim pileup)
+  after scoring moved to a 9-dim pileup input, so `run` and `score` failed
+  at the score stage with "load bundle". The default bundle path now
+  resolves to the v1.6.0 model (9-dim).
 
 ## [1.0.3] - 2026-08-29
 

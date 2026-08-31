@@ -32,7 +32,7 @@ dependencies beyond a reference FASTA and its index.
   region-level hyperedited-density track in the report
 - Strand-resolved candidate calling from BAM or the binary `.baln` channel
 - Site scoring with a frozen Caduceus-Mamba model (pileup veto gate, 5-fold
-  ensemble); AUROC 0.998 on the frozen evaluation corpus
+  ensemble); AUROC 0.996 on the evaluation corpus
 - Identical input produces byte-identical output, independent of thread count
 - Reference guardrail: refuses mismatched references (e.g. hg19) before running
 
@@ -175,7 +175,7 @@ esperanto <COMMAND> [OPTIONS]
 | `setup` | One-step reference environment: fetch/detect references + build the index |
 | `qc` | FASTQ quality control (trimming, filtering, `qc.json`/`qc.html`) |
 | `map` | Splice-aware alignment; single-pass with the L1 engine, 2-pass junction discovery otherwise |
-| `pile` | 8-dim pileup features for a single site or a site list |
+| `pile` | 9-dim pileup features for a single site or a site list |
 | `scan` | Strand-resolved candidate editing-site discovery (BAM or `.baln`) |
 | `score` | RE_PROB scoring: encoder + pileup veto gate + 5-fold ensemble |
 | `run` | Full pipeline: qc → map → sort → scan → filter → score → vcf + HTML report |

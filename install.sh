@@ -9,7 +9,7 @@
 #   ESPERANTO_TARBALL local tarball path (skips download when set)
 set -eu
 
-VERSION="v1.0.3"
+VERSION="v1.0.4"
 ARCH="linux-x86_64"
 
 # Machines with a working NVIDIA driver get the GPU-enabled build.
@@ -18,7 +18,7 @@ if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
     VARIANT="-gpu"
 fi
 
-PKG="esperanto-1.0.3-${ARCH}${VARIANT}"
+PKG="esperanto-1.0.4-${ARCH}${VARIANT}"
 TARBALL="${PKG}.tar.gz"
 BASE_URL="https://github.com/Zhazhupai603/esperanto/releases/download/${VERSION}"
 

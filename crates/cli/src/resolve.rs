@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail};
 
-/// Bundle location relative to a layout root (v1.4.1 contract name).
-const BUNDLE_REL: &str = "bundle/human/esperanto-model-v1.4.1-501_40ep/rust";
+/// Bundle location relative to a layout root (v1.6.0 contract name).
+const BUNDLE_REL: &str = "bundle/human/esperanto-model-v1.6.0/rust";
 /// Mouse model bundle location relative to a layout root.
 const MOUSE_BUNDLE_REL: &str = "bundle/mouse/esperanto-model-v0.9-mouse/rust";
 /// Preferred FASTA name inside a refs directory.
