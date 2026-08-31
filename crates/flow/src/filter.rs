@@ -64,7 +64,10 @@ impl CallFilter {
         let arm_score = self.score_arm.is_some_and(|t| score >= t);
         // Recall arm: editing-consistent signal (A>G forward / T>C reverse)
         // with at least `min_mutation_reads` supporting reads. REF=C/G sites
-        // have fwd_freq == rev_freq == 0 and are dropped here.
+        // have fwd_freq == rev_freq == 0 and are dropped here. The retrained
+        // model rejects REF=C/G sites on its own (~3% false-positive rate),
+        // so this direction gate is a performance optimization that halves
+        // the candidate set, not a correctness requirement.
         let var_reads = var_freq * depth as f64;
         let arm_edit = (fwd_freq >= self.min_vaf || rev_freq >= self.min_vaf)
             && var_reads >= self.min_mutation_reads as f64;

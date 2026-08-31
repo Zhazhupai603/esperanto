@@ -750,7 +750,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-bamio"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "noodles",
  "noodles-bgzf",
@@ -760,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-cli"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -782,7 +782,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-engine"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "esperanto-tidx",
  "esperanto-txmap",
@@ -792,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-flow"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "anyhow",
  "esperanto-bamio",
@@ -812,7 +812,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-map"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "bytemuck",
  "esperanto-bamio",
@@ -830,7 +830,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-pile"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "esperanto-bamio",
  "rust-htslib",
@@ -839,7 +839,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-qc"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "flate2",
  "rayon",
@@ -850,7 +850,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-report"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "anyhow",
  "serde",
@@ -859,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-scan"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "esperanto-bamio",
  "flate2",
@@ -872,7 +872,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-score"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -891,7 +891,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-tidx"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "blake3",
  "rayon",
@@ -900,7 +900,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-txmap"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "blake3",
  "thiserror 2.0.20",

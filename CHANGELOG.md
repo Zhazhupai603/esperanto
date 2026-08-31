@@ -18,6 +18,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), version
   at least 2 mutation reads. This drops REF=C/G sites (which cannot be
   A-to-I edited) and single-read noise before scoring, restoring the
   A-to-I candidate distribution the model was trained on.
+- Site scoring now uses a ninth pileup feature marking hyperedited
+  (collapsed-rescue) coverage, recovering heavily-edited sites that
+  were previously missed because their pileup showed only the reference
+  base.
 
 ## [1.0.3] - 2026-08-29
 

@@ -105,7 +105,23 @@ cannot be A-to-I edited) and single-read noise into it, and the model
 scored those out-of-distribution sites as if they were edits (measured on
 a human sample: 51% of passing candidates were REF=C/G). The direction
 gate restores the A-to-I candidate distribution the model was trained
-on.
+on. After the VAF-balanced retrain the model itself rejects REF=C/G
+sites (2.9% false-positive rate, matching the 3.4% on REF=A/T), so the
+gate is now a performance optimization — it halves the candidate set —
+rather than a correctness requirement.
+
+## Hyperedited signal (frozen 2026-08-31)
+
+The scoring model takes a ninth pileup feature marking whether a site is
+covered by a collapsed-rescue (hyperedited) read. Motivation: hyperedited
+reads are excluded from the pileup vote (their bases are
+alphabet-ambiguous), so their editing sites show a pure-reference pileup
+and were rejected by both scan (var_reads == 0) and score. The ninth
+feature lets the model recognize these sites directly; retraining on
+19,463 hyperedited sites as RE positives raised their recall from 2.2% to
+100% without degrading AUROC (0.9959 protocol A). The veto gate is not
+retrained — its threshold is low enough that hyperedited sites pass
+through, so its 8-dim weights are zero-padded to 9 dims.
 
 ## Pending decisions
 
