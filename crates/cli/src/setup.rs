@@ -8,10 +8,10 @@ use clap::Args;
 
 /// Default human reference FASTA (GENCODE GRCh38 primary assembly),
 /// downloaded when the refs directory holds neither a FASTA nor a GTF.
-const HG38_FA_URL: &str = "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_44/GRCh38.primary_assembly.genome.fa.gz";
-/// Default transcript annotation (GENCODE v44 basic), same trigger.
+const HG38_FA_URL: &str = "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_48/GRCh38.primary_assembly.genome.fa.gz";
+/// Default transcript annotation (GENCODE v48 primary), same trigger.
 const GENCODE_GTF_URL: &str =
-    "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_44/gencode.v44.basic.annotation.gtf.gz";
+    "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_48/gencode.v48.primary_assembly.annotation.gtf.gz";
 /// Release tarball providing the model bundle when none is installed
 /// (same pin as install.sh).
 const RELEASE_TARBALL_URL: &str = "https://github.com/Zhazhupai603/esperanto/releases/download/v1.0.0/esperanto-1.0.0-linux-x86_64.tar.gz";
@@ -39,9 +39,9 @@ pub struct SetupArgs {
     /// Rebuild even when the index artifacts already exist.
     #[arg(long)]
     force: bool,
-    /// Fetch the standard decoy set (45S/5S rDNA, hs38d1) and include it in
-    /// the alignment index under the `decoy_` contig prefix.
-    #[arg(long)]
+    /// Include the standard decoy set (45S/5S rDNA, hs38d1) in the alignment
+    /// index under the `decoy_` contig prefix (default; use --no-decoys to skip).
+    #[arg(long = "no-decoys", action = clap::ArgAction::SetFalse, default_value_t = true)]
     decoys: bool,
     /// Generate the retrocopy / multicopy blacklists from the annotation
     /// (junction-crossing simulated reads + exonic windows, gap-free mm<=2
@@ -232,7 +232,7 @@ pub fn run(a: SetupArgs) -> anyhow::Result<()> {
         fetched_human = true;
     }
     if fetched_human && human_gtf.is_none() {
-        let gtf_gz = dir.join("gencode.v44.basic.annotation.gtf.gz");
+        let gtf_gz = dir.join("gencode.v48.primary_assembly.annotation.gtf.gz");
         download(GENCODE_GTF_URL, &gtf_gz)?;
         human_gtf = Some(gunzip_in_place(&gtf_gz)?);
     }
