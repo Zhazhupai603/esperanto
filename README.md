@@ -2,7 +2,7 @@
 
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Language: Rust](https://img.shields.io/badge/language-Rust-orange.svg)
-![Version](https://img.shields.io/badge/version-1.0.2-green.svg)
+![Version](https://img.shields.io/badge/version-1.0.3-green.svg)
 
 ESPERANTO is a command-line toolkit for detecting RNA editing (A-to-I) sites from
 RNA-seq data. It runs quality control, splice-aware alignment, candidate calling,
@@ -21,10 +21,13 @@ dependencies beyond a reference FASTA and its index.
 - Unmapped reads get a second pass against a collapsed-alphabet index (A==G,
   T==C), which recovers hyperedited reads; survivors are written back with
   MAPQ 0 and an `RE:Z:collapsed` tag
-- Every run ends with a self-contained HTML report (`<out>/<sample>/report.html`, opens
+- Every run ends with a self-contained HTML report (`<out>/<sample>/<sample>.report.html`, opens
   in any browser): sample metrics, a drill-down genome explorer (chromosome →
   1 Mb window → per-base site track), gene search, and the recoded-protein
   table (amino-acid changes from A-to-I edits)
+- Collapsed-rescue reads count toward coverage but never vote on candidate
+  variants (their bases are alphabet-ambiguous); their placements feed a
+  region-level hyperedited-density track in the report
 - Strand-resolved candidate calling from BAM or the binary `.baln` channel
 - Site scoring with a frozen Caduceus-Mamba model (pileup veto gate, 5-fold
   ensemble); AUROC 0.998 on the frozen evaluation corpus
@@ -46,20 +49,20 @@ The installer places:
 
 Re-run the same command to upgrade.
 
-GPU builds: the score stage can use a CUDA GPU (measured ~1.9× over a 4-core
-CPU at 20k sites). Build with `cargo build --release --features gpu` — needs
-the CUDA toolkit at build time and its runtime libraries on the target
-machine. The default build is CPU-only and needs neither.
+GPU acceleration: the installer detects a working NVIDIA driver and picks
+the GPU-enabled build automatically (CPU-only machines get the CPU build).
+At runtime the score stage detects a CUDA GPU and asks once whether to
+use it; without a GPU nothing is asked and the CPU path runs (measured
+~1.9× over a 4-core CPU at 20k sites; numerics match the CPU path within
+3e-4 per site):
 
-On a GPU build, the scoring device is chosen at runtime:
+- `--device auto` (default): ask once when a GPU is detected, CPU otherwise
+- `--device cpu`: force the CPU path (never asks)
+- `--device gpu`: require a CUDA GPU (clear error when none initializes)
 
-```sh
-esperanto run --r1 reads.fq.gz --out out/ --device gpu
-```
-
-`--device auto` (default) asks once when a CUDA GPU is detected, `cpu` forces
-the CPU path, and `gpu` requires a CUDA GPU (a CPU-only build fails here with
-a rebuild hint).
+Source builds default to CPU-only and run everywhere; include the CUDA
+channel with `cargo build --release --features gpu` (needs the CUDA toolkit
+at build time and an NVIDIA driver at run time).
 
 Build from source (stable Rust toolchain):
 
@@ -129,8 +132,24 @@ Each run lands in a sample-scoped directory `<out>/<sample>/` (override the
 sample name with `--sample`). The main output is `<out>/<sample>/sites.vcf`:
 one row per called site, `FILTER=PASS` when `RE_PROB >= 0.5`, with `RE_PROB`,
 `VAF`, `DEPTH`, strand, and evidence annotations. Open
-`<out>/<sample>/report.html` in a browser for the interactive report.
+`<out>/<sample>/<sample>.report.html` in a browser for the interactive report.
 
+Knock-in mouse models (e.g. APOE knock-in): setup stages the human
+reference (the mouse reference is fetched automatically on the first
+hybrid run, with parallel resumable downloads), and
+`run --hybrid GENE[,GENE...]` splices the selected human gene loci onto
+the mouse baseline — building the hybrid index on first use and reusing
+it on later runs. Scoring routes
+per contig: human-locus sites use the human model, mouse-contig sites use
+the mouse model (installed bundles only; without a mouse bundle,
+mouse-contig sites are reported UNSCORED with VAF/depth):
+
+```sh
+esperanto run --r1 reads_R1.fq.gz --r2 reads_R2.fq.gz --out runs/ --hybrid APOE
+```
+
+Symbols follow the annotation's gene names: the human APOE locus is `APOE`
+(the ε2/ε3/ε4 alleles are haplotypes of the same gene, not separate symbols).
 An interrupted run resumes with one command — no flags, it re-reads the
 frozen parameters and continues from the first broken stage (an intact
 alignment is never re-run):
@@ -173,9 +192,11 @@ Common options:
 | `--lib stranded` | `scan`, `run` | stranded (dUTP-style) libraries; default `unstranded` |
 | `--bundle PATH` | `score`, `run` | override the auto-detected model bundle |
 | `--l1-bundle PATH` | `map`, `run` | override the auto-detected L1 engine bundle |
-| `--batch N` | `score`, `run` | score batch size (default 64) |
-| `--device auto|cpu|gpu` | `score`, `run` | score device; `auto` asks once when a CUDA GPU is detected (GPU builds only) |
+| `--baln PATH` | `score` | experimental: read pileup records from the `.baln` channel instead of the BAM |
+| `--batch N` | `score`, `run` | score batch size (default 256) |
+| `--device auto|cpu|gpu` | `score`, `run` | score device; `auto` uses a detected CUDA GPU, CPU otherwise |
 | `--sample NAME` | `run` | sample directory name under `--out` (default: derived from the R1/BAM file name) |
+| `--hybrid [GENES]` | `run` | knock-in mouse: splice these human gene loci onto the mouse reference (bare flag opens the interactive gene picker) |
 
 When an option is omitted, inputs are resolved automatically (first hit wins):
 
@@ -208,7 +229,7 @@ discovery.
 | `<out>/<sample>/scan/candidates.bed` | candidate sites (coordinate, strand, evidence, score, depth, allele frequency) |
 | `<out>/<sample>/score/scores.tsv` | `chrom`, `pos`, `RE_PROB` for every scored site |
 | `<out>/<sample>/sites.vcf` | final calls |
-| `<out>/<sample>/report.html` | self-contained interactive report (metrics, genome explorer, gene search, recoded proteins) |
+| `<out>/<sample>/<sample>.report.html` | self-contained interactive report (metrics, genome explorer with a red hyperedited-region track, gene search, recoded proteins) |
 
 ## Guarantees
 

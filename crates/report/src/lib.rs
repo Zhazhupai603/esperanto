@@ -52,6 +52,8 @@ struct Site {
     depth: i64,
     pass_: bool,
     gene: String,
+    /// True on hybrid-run rows with no matching model (FILTER=UNSCORED).
+    unscored: bool,
 }
 
 /// Output document (field order mirrors the reference data pack).
@@ -62,6 +64,9 @@ struct DataPack {
     chroms: Vec<ChromLen>,
     heat5: BTreeMap<String, Vec<f64>>,
     heat1: BTreeMap<String, Vec<f64>>,
+    /// Rescued (hyperedited) read counts per window, same binning as heat5/heat1.
+    resc5: BTreeMap<String, Vec<u64>>,
+    resc1: BTreeMap<String, Vec<u64>>,
     sites: BTreeMap<String, Vec<SiteRow>>,
     recodings: Vec<Recoding>,
     genes: Vec<GeneOut>,
@@ -75,6 +80,8 @@ struct Metrics {
     map_rate: f64,
     rescued: u64,
     recodings: u64,
+    /// Hybrid runs: sites on contigs with no matching model.
+    unscored: u64,
 }
 
 #[derive(Serialize)]
@@ -85,7 +92,7 @@ struct ChromLen {
 
 /// Site row serialized as `[pos, prob, vaf, depth, pass, gene]`.
 #[derive(Serialize)]
-struct SiteRow(i64, f64, f64, i64, i64, String);
+struct SiteRow(i64, Option<f64>, f64, i64, i64, String);
 
 #[derive(Serialize)]
 struct Recoding {
@@ -148,11 +155,14 @@ fn read_sites(vcf: &Path) -> anyhow::Result<Vec<Site>> {
         let pos: i64 = f[1]
             .parse()
             .with_context(|| format!("{} line {}: bad POS '{}'", vcf.display(), ln + 1, f[1]))?;
+        let unscored = f[6] == "UNSCORED";
         let (mut prob, mut vaf, mut depth) = (0.0f64, 0.0f64, 0i64);
+        let mut has_prob = false;
         for part in f[7].split(';') {
             if let Some((k, v)) = part.split_once('=') {
                 match k {
                     "RE_PROB" => {
+                        has_prob = true;
                         prob = v.parse().with_context(|| {
                             format!("{} line {}: bad RE_PROB '{v}'", vcf.display(), ln + 1)
                         })?
@@ -179,7 +189,8 @@ fn read_sites(vcf: &Path) -> anyhow::Result<Vec<Site>> {
             depth,
             pass_: f[6] == "PASS",
             gene: String::new(),
-        });
+                unscored: unscored || !has_prob,
+    });
     }
     Ok(sites)
 }
@@ -213,7 +224,29 @@ fn read_metrics(out_dir: &Path) -> anyhow::Result<(u64, f64, u64)> {
 
 /// Reportable chromosomes straight from the `.fai` in file order:
 /// `chr`-prefixed, no `_` (decoys/alternates), excluding `chrM`.
-fn report_chroms(fa: &FastaIndex) -> Vec<ChromLen> {
+/// Reportable chromosomes: with a hybrid manifest (`species.json` in the run
+/// directory) every declared contig except mitochondria; legacy runs keep the
+/// `chr`-prefixed, no-underscore filter.
+fn report_chroms(fa: &FastaIndex, out_dir: &Path) -> Vec<ChromLen> {
+    if let Ok(text) = std::fs::read_to_string(out_dir.join("species.json")) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+            let declared: std::collections::BTreeSet<&str> = v["contig_owner"]
+                .as_object()
+                .map(|m| m.keys().map(|k| k.as_str()).collect())
+                .unwrap_or_default();
+            if !declared.is_empty() {
+                return fa
+                    .contigs()
+                    .iter()
+                    .filter(|(n, _)| declared.contains(n.as_str()) && n != "chrM")
+                    .map(|(n, l)| ChromLen {
+                        chrom: n.clone(),
+                        len: *l,
+                    })
+                    .collect();
+            }
+        }
+    }
     fa.contigs()
         .iter()
         .filter(|(n, _)| n.starts_with("chr") && !n.contains('_') && n != "chrM")
@@ -248,12 +281,40 @@ fn mkheat(sites: &[Site], chroms: &[ChromLen], win: i64) -> BTreeMap<String, Vec
         .collect()
 }
 
-/// Generate `<out>/report.html`; returns its path.
+/// Rescued-read counts per `win`-sized window from `map/rescued.bed`
+/// (`chrom<TAB>pos` 0-based rows, one per rescued placement). A missing or
+/// unparsable sidecar yields empty maps (pre-sidecar runs stay reportable).
+fn rescued_heat(out_dir: &Path, chroms: &[ChromLen], win: i64) -> BTreeMap<String, Vec<u64>> {
+    let mut vals: BTreeMap<String, Vec<u64>> = chroms
+        .iter()
+        .map(|c| (c.chrom.clone(), vec![0u64; (c.len / win + 1) as usize]))
+        .collect();
+    let Ok(text) = std::fs::read_to_string(out_dir.join("map").join("rescued.bed")) else {
+        return BTreeMap::new();
+    };
+    for line in text.lines() {
+        let Some((chrom, pos)) = line.split_once('\t') else {
+            continue;
+        };
+        let Ok(pos) = pos.parse::<i64>() else {
+            continue;
+        };
+        if let Some(v) = vals.get_mut(chrom) {
+            let i = (pos / win) as usize;
+            if i < v.len() {
+                v[i] += 1;
+            }
+        }
+    }
+    vals
+}
+
+/// Generate `<out>/<sample>.report.html`; returns its path.
 pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<PathBuf> {
     let mut sites = read_sites(&out_dir.join("sites.vcf"))?;
     let ann = Annotation::load(gtf)?;
     let mut fa = FastaIndex::open(fasta)?;
-    let chroms = report_chroms(&fa);
+    let chroms = report_chroms(&fa, out_dir);
     let (reads_in, map_rate, rescued) = read_metrics(out_dir)?;
 
     // Gene annotation + aggregation + recoding in one VCF-order pass.
@@ -330,7 +391,7 @@ pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<Path
     for s in &sites {
         per_chrom.entry(s.chrom.clone()).or_default().push(SiteRow(
             s.pos,
-            round_dp(s.prob, 3),
+            if s.unscored { None } else { Some(round_dp(s.prob, 3)) },
             round_dp(s.vaf, 3),
             s.depth,
             i64::from(s.pass_),
@@ -373,11 +434,14 @@ pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<Path
 
     let heat5 = mkheat(&sites, &chroms, 5_000_000);
     let heat1 = mkheat(&sites, &chroms, 1_000_000);
+    let resc5 = rescued_heat(out_dir, &chroms, 5_000_000);
+    let resc1 = rescued_heat(out_dir, &chroms, 1_000_000);
+    let sample = out_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "run".to_string());
     let pack = DataPack {
-        sample: out_dir
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "run".to_string()),
+        sample: sample.clone(),
         metrics: Metrics {
             events: sites.len() as u64,
             pass: sites.iter().filter(|s| s.pass_).count() as u64,
@@ -385,16 +449,19 @@ pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<Path
             map_rate,
             rescued,
             recodings: recodings.len() as u64,
+            unscored: sites.iter().filter(|s| s.unscored).count() as u64,
         },
         chroms,
         heat5,
         heat1,
+        resc5,
+        resc1,
         sites: per_chrom,
         recodings,
         genes: gene_out,
     };
     let html = render(&pack)?;
-    let out_path = out_dir.join("report.html");
+    let out_path = out_dir.join(format!("{sample}.report.html"));
     std::fs::write(&out_path, &html).with_context(|| format!("writing {}", out_path.display()))?;
     Ok(out_path)
 }
@@ -403,7 +470,12 @@ pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<Path
 /// pos, prob, vaf, depth, pass, gene.
 fn cmp_site_row(a: &SiteRow, b: &SiteRow) -> std::cmp::Ordering {
     a.0.cmp(&b.0)
-        .then(a.1.total_cmp(&b.1))
+        .then(match (a.1, b.1) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, _) => std::cmp::Ordering::Less,
+            (_, None) => std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) => x.total_cmp(&y),
+        })
         .then(a.2.total_cmp(&b.2))
         .then(a.3.cmp(&b.3))
         .then(a.4.cmp(&b.4))
@@ -448,10 +520,13 @@ mod tests {
                 map_rate: 0.5,
                 rescued: 0,
                 recodings: 0,
+                unscored: 0,
             },
             chroms: vec![],
             heat5: BTreeMap::new(),
             heat1: BTreeMap::new(),
+            resc5: BTreeMap::new(),
+            resc1: BTreeMap::new(),
             sites: BTreeMap::new(),
             recodings: vec![],
             genes: vec![],

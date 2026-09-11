@@ -49,7 +49,10 @@ pub fn run(params: &RunParams) -> Result<(), FlowError> {
 
 /// Entry + guardrail checks shared by fresh runs and resumes.
 pub fn preflight(params: &RunParams, entry: Entry) -> Result<(), FlowError> {
-    guard::check_species(&params.fasta)?;
+    // Reference manifest copied into the run dir at run start (hybrid refs);
+    // absent → legacy hg38 heuristic.
+    let manifest = crate::manifest::SpeciesManifest::read(&params.out_dir);
+    guard::check_species(&params.fasta, manifest.as_ref())?;
     match entry {
         Entry::FastqSe | Entry::FastqPe => {
             if params.index.is_none() {
@@ -100,10 +103,15 @@ pub fn run_from(
             } else {
                 current_bam = map_dir.join("sorted.bam");
             }
-            if entry == Entry::FastqSe {
-                // The SE mapper writes .baln; use it as the scan fast channel.
-                baln = Some(map_dir.join("align.baln"));
-            }
+            // The mapper writes .baln for SE and PE alike; use it as the
+            // scan fast channel. A missing or stub (0-byte, pre-channel
+            // run directories) .baln falls back to the BAM.
+            let baln_path = map_dir.join("align.baln");
+            baln = baln_path
+                .metadata()
+                .map(|m| m.len() > 12)
+                .unwrap_or(false)
+                .then_some(baln_path);
         }
         Entry::Bam | Entry::BamSites => {
             if let Some(bam) = &params.bam {
@@ -148,7 +156,8 @@ pub fn run_from(
 }
 
 /// scores.tsv → probs bridge for resumes that skip the score stage.
-fn load_scores(path: &Path) -> Result<Vec<f64>, FlowError> {
+/// `NA` marks unscored rows (hybrid runs: mouse-contig sites).
+fn load_scores(path: &Path) -> Result<Vec<Option<f64>>, FlowError> {
     let text = fs::read_to_string(path)?;
     let mut probs = Vec::new();
     for (i, line) in text.lines().enumerate() {
@@ -158,10 +167,17 @@ fn load_scores(path: &Path) -> Result<Vec<f64>, FlowError> {
         let p = line
             .split('\t')
             .nth(2)
-            .and_then(|v| v.parse::<f64>().ok())
+            .map(|v| {
+                if v == "NA" {
+                    Ok(None)
+                } else {
+                    v.parse::<f64>().map(Some).map_err(|_| ())
+                }
+            })
+            .and_then(|r| r.ok())
             .ok_or_else(|| FlowError::BedParse {
                 line: i + 1,
-                msg: "scores.tsv expects 'chrom<TAB>pos<TAB>prob'".into(),
+                msg: "scores.tsv expects 'chrom<TAB>pos<TAB>prob' (or NA)".into(),
             })?;
         probs.push(p);
     }
@@ -177,7 +193,7 @@ fn stage_report(params: &RunParams) {
             Ok(p) => eprintln!("[report] written: {}", p.display()),
             Err(e) => eprintln!("[report] warning: report generation failed: {e}"),
         },
-        None => eprintln!("[report] warning: no GTF available; skipped report.html"),
+        None => eprintln!("[report] warning: no GTF available; skipped the HTML report"),
     }
 }
 
@@ -499,8 +515,24 @@ fn rescue_collapsed(
             rescued_names.insert(name);
         }
     }
-    if rescued.is_empty() {
-        return Ok(());
+if rescued.is_empty() {
+return Ok(());
+    }
+
+    // Placement sidecar for the report's hyperedited-region track: one
+    // `chrom<TAB>pos` row (0-based) per rescued read, written before any
+    // merge step so an interruption still leaves the raw data on disk.
+    {
+        let mut text = String::new();
+        use std::fmt::Write as _;
+        for (_, _, _, a) in &rescued {
+            let _ = writeln!(
+                text,
+                "{}\t{}",
+                cidx.reference.contigs[a.contig as usize].name, a.pos
+            );
+        }
+        fs::write(map_dir.join("rescued.bed"), text)?;
     }
 
     // Rewrite unmapped.fq.gz without the rescued reads.
@@ -739,7 +771,7 @@ fn stage_score(
     params: &RunParams,
     bam: &Path,
     sites: &[(String, i64)],
-) -> Result<Vec<f64>, FlowError> {
+) -> Result<Vec<Option<f64>>, FlowError> {
     let dir = params.out_dir.join("score");
     fs::create_dir_all(&dir)?;
     if sites.is_empty() {
@@ -748,6 +780,11 @@ fn stage_score(
         return Ok(Vec::new());
     }
     eprintln!("[score] running");
+    // Hybrid runs: human-locus sites score with the bundle; mouse-contig
+    // sites are never scored with the human model (scientific contract) —
+    // they reach the VCF marked UNSCORED with VAF/DEPTH kept.
+    let manifest = crate::manifest::SpeciesManifest::read(&params.out_dir);
+    let hybrid = manifest.as_ref().is_some_and(|m| m.kind == "hybrid");
     let caduceus = match &params.caduceus {
         Some(c) => c.clone(),
         None => score_pipeline::resolve_encoder_from_bundle(&params.bundle)
@@ -757,24 +794,129 @@ fn stage_score(
         .device_ask
         .as_ref()
         .map(|a| a.fn_ref());
-    let probs = score_pipeline::score_sites_batched(
-        bam,
-        &params.fasta,
-        &caduceus,
-        &params.bundle,
-        sites,
-        params.threads,
-        params.batch.max(1),
-        None,
-        params.device,
-        ask,
-    )
-    .map_err(anyhow_stage_err("score"))?;
+    let scored: Vec<f64> = if hybrid {
+        let m = manifest.as_ref().expect("hybrid checked");
+        let human_sites: Vec<(String, i64)> = sites
+            .iter()
+            .filter(|(c, _)| m.owner_of(c) == Some("human"))
+            .cloned()
+            .collect();
+        let mouse_sites: Vec<(String, i64)> = sites
+            .iter()
+            .filter(|(c, _)| m.owner_of(c) == Some("mouse"))
+            .cloned()
+            .collect();
+        let mut by_site: std::collections::HashMap<(String, i64), f64> =
+            std::collections::HashMap::with_capacity(sites.len());
+        if !human_sites.is_empty() {
+            let probs = score_pipeline::score_sites_batched(
+                bam,
+                &params.fasta,
+                &caduceus,
+                &params.bundle,
+                &human_sites,
+                params.threads,
+                params.batch.max(1),
+                None,
+                params.device,
+                ask,
+                None,
+                score_pipeline::ReferenceCheck::TrustedHybrid,
+            )
+            .map_err(anyhow_stage_err("score"))?;
+            for (s, p) in human_sites.iter().zip(probs) {
+                by_site.insert(s.clone(), p);
+            }
+        }
+        if !mouse_sites.is_empty() {
+            // Mouse-contig sites score with the mouse bundle (manifest
+            // frozen at build time); without one they stay UNSCORED.
+            let mouse_bundle: Option<std::path::PathBuf> = m.bundles.get("mouse").cloned();
+            match mouse_bundle {
+                Some(mb) => {
+                    let m_caduceus = match &params.caduceus {
+                        // the encoder is shared (same frozen backbone)
+                        Some(c) => c.clone(),
+                        None => score_pipeline::resolve_encoder_from_bundle(&mb)
+                            .map_err(anyhow_stage_err("score"))?,
+                    };
+                    let probs = score_pipeline::score_sites_batched(
+                        bam,
+                        &params.fasta,
+                        &m_caduceus,
+                        &mb,
+                        &mouse_sites,
+                        params.threads,
+                        params.batch.max(1),
+                        None,
+                        params.device,
+                        ask,
+                        None,
+                        score_pipeline::ReferenceCheck::TrustedHybrid,
+                    )
+                    .map_err(anyhow_stage_err("score"))?;
+                    for (s, p) in mouse_sites.iter().zip(probs) {
+                        by_site.insert(s.clone(), p);
+                    }
+                    eprintln!(
+                        "[score] hybrid: {} human + {} mouse sites scored (mouse model)",
+                        human_sites.len(),
+                        mouse_sites.len()
+                    );
+                }
+                None => {
+                    eprintln!(
+                        "[score] hybrid: {} mouse-contig sites marked UNSCORED (no mouse model installed)",
+                        mouse_sites.len()
+                    );
+                }
+            }
+        }
+        sites
+            .iter()
+            .map(|s| by_site.get(s).copied().unwrap_or(f64::NAN))
+            .collect::<Vec<f64>>()
+    } else {
+        score_pipeline::score_sites_batched(
+            bam,
+            &params.fasta,
+            &caduceus,
+            &params.bundle,
+            sites,
+            params.threads,
+            params.batch.max(1),
+            None,
+            params.device,
+            ask,
+            None,
+            score_pipeline::ReferenceCheck::Guardrail,
+        )
+        .map_err(anyhow_stage_err("score"))?
+    };
 
+    // Reassemble in site order (None = unscored rows: mouse-contig sites
+    // without a mouse model surface as NAN in the hybrid branch).
+    let mut probs: Vec<Option<f64>> = Vec::with_capacity(sites.len());
+    if hybrid {
+        for v in scored {
+            probs.push(if v.is_nan() { None } else { Some(v) });
+        }
+    } else {
+        for v in scored {
+            probs.push(Some(v));
+        }
+    }
     let mut text = String::new();
     for ((chrom, pos), prob) in sites.iter().zip(&probs) {
         use std::fmt::Write as _;
-        let _ = writeln!(text, "{chrom}\t{pos}\t{prob}");
+        match prob {
+            Some(p) => {
+                let _ = writeln!(text, "{chrom}\t{pos}\t{p}");
+            }
+            None => {
+                let _ = writeln!(text, "{chrom}\t{pos}\tNA");
+            }
+        }
     }
     fs::write(dir.join("scores.tsv"), text)?;
     eprintln!("[score] {} sites", probs.len());

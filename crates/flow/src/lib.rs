@@ -10,6 +10,7 @@
 pub mod error;
 pub mod filter;
 pub mod guard;
+pub mod manifest;
 pub mod params;
 pub mod resume;
 pub mod stages;

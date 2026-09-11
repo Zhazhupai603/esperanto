@@ -4,6 +4,7 @@
 //! Write side: record model + binary encoder + multithreaded BGZF writer + header construction;
 //! Read side: sequential record view (read module) + original-orientation restore helpers.
 
+pub mod baln;
 pub mod encode;
 pub mod read;
 pub mod sort;

@@ -1,10 +1,13 @@
-# scan — strand-resolved candidate editing-site discovery (call_v2 scatter engine)
+# scan — strand-resolved candidate editing-site discovery (scatter engine)
 
-Genome-wide scan from BAM or .baln, emitting candidates.bed (10-column contract). **No hard filtering**: strand-resolved statistics + soft score call_score (0–1) + evidence code EVID all pass through (var_freq/fwd_freq/rev_freq pass through), to be consumed downstream with thresholds. Semantic source: the legacy esperanto-scan (call_v2 default engine; the legacy htslib v1 engine is deprecated and not ported).
+Genome-wide scan from BAM or .baln, emitting candidates.bed (10-column contract). **No hard filtering**: strand-resolved statistics + soft score call_score (0–1) + evidence code EVID all pass through (var_freq/fwd_freq/rev_freq pass through), to be consumed downstream with thresholds. Semantic source: the scatter caller is the only engine.
 
 ## Inputs
 
 - `--bam`: aligned BAM (requires .bai/.csi). Skips unmapped (0x4) / secondary (0x100) / supplementary (0x800).
+- Reads tagged `RE:Z:collapsed` (collapsed-rescue placements) count toward depth/bq/mapq/junction
+  accumulators only; their bases are alphabet-ambiguous (A==G, T==C) and never contribute variant
+  evidence (`sites` counts). Same rule on the .baln path.
 - `--baln`: binary fast path from the map product; **byte-identical output** with the BAM path (both sources share the same scatter kernel; block-window overlap semantics aligned with htslib fetch: pos ∈ [cs−max_span, ce) and pos+span > cs). contig-derived lengths are corrected against .fai (derived values used when fasta is absent or the contig is missing).
 - `--fasta` (optional): reference base / homopolymer / junction direction voting; absent or contig missing → majority pseudo-ref (all sites on that contig fully counted, hp=0, junction does not vote). A fasta missing a contig must be pre-checked against the .fai list; it must not panic.
 - `--gtf` (optional): strand-decision evidence, priority 3.
@@ -43,7 +46,7 @@ Parallel over (contig, 32 Mbp blocks); each read's contribution is scattered dir
 
 ## Dependencies
 
-rust-htslib (BAM path + faidx), thiserror, serde/serde_json (spec), rayon, flate2 (annotation gz). Does not depend on other esperanto crates (the .baln format is parsed self-contained).
+rust-htslib (BAM path + faidx), thiserror, serde/serde_json (spec), rayon, flate2 (annotation gz), esperanto-bamio (canonical `.baln` reader, shared with score/pileup).
 
 ## Self-checks
 

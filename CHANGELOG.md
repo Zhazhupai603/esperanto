@@ -3,6 +3,70 @@
 All notable changes to ESPERANTO are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows [SemVer](https://semver.org/).
 
+## [1.0.3] - 2026-08-29
+
+### Added
+
+- Hybrid references for knock-in mouse models: `run --hybrid
+  GENE[,GENE...]` stages the mouse reference on demand and splices the
+  selected human gene loci (full locus incl. introns) onto the mouse
+  baseline, building the hybrid index on first use and reusing it on later
+  runs (bare `--hybrid` opens an interactive gene picker). Scoring routes
+  per contig via the species.json manifest: human-locus sites use the
+  human model bundle, mouse-contig sites use the mouse model bundle
+  (donor-disjoint held-out AUROC 0.985 on 10 ENCODE B6CASTF1 brain
+  samples); without a mouse bundle installed, mouse-contig sites are
+  written UNSCORED with VAF/DEPTH. The manifest also drives the
+  guardrail and the report's contig list.
+
+### Changed
+- Large reference downloads run as parallel resumable chunks (6 streams,
+  per-chunk retry, mirror fallback); a dropped connection resumes where
+  it stopped instead of restarting. The mouse reference is staged on
+  demand at the first `--hybrid` run instead of during setup, and setup
+  no longer downloads the (optional) mouse annotation.
+
+- The HTML report is named `<sample>.report.html` and gains a red
+  region-level hyperedited-density track (rescued-read counts per window)
+  under the signal tracks in the genome explorer.
+
+### Changed
+
+- Collapsed-rescue reads (`RE:Z:collapsed`) no longer contribute variant
+  evidence to candidate calling — their bases are alphabet-ambiguous and
+  produced millions of spurious low-quality candidates on rescue-heavy
+  samples. They still count toward depth. Candidate volume drops to the
+  real scale and the score stage shrinks from hours to minutes on such
+  samples.
+
+- The pileup engine is now event-driven: records stream once per region
+  (nodes retire through an end-keyed heap, columns are built only at site
+  positions, and a MAXCNT-saturated group falls back to the exact per-site
+  sweep). Pileup time on candidate-dense real data drops by ~20x with
+  bit-identical features elsewhere.
+
+### Added
+
+- Paired-end runs now write the `.baln` fast channel too (previously a
+  zero-byte stub), and the scan stage uses it for PE entries with a BAM
+  fallback for stub/absent files; `score --baln` is available as an
+  experimental pileup source.
+
+### Changed
+
+- Score runs its pileup pass as a single region sweep per worker instead
+  of per-64-site fetches, and the default score batch is 256 (numerics are
+  unchanged by construction: identical sites, identical record sets,
+  identical model). Pileup features now skip `RE:Z:collapsed` records,
+  matching the scan evidence rule; on rescue-heavy samples the depth
+  features (and downstream gate/score inputs) change accordingly.
+ dev/pile-stream
+- The installer detects a working NVIDIA driver and downloads the
+  GPU-enabled build automatically, falling back to the CPU build when the
+  GPU asset is unavailable. On a GPU-enabled build, `--device auto` asks
+  once whether to use a detected GPU; machines without a GPU are never
+  asked and stay on the CPU path.
+
 ## [1.0.2] - 2026-08-27
 
 ### Added
