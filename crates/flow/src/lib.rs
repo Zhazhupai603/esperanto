@@ -8,6 +8,7 @@
 //! stage crates; flow only wires, fails early, and writes deterministically.
 
 pub mod error;
+pub mod filter;
 pub mod guard;
 pub mod params;
 pub mod stages;

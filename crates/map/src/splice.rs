@@ -12,7 +12,7 @@
 use crate::extend::{
     extend_hint, push_op, CigarOp, DiagHint, ExtendBuffer, ExtendParams, Extension,
 };
-use crate::fasta::Reference;
+use crate::fasta::{Base, Reference};
 use crate::gtf::{Junction, JunctionLib, RefinedJunction, SpliceSignal};
 use crate::seed::Strand;
 
@@ -192,6 +192,125 @@ pub fn refine_junction(
         }
     }
     best.map(|(_, rj)| rj)
+}
+
+/// Read-aware junction refinement (preferred over [`refine_junction`]).
+///
+/// The intron length is fixed by the seed anchors: `ref_gap − read_gap`,
+/// where `ref_gap = naive_end − naive_start` and `read_gap = q_b − q_a`. The
+/// boundary therefore has a single degree of freedom — where along the
+/// un-anchored read gap the splice falls. Enumerate that shift and pick the
+/// boundary that carries a canonical splice signal AND matches the read on
+/// both flanks (editing-aware). This removes the proximity bias that drifted
+/// off at competing GT/AG motifs.
+#[allow(clippy::too_many_arguments)]
+pub fn refine_junction_read(
+    reference: &Reference,
+    read: &[u8],
+    contig: u32,
+    naive_start: u32,
+    naive_end: u32,
+    q_a: u32,
+    q_b: u32,
+    minus: bool,
+    lib: &JunctionLib,
+    params: &SpliceParams,
+) -> Option<RefinedJunction> {
+    let ctg = reference.contigs.get(contig as usize)?;
+    let len = ctg.len;
+    let read_len = read.len() as u32;
+
+    let ref_gap = naive_end as i64 - naive_start as i64;
+    let read_gap = q_b as i64 - q_a as i64;
+    if read_gap > 20 {
+        return None; // not a tight junction
+    }
+    let intron_len = ref_gap - read_gap;
+    if intron_len < params.min_intron as i64 || intron_len > params.max_intron as i64 {
+        return None;
+    }
+
+    // Boundary shift delta = s − naive_start, constrained to the read gap
+    // (plus a small margin for anchor-boundary imprecision). The read gap may
+    // be negative when the two anchors overlap by a base at the junction (a
+    // read base matching both the last exon base and the acceptor dinucleotide);
+    // signed arithmetic keeps the intron length exact.
+    let margin = 2i64;
+    let lo = read_gap.min(0) - margin;
+    let hi = read_gap.max(0) + margin;
+
+    let mut best: Option<(i32, RefinedJunction)> = None;
+    for delta in lo..=hi {
+        let s = naive_start as i64 + delta;
+        if s < 0 {
+            continue;
+        }
+        let e = s + intron_len;
+        if e < 2 || e as u64 > len as u64 {
+            continue;
+        }
+        let qb = q_a as i64 + delta;
+        if qb < 1 || qb as u32 >= read_len {
+            continue;
+        }
+        let signal = splice_signal(
+            dinuc(ctg, s as u32, true),
+            dinuc(ctg, e as u32, false),
+            minus,
+        );
+        let junction = Junction {
+            contig,
+            start: s as u32,
+            end: e as u32,
+            minus_strand: minus,
+        };
+        let support = lib.support(&junction);
+
+        // Read-match on both flanks of the boundary (editing-aware).
+        let mut m = 0i32;
+        let w = 4i64;
+        for i in 1..=w {
+            let q1 = qb - i;
+            let g1 = s - i;
+            if q1 >= 0
+                && g1 >= 0
+                && edit_equiv(Base::from_ascii(read[q1 as usize]), ctg.base(g1 as u32))
+            {
+                m += 1;
+            }
+            let q2 = qb + i - 1;
+            let g2 = e + i - 1;
+            if (q2 as u32) < read_len
+                && (g2 as u64) < len as u64
+                && edit_equiv(Base::from_ascii(read[q2 as usize]), ctg.base(g2 as u32))
+            {
+                m += 1;
+            }
+        }
+
+        let mut score = m * 50 + signal.score(params) * 5 - (delta.abs() as i32) * 5;
+        if support > 0 {
+            score += params.known_bonus;
+        }
+        if best.as_ref().is_none_or(|(bs, _)| score > *bs) {
+            best = Some((
+                score,
+                RefinedJunction {
+                    junction,
+                    signal,
+                    known_support: support,
+                },
+            ));
+        }
+    }
+    best.map(|(_, rj)| rj)
+}
+
+/// Editing-equivalent bases: exact match, or A↔G / T↔C (A-to-I editing on
+/// either strand).
+fn edit_equiv(a: Base, b: Base) -> bool {
+    use Base::{A, C, G, T};
+    a == b || matches!((a, b), (A, G) | (G, A) | (T, C) | (C, T))
 }
 
 /// Read a donor (at `p`) or acceptor (at `p − 2`) dinucleotide, N-padded when
@@ -424,15 +543,24 @@ pub fn align_spliced(
     // Per-pair refinement + S14 guards.
     let mut junctions: Vec<RefinedJunction> = Vec::with_capacity(segments.len() - 1);
     for w in segments.windows(2) {
-        let refined = refine_junction(
+        let refined = refine_junction_read(
             reference,
+            read,
             contig,
             w[0].r_end,
             w[1].r_start,
+            w[0].q_end,
+            w[1].q_start,
             minus,
             lib,
             params,
-        )?;
+        );
+        if std::env::var_os("ESP_PROBE").is_some() {
+            eprintln!("[probe-sp] refine seg r=({},{}) q=({},{}) -> {}",
+                w[0].r_end, w[1].r_start, w[0].q_end, w[1].q_start,
+                refined.as_ref().map_or("None".to_string(), |r| format!("intron=({},{}) sig={:?} known={}", r.junction.start, r.junction.end, r.signal, r.known_support)));
+        }
+        let refined = refined?;
         let intron_len = refined.junction.end - refined.junction.start;
         if intron_len < params.min_intron || intron_len > params.max_intron {
             return None;

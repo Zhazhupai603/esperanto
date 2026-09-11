@@ -19,8 +19,8 @@ use crate::index::Index;
 use crate::intron_chain::cigar_conserving;
 use crate::seed::{minimizers, SeedParams, Strand};
 use crate::splice::{
-    junction_signal, lib_window_candidates, refine_junction, s14_pass, tail_gate, SpliceParams,
-    SPLIT_COST, SPLIT_LIB_WINDOW,
+    junction_signal, lib_window_candidates, refine_junction, s14_pass, splice_signal, tail_gate,
+    SpliceParams, SPLIT_COST, SPLIT_LIB_WINDOW,
 };
 
 /// Library-driven tail lower bound (frozen).
@@ -29,9 +29,10 @@ pub const TAIL_MIN: usize = 7;
 /// Tail-start retry radius (parity experiments, frozen: ±5bp).
 pub const TAIL_RETRY_RADIUS: i64 = 5;
 
-/// Direct-scan channel tail length range (5..15bp).
+/// Direct-scan channel tail length range (5..19bp; tails ≥ 19 bp reach the
+/// seed channel, which needs k+w-1 = 19 bp for one minimizer).
 pub const DIRECT_TAIL_MIN: usize = 5;
-pub const DIRECT_TAIL_MAX: usize = 15;
+pub const DIRECT_TAIL_MAX: usize = 19;
 
 /// Direct-scan donor search radius (±12bp).
 pub const DIRECT_DONOR_RADIUS: i64 = 12;
@@ -421,7 +422,7 @@ fn channel_a(ctx: &SplitContext, right: bool, buf: &mut ExtendBuffer) -> Option<
 
 /// Dinucleotide ending at `p` (i.e. `[p-2, p)`), read from a decoded window
 /// starting at `lo`; `NN` when out of range.
-const GT_SET: [[u8; 2]; 1] = [*b"GT"];
+const GT_SET: [[u8; 2]; 3] = [*b"GT", *b"GC", *b"AT"];
 const AG_AC_SET: [[u8; 2]; 2] = [*b"AG", *b"AC"];
 const CT_GT_SET: [[u8; 2]; 2] = [*b"CT", *b"GT"];
 const AC_GC_AT_SET: [[u8; 2]; 3] = [*b"AC", *b"GC", *b"AT"];
@@ -463,16 +464,15 @@ fn matches_at(win: &[u8], lo: u32, p: u32, pat: &[u8]) -> bool {
 /// acceptors ±12 around `pos`, probe scan ≤50kb upstream for an exact
 /// tail-suffix match at a plausible donor. Candidate score =
 /// `sig.score*100 - |body_boundary_deviation| - |intron - 5000|/1000`; the
-/// best candidate's whole tail is then extension-validated (≥4/5, score>0).
-/// The discovered junction is recorded with signal GtAg, support 0.
+/// best candidate's whole tail is then extension-validated (≥ 4/5, score > 0).
+/// The discovered junction is recorded with the detected splice signal, support 0.
 fn channel_b(ctx: &SplitContext, right: bool, buf: &mut ExtendBuffer) -> Option<SplitRescue> {
     let ctg = ctx.reference.contigs.get(ctx.contig as usize)?;
-    let (tail, body_edge_read) = if right {
-        (&ctx.read[ctx.read_end as usize..], ctx.read_end)
+    let tl = if right {
+        ctx.read.len() - ctx.read_end as usize
     } else {
-        (&ctx.read[..ctx.read_start as usize], ctx.read_start)
+        ctx.read_start as usize
     };
-    let tl = tail.len();
     if !(DIRECT_TAIL_MIN..DIRECT_TAIL_MAX).contains(&tl) {
         return None;
     }
@@ -487,11 +487,6 @@ fn channel_b(ctx: &SplitContext, right: bool, buf: &mut ExtendBuffer) -> Option<
         (true, true) => (&CT_GT_SET, &AC_GC_AT_SET),
         (false, false) => (&AG_AC_SET, &GT_SET),
         (false, true) => (&AC_GC_AT_SET, &CT_GT_SET),
-    };
-    let probe = if right {
-        &tail[..probe_len]
-    } else {
-        &tail[tl - probe_len..]
     };
 
     // One decoded window covering the ±12 body scan and the full search span.
@@ -513,7 +508,12 @@ fn channel_b(ctx: &SplitContext, right: bool, buf: &mut ExtendBuffer) -> Option<
     let win = ctg.slice_ascii(scan_lo, scan_hi);
     let body_anchor = if right { ctx.ref_end } else { ctx.pos };
 
-    let mut best: Option<(i32, u32, u32)> = None; // (score, intron_start, intron_end)
+    // Body-overshoot note: a continuous extension can run a few bp INTO the
+    // intron (repeat similarity). The true junction boundary then sits `over`
+    // bp before the body edge, and the exon fragment on the tail side starts
+    // `over` bp earlier in the read. Each boundary candidate computes its own
+    // overshoot and uses an overshoot-adjusted probe and tail.
+    let mut best: Option<(i32, u32, u32, u32)> = None; // (score, intron_start, intron_end, over)
     if right {
         let d_lo = ctx.ref_end.saturating_sub(DIRECT_DONOR_RADIUS as u32);
         let d_hi = (ctx.ref_end + DIRECT_DONOR_RADIUS as u32).min(ctg.len.saturating_sub(2));
@@ -522,17 +522,23 @@ fn channel_b(ctx: &SplitContext, right: bool, buf: &mut ExtendBuffer) -> Option<
                 continue;
             }
             let dev = (d as i64 - body_anchor as i64).abs() as i32;
+            let over = (ctx.ref_end as i64 - d as i64).max(0) as u32;
+            if over > ctx.read_end {
+                continue;
+            }
+            let probe_start = (ctx.read_end - over) as usize;
+            let probe_d = &ctx.read[probe_start..probe_start + probe_len];
             let q_lo = d as u64 + min_intron as u64;
             let q_hi = (d as u64 + span).min(scan_hi as u64);
             for q in q_lo..=q_hi {
                 let qu = q as u32;
                 if tail_set.contains(&dinuc_before(&win, scan_lo, qu))
-                    && matches_at(&win, scan_lo, qu, probe)
+                    && matches_at(&win, scan_lo, qu, probe_d)
                 {
                     let intron = qu as i64 - d as i64;
                     let score = 4 * 100 - dev - ((intron - 5000).abs() / 1000) as i32;
-                    if best.as_ref().is_none_or(|(s, _, _)| score > *s) {
-                        best = Some((score, d, qu));
+                    if best.as_ref().is_none_or(|(s, _, _, _)| score > *s) {
+                        best = Some((score, d, qu, over));
                     }
                 }
             }
@@ -545,6 +551,12 @@ fn channel_b(ctx: &SplitContext, right: bool, buf: &mut ExtendBuffer) -> Option<
                 continue;
             }
             let dev = (a as i64 - body_anchor as i64).abs() as i32;
+            let over = (a as i64 - ctx.pos as i64).max(0) as u32;
+            if ctx.read_start + over > ctx.read.len() as u32 {
+                continue;
+            }
+            let probe_end = (ctx.read_start + over) as usize;
+            let probe_d = &ctx.read[probe_end - probe_len..probe_end];
             let s_lo = ((a as i64 - DIRECT_SCAN_SPAN as i64).max(scan_lo as i64).max(0)) as u64;
             let s_hi = a as u64 - min_intron as u64;
             for s in s_lo..=s_hi {
@@ -553,31 +565,53 @@ fn channel_b(ctx: &SplitContext, right: bool, buf: &mut ExtendBuffer) -> Option<
                 }
                 let su = s as u32;
                 if tail_set.contains(&dinuc_after(&win, scan_lo, su))
-                    && matches_at(&win, scan_lo, su - probe_len as u32, probe)
+                    && matches_at(&win, scan_lo, su - probe_len as u32, probe_d)
                 {
                     let intron = a as i64 - s as i64;
                     let score = 4 * 100 - dev - ((intron - 5000).abs() / 1000) as i32;
-                    if best.as_ref().is_none_or(|(s0, _, _)| score > *s0) {
-                        best = Some((score, su, a));
+                    if best.as_ref().is_none_or(|(s0, _, _, _)| score > *s0) {
+                        best = Some((score, su, a, over));
                     }
                 }
             }
         }
     }
-    let (scan_score, start, end) = best?;
+    if std::env::var_os("ESP_PROBE").is_some() {
+        eprintln!("[probe-cb] right={right} tail={tl} best={best:?}");
+    }
+    let (scan_score, start, end, over) = best?;
     let intron_len = end - start;
+
+    // Overshoot-adjusted tail and body edge: the body ran `over` bp into the
+    // intron, so the true exon fragment is `over` bp longer on the tail side.
+    let (ext_tail, body_edge) = if right {
+        let edge = ctx.read_end - over;
+        (&ctx.read[edge as usize..], edge)
+    } else {
+        let edge = ctx.read_start + over;
+        (&ctx.read[..edge as usize], edge)
+    };
+    let etl = ext_tail.len();
 
     // Whole-tail extension validation.
     let (win_lo, win_hi) = if right {
-        let hi = ((end as u64) + (tl as u64) + (TAIL_MARGIN as u64)).min(ctg.len as u64) as u32;
+        let hi = ((end as u64) + (etl as u64) + (TAIL_MARGIN as u64)).min(ctg.len as u64) as u32;
         (end, hi)
     } else {
         let hi = start;
-        let lo = hi.saturating_sub(tl as u32 + TAIL_MARGIN);
+        let lo = hi.saturating_sub(etl as u32 + TAIL_MARGIN);
         (lo, hi)
     };
-    let (_, ext) = extend_tail(ctg, tail, win_lo, win_hi, &ctx.extend_params, buf)?;
-
+    let ext_res = extend_tail(ctg, ext_tail, win_lo, win_hi, &ctx.extend_params, buf);
+    if std::env::var_os("ESP_PROBE").is_some() {
+        eprintln!("[probe-cb] start={start} end={end} over={over} ext={}", ext_res.as_ref().map_or("None".to_string(), |(_, e)| format!("score={} ref_start={}", e.score, e.ref_start)));
+    }
+    let (_, ext) = ext_res?;
+    let signal = splice_signal(
+        dinuc_after(&win, scan_lo, start),
+        dinuc_before(&win, scan_lo, end),
+        ctx.minus(),
+    );
     let junction = RefinedJunction {
         junction: Junction {
             contig: ctx.contig,
@@ -585,17 +619,17 @@ fn channel_b(ctx: &SplitContext, right: bool, buf: &mut ExtendBuffer) -> Option<
             end,
             minus_strand: ctx.minus(),
         },
-        signal: SpliceSignal::GtAg,
+        signal,
         known_support: 0,
     };
     let (cigar, pos) = if right {
         (
-            build_rescue(ctx.cigar, body_edge_read, &ext, intron_len),
+            build_rescue(ctx.cigar, body_edge, &ext, intron_len),
             ctx.pos,
         )
     } else {
         (
-            build_rescue_left(&ext, ctx.cigar, body_edge_read, intron_len),
+            build_rescue_left(&ext, ctx.cigar, body_edge, intron_len),
             win_lo + ext.ref_start,
         )
     };
@@ -737,8 +771,15 @@ pub fn rescue_right_tail(ctx: &SplitContext, buf: &mut ExtendBuffer) -> Option<S
     if tail_len < TAIL_MIN {
         return None;
     }
+    if std::env::var_os("ESP_PROBE").is_some() && !ctx.lib.is_empty() {
+        eprintln!("[probe-tail] rescue_right_tail tail_len={tail_len} read_end={} lib_empty={}", ctx.read_end, ctx.lib.is_empty());
+    }
     if !ctx.lib.is_empty() {
-        return channel_a(ctx, true, buf);
+        // Library first (high-confidence); fall back to de-novo scan/seed
+        // (B/C) for junctions NOT in the library (novel splices).
+        if let Some(a) = channel_a(ctx, true, buf) {
+            return Some(a);
+        }
     }
     channel_b(ctx, true, buf).or_else(|| channel_c(ctx, true, buf))
 }
@@ -751,7 +792,9 @@ pub fn rescue_left_tail(ctx: &SplitContext, buf: &mut ExtendBuffer) -> Option<Sp
         return None;
     }
     if !ctx.lib.is_empty() {
-        return channel_a(ctx, false, buf);
+        if let Some(a) = channel_a(ctx, false, buf) {
+            return Some(a);
+        }
     }
     channel_b(ctx, false, buf).or_else(|| channel_c(ctx, false, buf))
 }
