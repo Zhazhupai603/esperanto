@@ -189,8 +189,8 @@ pub enum L1Outcome {
         strand: Strand,
         /// CIGAR in reference (left-to-right) orientation.
         cigar: Vec<CigarOp>,
-        /// Alignment score: 0 on the full branch, EA edit distance on the
-        /// interrupted branch (lower is better).
+        /// Alignment score: 0 on the full branch, EA edit distance on partials
+        /// (lower is better).
         score: i32,
         /// Mapping quality 0..=60.
         mapq: u8,
@@ -198,6 +198,34 @@ pub enum L1Outcome {
     /// No confident placement; defer to L2.
     Fallback,
 }
+
+/// One transcriptome-layer placement candidate, projected onto the genome.
+///
+/// The candidate generator reports *every* locus it can defend: all full
+/// extensions, and every verified partial within the distance and coverage
+/// gates. It expresses no preference between them and produces no mapping
+/// quality — arbitration against the genomic layer's candidates happens in
+/// one strict scoring domain at the caller (see `esperanto_map::align`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L1Candidate {
+    /// Contig id (index into the projection's contig name table).
+    pub contig: u32,
+    /// Leftmost 0-based genomic position of the alignment.
+    pub pos: u32,
+    /// Genomic strand of the read.
+    pub strand: Strand,
+    /// CIGAR in reference (left-to-right) orientation.
+    pub cigar: Vec<CigarOp>,
+    /// Source transcript id.
+    pub tx_id: u32,
+    /// Branch that produced the candidate.
+    pub branch: Branch,
+    /// EA edit distance after verification (0 on the full branch).
+    pub dist: u32,
+}
+
+/// Upper bound on candidates returned by [`align_read_candidates`].
+pub const MAX_L1_CANDIDATES: usize = 8;
 
 /// Pipeline branch taken for a read (diagnostic, written into
 /// [`ReadStats`]).
@@ -390,136 +418,17 @@ pub fn align_read(
     }
     stats.branch = Branch::NoHit;
 
-    let read_rc = kmer::revcomp(read);
-
-    // ---- interleaved seeding: query + extend (full information) ---------
-    let mut exts: Vec<ExtEntry> = Vec::new();
-    let mut seen: BTreeSet<(u32, u16, i64)> = BTreeSet::new();
-    let mut diag_per_tx: BTreeMap<u32, usize> = BTreeMap::new();
-    let mut ext_per_tx: BTreeMap<u32, usize> = BTreeMap::new();
-    let mut raw_hits: usize = 0;
-    let per_tx_ext_cap = cfg.max_tx_candidates * cfg.max_diagonals_per_tx;
-    let batch_size = cfg.prefetch_batch.max(1);
-
-    let mut stream = KmerStream::new(read, k);
-    let mut batch: Vec<(usize, u64)> = Vec::with_capacity(batch_size);
-    'seeding: loop {
-        batch.clear();
-        while batch.len() < batch_size {
-            match stream.next() {
-                Some(item) => batch.push(item),
-                None => break,
-            }
-        }
-        if batch.is_empty() {
-            break;
-        }
-        for &(_, code) in &batch {
-            tidx.prefetch(code);
-        }
-        let exhausted = batch.len() < batch_size;
-        for (pos, code) in batch.iter().copied() {
-            let canon = kmer::canonical(code, k);
-            let hits = tidx.lookup(canon);
-            stats.queries += 1;
-            if hits.len() > cfg.max_hits_per_kmer {
-                continue;
-            }
-            for &(tx_id, tx_off) in hits {
-                if raw_hits >= cfg.max_raw_hits {
-                    break 'seeding;
-                }
-                raw_hits += 1;
-                if ext_per_tx.get(&tx_id).copied().unwrap_or(0) >= per_tx_ext_cap {
-                    continue;
-                }
-                let tx_seq = txseqs.seq(tx_id);
-                let t_off = tx_off as usize;
-                if t_off + k > tx_seq.len() {
-                    continue;
-                }
-                let Some(tx_code) = kmer::window_code(tx_seq, t_off, k) else {
-                    continue;
-                };
-                // Strand: forward code comparison at the hit offset.
-                let (strand, oriented_pos) = if tx_code == code {
-                    (Strand::Plus, pos)
-                } else {
-                    (Strand::Minus, read_len - k - pos)
-                };
-                let diagonal = tx_off as i64 - oriented_pos as i64;
-                let key = (tx_id, strand.sam_flag(), diagonal);
-                if seen.contains(&key) {
-                    continue;
-                }
-                if diag_per_tx.get(&tx_id).copied().unwrap_or(0) >= cfg.max_diagonals_per_tx {
-                    continue;
-                }
-                let oriented: &[u8] = if strand == Strand::Plus {
-                    read
-                } else {
-                    &read_rc
-                };
-                let ext = extend_ea(oriented, oriented_pos, k, tx_seq, t_off);
-                seen.insert(key);
-                *diag_per_tx.entry(tx_id).or_insert(0) += 1;
-                *ext_per_tx.entry(tx_id).or_insert(0) += 1;
-                exts.push(ExtEntry {
-                    tx_id,
-                    strand,
-                    diagonal,
-                    ext,
-                });
-            }
-        }
-        if exhausted {
-            break;
-        }
-    }
-    stats.extension_tx_count = ext_per_tx.len() as u32;
-
-    if exts.is_empty() {
+    let (mut fulls, parts, read_rc) =
+        collect_extensions(read, tidx, txseqs, cfg, stats);
+    if fulls.is_empty() && parts.is_empty() {
         stats.branch = Branch::NoHit;
         return L1Outcome::Fallback;
     }
 
-    let mut fulls: Vec<ExtEntry> = Vec::new();
-    let mut parts: Vec<ExtEntry> = Vec::new();
-    for e in exts {
-        if e.ext.full {
-            fulls.push(e);
-        } else {
-            parts.push(e);
-        }
-    }
-    parts.sort_by(|a, b| {
-        b.ext
-            .read_cov()
-            .cmp(&a.ext.read_cov())
-            .then(a.tx_id.cmp(&b.tx_id))
-            .then(a.diagonal.cmp(&b.diagonal))
-    });
-
     // EA-Myers infix distance of one candidate against its anchored
     // transcript window (None when the window is empty).
     let verify = |e: &ExtEntry| -> Option<u32> {
-        let tx_seq = txseqs.seq(e.tx_id);
-        let anchor = e.ext.tx_lo as i64 - e.ext.read_lo as i64;
-        let wlo = (anchor - cfg.flank as i64).max(0) as usize;
-        let whi = ((anchor + read_len as i64 + cfg.flank as i64).max(0) as usize).min(tx_seq.len());
-        if whi <= wlo {
-            return None;
-        }
-        let oriented: &[u8] = if e.strand == Strand::Plus {
-            read
-        } else {
-            &read_rc
-        };
-        Some(if read_len <= 128 {
-            myers::infix(oriented, &tx_seq[wlo..whi])
-        } else {
-            myers::long::infix(oriented, &tx_seq[wlo..whi])
-        })
+        verify_dist(read, &read_rc, txseqs, e, cfg)
     };
     stats.fulls_count = fulls.len() as u32;
     stats.parts_count = parts.len() as u32;
@@ -677,7 +586,295 @@ pub fn align_read(
         strand: bestp.strand,
         cigar: bestp.cigar.clone(),
         score: bestp.score,
-        mapq,
+mapq,
+}
+}
+
+/// Seed a read against the transcriptome index and greedily extend every
+/// seed hit under the EA predicate (shared by [`align_read`] and
+/// [`align_read_candidates`]).
+///
+/// Returns the full-length extensions, the partial extensions sorted by
+/// (read coverage DESC, tx_id ASC, diagonal ASC), and the reverse
+/// complement of the read (reused by verification).
+fn collect_extensions(
+    read: &[u8],
+    tidx: &impl Tidx,
+    txseqs: &impl TxSeqs,
+    cfg: &EngineConfig,
+    stats: &mut ReadStats,
+) -> (Vec<ExtEntry>, Vec<ExtEntry>, Vec<u8>) {
+    let k = tidx.k() as usize;
+    let read_len = read.len();
+    let read_rc = kmer::revcomp(read);
+
+    let mut exts: Vec<ExtEntry> = Vec::new();
+    let mut seen: BTreeSet<(u32, u16, i64)> = BTreeSet::new();
+    let mut diag_per_tx: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut ext_per_tx: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut raw_hits: usize = 0;
+    let per_tx_ext_cap = cfg.max_tx_candidates * cfg.max_diagonals_per_tx;
+    let batch_size = cfg.prefetch_batch.max(1);
+
+    let mut stream = KmerStream::new(read, k);
+    let mut batch: Vec<(usize, u64)> = Vec::with_capacity(batch_size);
+    'seeding: loop {
+        batch.clear();
+        while batch.len() < batch_size {
+            match stream.next() {
+                Some(item) => batch.push(item),
+                None => break,
+            }
+        }
+        if batch.is_empty() {
+            break;
+        }
+        for &(_, code) in &batch {
+            tidx.prefetch(code);
+        }
+        let exhausted = batch.len() < batch_size;
+        for (pos, code) in batch.iter().copied() {
+            let canon = kmer::canonical(code, k);
+            let hits = tidx.lookup(canon);
+            stats.queries += 1;
+            if hits.len() > cfg.max_hits_per_kmer {
+                continue;
+            }
+            for &(tx_id, tx_off) in hits {
+                if raw_hits >= cfg.max_raw_hits {
+                    break 'seeding;
+                }
+                raw_hits += 1;
+                if ext_per_tx.get(&tx_id).copied().unwrap_or(0) >= per_tx_ext_cap {
+                    continue;
+                }
+                let tx_seq = txseqs.seq(tx_id);
+                let t_off = tx_off as usize;
+                if t_off + k > tx_seq.len() {
+                    continue;
+                }
+                let Some(tx_code) = kmer::window_code(tx_seq, t_off, k) else {
+                    continue;
+                };
+                // Strand: forward code comparison at the hit offset.
+                let (strand, oriented_pos) = if tx_code == code {
+                    (Strand::Plus, pos)
+                } else {
+                    (Strand::Minus, read_len - k - pos)
+                };
+                let diagonal = tx_off as i64 - oriented_pos as i64;
+                let key = (tx_id, strand.sam_flag(), diagonal);
+                if seen.contains(&key) {
+                    continue;
+                }
+                if diag_per_tx.get(&tx_id).copied().unwrap_or(0) >= cfg.max_diagonals_per_tx {
+                    continue;
+                }
+                let oriented: &[u8] = if strand == Strand::Plus {
+                    read
+                } else {
+                    &read_rc
+                };
+                let ext = extend_ea(oriented, oriented_pos, k, tx_seq, t_off);
+                seen.insert(key);
+                *diag_per_tx.entry(tx_id).or_insert(0) += 1;
+                *ext_per_tx.entry(tx_id).or_insert(0) += 1;
+                exts.push(ExtEntry {
+                    tx_id,
+                    strand,
+                    diagonal,
+                    ext,
+                });
+            }
+        }
+        if exhausted {
+            break;
+        }
     }
+    stats.extension_tx_count = ext_per_tx.len() as u32;
+
+    let mut fulls: Vec<ExtEntry> = Vec::new();
+    let mut parts: Vec<ExtEntry> = Vec::new();
+    for e in exts {
+        if e.ext.full {
+            fulls.push(e);
+        } else {
+            parts.push(e);
+        }
+    }
+    parts.sort_by(|a, b| {
+        b.ext
+            .read_cov()
+            .cmp(&a.ext.read_cov())
+            .then(a.tx_id.cmp(&b.tx_id))
+            .then(a.diagonal.cmp(&b.diagonal))
+    });
+    (fulls, parts, read_rc)
+}
+
+/// Candidate generation without arbitration: every defensible transcriptome
+/// placement of the read, projected onto the genome.
+///
+/// Full-length extensions are all projected. Partial extensions are verified
+/// with EA-Myers and projected when they clear the same distance
+/// (`read_len/33`, minimum 1) and coverage (`coverage_gate`) gates the
+/// single-winner path applies. Projections are deduplicated on
+/// `(contig, pos, strand, cigar)` and capped at [`MAX_L1_CANDIDATES`]; the
+/// list carries no preference between loci — scoring and MAPQ are the
+/// caller's business in one strict domain.
+pub fn align_read_candidates(
+    read: &[u8],
+    tidx: &impl Tidx,
+    txmap: &impl TxMap,
+    txseqs: &impl TxSeqs,
+    cfg: &EngineConfig,
+    stats: &mut ReadStats,
+) -> Vec<L1Candidate> {
+    let k = tidx.k() as usize;
+    let read_len = read.len();
+    if read_len < k {
+        stats.branch = Branch::TooShort;
+        return Vec::new();
+    }
+    stats.branch = Branch::NoHit;
+
+    let (fulls, parts, read_rc) = collect_extensions(read, tidx, txseqs, cfg, stats);
+    stats.fulls_count = fulls.len() as u32;
+    stats.parts_count = parts.len() as u32;
+    if fulls.is_empty() && parts.is_empty() {
+        stats.branch = Branch::NoHit;
+        return Vec::new();
+    }
+
+    let max_dist = (read_len / 33).max(1) as u32;
+    let mut out: Vec<L1Candidate> = Vec::new();
+
+    if !fulls.is_empty() {
+        stats.branch = Branch::Full;
+        stats.extension_bases = read_len as u32;
+        let mut placed: Vec<placement::Placed> = fulls
+            .iter()
+            .filter_map(|e| placement::project_full(txmap, e, read_len))
+            .collect();
+        placed.sort_by(|a, b| {
+            (a.strand.sam_flag(), a.contig, a.pos, a.tx_id, a.diagonal).cmp(&(
+                b.strand.sam_flag(),
+                b.contig,
+                b.pos,
+                b.tx_id,
+                b.diagonal,
+            ))
+        });
+        for p in placed {
+            if out.len() >= MAX_L1_CANDIDATES {
+                break;
+            }
+            if out.iter().any(|x| {
+                x.contig == p.contig
+                    && x.pos == p.pos
+                    && x.strand == p.strand
+                    && x.cigar == p.cigar
+            }) {
+                continue;
+            }
+            out.push(L1Candidate {
+                contig: p.contig,
+                pos: p.pos,
+                strand: p.strand,
+                cigar: p.cigar,
+                tx_id: p.tx_id,
+                branch: Branch::Full,
+                dist: 0,
+            });
+        }
+        return out;
+    }
+
+    stats.branch = Branch::Interrupted;
+    if read_len > 256 {
+        stats.branch = Branch::GateFail;
+        return out;
+    }
+    let take = cfg.max_tx_candidates.min(parts.len());
+    let mut verified: Vec<(&ExtEntry, u32)> = Vec::new();
+    for entry in parts.iter().take(take) {
+        if let Some(dist) = verify_dist(read, &read_rc, txseqs, entry, cfg) {
+            if dist < stats.best_part_dist {
+                stats.best_part_dist = dist;
+            }
+            let cov = (read_len - dist as usize) as f64 / read_len as f64;
+            if dist <= max_dist && cov >= cfg.coverage_gate {
+                verified.push((entry, dist));
+            }
+        }
+    }
+    if verified.is_empty() {
+        stats.branch = Branch::GateFail;
+        return out;
+    }
+    verified.sort_by(|a, b| {
+        a.1.cmp(&b.1)
+            .then(a.0.tx_id.cmp(&b.0.tx_id))
+            .then(a.0.diagonal.cmp(&b.0.diagonal))
+    });
+    for &(entry, dist) in &verified {
+        if out.len() >= MAX_L1_CANDIDATES {
+            break;
+        }
+        let Some(p) = placement::project_partial(txmap, entry, read_len, dist as i32) else {
+            continue;
+        };
+        if out.iter().any(|x| {
+            x.contig == p.contig
+                && x.pos == p.pos
+                && x.strand == p.strand
+                && x.cigar == p.cigar
+        }) {
+            continue;
+        }
+        out.push(L1Candidate {
+            contig: p.contig,
+            pos: p.pos,
+            strand: p.strand,
+            cigar: p.cigar,
+            tx_id: p.tx_id,
+            branch: Branch::Interrupted,
+            dist,
+        });
+    }
+    if out.is_empty() {
+        stats.branch = Branch::GateFail;
+    } else {
+        stats.extension_bases = verified[0].0.ext.read_cov() as u32;
+    }
+    out
+}
+
+/// EA-Myers infix distance of one candidate against its anchored transcript
+/// window (None when the window is empty).
+fn verify_dist(
+    read: &[u8],
+    read_rc: &[u8],
+    txseqs: &impl TxSeqs,
+    e: &ExtEntry,
+    cfg: &EngineConfig,
+) -> Option<u32> {
+    let tx_seq = txseqs.seq(e.tx_id);
+    let anchor = e.ext.tx_lo as i64 - e.ext.read_lo as i64;
+    let wlo = (anchor - cfg.flank as i64).max(0) as usize;
+    let whi = ((anchor + read.len() as i64 + cfg.flank as i64).max(0) as usize).min(tx_seq.len());
+    if whi <= wlo {
+        return None;
+    }
+    let oriented: &[u8] = if e.strand == Strand::Plus {
+        read
+    } else {
+        read_rc
+    };
+    Some(if read.len() <= 128 {
+        myers::infix(oriented, &tx_seq[wlo..whi])
+    } else {
+        myers::long::infix(oriented, &tx_seq[wlo..whi])
+    })
 }
 

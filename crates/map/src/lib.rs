@@ -5,6 +5,7 @@
 
 pub mod align;
 pub mod baln;
+pub mod blacklist;
 pub mod bam;
 pub mod intron_chain;
 pub mod jkmer;
@@ -21,7 +22,9 @@ pub mod mapq;
 pub mod myers_ea;
 pub mod pair;
 pub mod pipeline;
+pub mod prof;
 pub mod seed;
+pub mod sinks;
 pub mod stats;
 pub mod span;
 pub mod splice;

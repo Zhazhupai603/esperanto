@@ -152,6 +152,19 @@ impl JunctionLib {
             .is_ok()
     }
 
+    /// Locus membership check, strand-insensitive: the intron
+    /// `(contig, start, end)` is annotated under some transcript. A read
+    /// sequenced antisense to the transcript still crosses the same
+    /// annotated intron, so known-junction bonuses must not hinge on the
+    /// read's orientation.
+    pub fn contains_any_strand(&self, contig: u32, start: u32, end: u32) -> bool {
+        self.junctions
+            .binary_search_by_key(&(contig, start, end), |x| {
+                (x.contig, x.start, x.end)
+            })
+            .is_ok()
+    }
+
     /// Junctions on `contig` with `start` in `[lo, hi)`, as a contiguous
     /// subslice of `(junctions, counts)`.
     pub fn range_start(&self, contig: u32, lo: u32, hi: u32) -> (&[Junction], &[u32]) {

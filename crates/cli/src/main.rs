@@ -20,6 +20,7 @@ mod scan;
 mod score;
 mod setup;
 mod update;
+mod verify;
 
 use clap::{Parser, Subcommand};
 
@@ -43,6 +44,8 @@ Index(index::IndexArgs),
     Pile(pile::PileArgs),
     /// Candidate editing-site discovery from BAM/.baln.
     Scan(scan::ScanArgs),
+    /// Supporting-read re-alignment: withdraw votes with better placements.
+    Verify(verify::VerifyArgs),
     /// RE_PROB scoring for a site list.
     Score(score::ScoreArgs),
     /// Full pipeline: qc → map → sort → scan → score → vcf.
@@ -68,6 +71,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Map(a) => map::run(a),
         Cmd::Pile(a) => pile::run(a),
         Cmd::Scan(a) => scan::run(a),
+        Cmd::Verify(a) => verify::run(a),
         Cmd::Score(a) => score::run(a),
         Cmd::Run(a) => run::run(a),
         Cmd::Report(a) => report::run(a),

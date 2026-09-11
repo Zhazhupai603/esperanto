@@ -24,6 +24,9 @@ pub struct PileArgs {
     /// Output TSV (default stdout).
     #[arg(long)]
     out: Option<PathBuf>,
+    /// Reads below this MAPQ do not count.
+    #[arg(long, default_value_t = esperanto_pile::MIN_MAPQ)]
+    min_mapq: u8,
 }
 
 pub fn run(a: PileArgs) -> anyhow::Result<()> {
@@ -51,15 +54,15 @@ pub fn run(a: PileArgs) -> anyhow::Result<()> {
 
     let mut bam = rust_htslib::bam::IndexedReader::from_path(&a.bam)?;
     let refs: Vec<(&str, i64)> = sites.iter().map(|(c, p)| (c.as_str(), *p)).collect();
-    let feats = esperanto_pile::extract_pileup_features_batch(&mut bam, &refs)?;
+    let feats = esperanto_pile::extract_pileup_features_batch(&mut bam, &refs, a.min_mapq)?;
 
     let mut buf = String::new();
     use std::fmt::Write as _;
     for ((chrom, pos), f) in sites.iter().zip(&feats) {
         let _ = writeln!(
             buf,
-            "{chrom}\t{pos}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]
+            "{chrom}\t{pos}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8]
         );
     }
     match &a.out {

@@ -1,4 +1,4 @@
-//! esperanto-scan error types (thiserror enum; user-supplied paths never panic; style mirrors esperanto-map).
+//! esperanto-scan error types.
 
 use thiserror::Error;
 
@@ -14,11 +14,11 @@ pub enum CallError {
         source: std::io::Error,
     },
 
-    #[error("call spec error at {path}: {msg}")]
-    Spec { path: String, msg: String },
+    #[error("snp vcf {path}: {msg}")]
+    Snp { path: String, msg: String },
 
-    #[error("annotation error at {path}: {msg}")]
-    Annot { path: String, msg: String },
+    #[error("fasta {path}: {msg}")]
+    Fasta { path: String, msg: String },
 
     #[error("contig {0} not found in BAM header")]
     ContigNotFound(String),

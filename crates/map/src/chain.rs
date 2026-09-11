@@ -56,7 +56,7 @@ impl ChainParams {
 pub const TOP_CANDIDATES: usize = 24;
 
 /// One chained candidate: anchors sorted by `(rpos, qpos)` ascending.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Chain {
     /// Contig index.
     pub contig: u32,
@@ -84,16 +84,36 @@ impl Chain {
     }
 }
 
-/// Chain anchors into candidates, highest score first.
+/// Reusable DP buffers for chaining (per-thread scratch).
 ///
-/// Groups are processed in (contig, strand) order; results are merged and
-/// sorted by score descending (ties: contig, strand, first rpos, first qpos —
-/// byte-level reproducible). Chains scoring below `params.min_chain_score`
-/// are dropped.
-pub fn chain_anchors(mut anchors: Vec<Anchor>, params: &ChainParams) -> Vec<Chain> {
-    anchors.sort_by_key(|a| (a.contig, a.strand as u8, a.rpos, a.qpos));
+/// Allocation-elimination only: every buffer is cleared/resized before
+/// refill, so results are identical to the fresh-`Vec` path.
+#[derive(Default)]
+pub struct ChainScratch {
+    f: Vec<i32>,
+    parent: Vec<usize>,
+    used: Vec<bool>,
+    order: Vec<usize>,
+    idx: Vec<usize>,
+}
 
-    let mut chains: Vec<Chain> = Vec::new();
+pub fn chain_anchors(mut anchors: Vec<Anchor>, params: &ChainParams) -> Vec<Chain> {
+    let mut out = Vec::new();
+    chain_anchors_into(&mut anchors, params, &mut out, &mut ChainScratch::default());
+    out
+}
+
+/// [`chain_anchors`] into reusable buffers (`anchors` is sorted in place,
+/// read, and left with unspecified-but-equivalent contents; `out` is
+/// cleared, then filled).
+pub fn chain_anchors_into(
+    anchors: &mut [Anchor],
+    params: &ChainParams,
+    out: &mut Vec<Chain>,
+    scratch: &mut ChainScratch,
+) {
+    out.clear();
+    anchors.sort_by_key(|a| (a.contig, a.strand as u8, a.rpos, a.qpos));
     let mut group_start = 0usize;
     while group_start < anchors.len() {
         let mut group_end = group_start + 1;
@@ -106,12 +126,12 @@ pub fn chain_anchors(mut anchors: Vec<Anchor>, params: &ChainParams) -> Vec<Chai
         {
             group_end += 1;
         }
-        chain_group(&anchors[group_start..group_end], params, &mut chains);
+        chain_group_into(&anchors[group_start..group_end], params, out, scratch);
         group_start = group_end;
     }
 
-    chains.retain(|c| c.score >= params.min_chain_score);
-    chains.sort_by(|a, b| {
+    out.retain(|c| c.score >= params.min_chain_score);
+    out.sort_by(|a, b| {
         b.score
             .cmp(&a.score)
             .then(a.contig.cmp(&b.contig))
@@ -129,19 +149,24 @@ pub fn chain_anchors(mut anchors: Vec<Anchor>, params: &ChainParams) -> Vec<Chai
                     .cmp(&b.anchors.first().map_or(0, |x| x.qpos)),
             )
     });
-    chains
 }
 
-/// Single-group DP chaining (emits all above-threshold, non-overlapping
-/// chains, highest score first).
-fn chain_group(group: &[Anchor], params: &ChainParams, out: &mut Vec<Chain>) {
+fn chain_group_into(
+    group: &[Anchor],
+    params: &ChainParams,
+    out: &mut Vec<Chain>,
+    scratch: &mut ChainScratch,
+) {
     let n = group.len();
     if n == 0 {
         return;
     }
     let k = params.k;
-    let mut f = vec![k; n];
-    let mut parent = vec![usize::MAX; n];
+    let ChainScratch { f, parent, used, order, idx } = scratch;
+    f.clear();
+    f.resize(n, k);
+    parent.clear();
+    parent.resize(n, usize::MAX);
     for i in 0..n {
         let a = group[i];
         // Look-back window: stop when the reference gap exceeds max_gap
@@ -186,14 +211,16 @@ fn chain_group(group: &[Anchor], params: &ChainParams, out: &mut Vec<Chain>) {
 
     // Backtrack: from the highest-scoring unused end, walk parents; a walk
     // hitting a used anchor DISCARDS the whole chain (marks nothing).
-    let mut used = vec![false; n];
-    let mut order: Vec<usize> = (0..n).collect();
+    used.clear();
+    used.resize(n, false);
+    order.clear();
+    order.extend(0..n);
     order.sort_by_key(|&i| std::cmp::Reverse(f[i]));
-    for &end in &order {
+    for &end in order.iter() {
         if used[end] || f[end] < params.min_chain_score {
             continue;
         }
-        let mut idx = Vec::new();
+        idx.clear();
         let mut cur = end;
         let mut overlapped = false;
         loop {
@@ -210,7 +237,7 @@ fn chain_group(group: &[Anchor], params: &ChainParams, out: &mut Vec<Chain>) {
         if overlapped {
             continue;
         }
-        for &i in &idx {
+        for &i in idx.iter() {
             used[i] = true;
         }
         idx.reverse();
@@ -227,20 +254,27 @@ fn chain_group(group: &[Anchor], params: &ChainParams, out: &mut Vec<Chain>) {
 /// 0 if none. Chains are score-descending, so the first disjoint chain is
 /// the maximum.
 pub fn second_score(chains: &[Chain]) -> i32 {
+    second_score_with(chains, &mut HashSet::new())
+}
+
+/// [`second_score`] with a reusable key set (`seen` is cleared, then filled).
+pub fn second_score_with(chains: &[Chain], seen: &mut HashSet<(u32, u32)>) -> i32 {
     let Some(best) = chains.first() else {
         return 0;
     };
-    let best_keys: HashSet<(u32, u32)> = best.anchors.iter().map(|a| (a.qpos, a.rpos)).collect();
+    seen.clear();
+    seen.extend(best.anchors.iter().map(|a| (a.qpos, a.rpos)));
     for c in chains.iter().skip(1) {
         if c.anchors
             .iter()
-            .all(|a| !best_keys.contains(&(a.qpos, a.rpos)))
+            .all(|a| !seen.contains(&(a.qpos, a.rpos)))
         {
             return c.score;
         }
     }
     0
 }
+
 
 /// All chains scoring exactly what `chains[0]` scores (multi-mapping check).
 pub fn tied_best(chains: &[Chain]) -> Vec<&Chain> {
@@ -249,4 +283,47 @@ pub fn tied_best(chains: &[Chain]) -> Vec<&Chain> {
     }
     let best = chains[0].score;
     chains.iter().filter(|c| c.score == best).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn anchor(contig: u32, strand: Strand, rpos: u32, qpos: u32) -> Anchor {
+        Anchor {
+            qpos,
+            rpos,
+            contig,
+            strand,
+        }
+    }
+
+    #[test]
+    fn scratch_reuse_two_calls_independent() {
+        let params = ChainParams::rna_default();
+        let mut scratch = ChainScratch::default();
+        let mut out = Vec::new();
+
+        let a1: Vec<Anchor> = (0..20)
+            .map(|i| anchor(0, Strand::Plus, i * 10, i * 10))
+            .collect();
+        chain_anchors_into(&mut a1.clone(), &params, &mut out, &mut scratch);
+        let first: Vec<Chain> = out.clone();
+        assert_eq!(first, chain_anchors(a1, &params));
+
+        // Different input through the same buffers: fresh-call identical.
+        let a2: Vec<Anchor> = (0..15)
+            .map(|i| anchor(1, Strand::Minus, 500 + i * 7, i * 9))
+            .collect();
+        chain_anchors_into(&mut a2.clone(), &params, &mut out, &mut scratch);
+        assert_eq!(out, chain_anchors(a2, &params));
+        assert_ne!(out.first().map(|c| c.contig), first.first().map(|c| c.contig));
+
+        // And the first input again reproduces the first result.
+        let a1: Vec<Anchor> = (0..20)
+            .map(|i| anchor(0, Strand::Plus, i * 10, i * 10))
+            .collect();
+        chain_anchors_into(&mut a1.clone(), &params, &mut out, &mut scratch);
+        assert_eq!(out, first);
+    }
 }

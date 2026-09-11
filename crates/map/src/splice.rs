@@ -508,30 +508,43 @@ fn same_op(op: CigarOp, len: u32) -> CigarOp {
     }
 }
 
-/// Multi-segment spliced alignment of `read` across a chain's segments
-/// (pseudo-reference concatenation).
+/// Prepared spliced-alignment inputs: per-pair refined junctions, the
+/// concatenated pseudo-reference and its per-segment genomic bounds —
+/// everything [`align_spliced`] needs before the DP itself. Factored out so
+/// callers that want the pseudo-reference without the DP can
+/// build the pseudo-reference without duplicating the refinement logic.
+#[derive(Clone, Debug)]
+pub struct PreparedSpliced {
+    /// Refined junctions, one per adjacent segment pair.
+    pub junctions: Vec<RefinedJunction>,
+    /// The concatenated pseudo-reference.
+    pub pseudo: Vec<u8>,
+    /// Per-segment `(pseudo_start, ref_start, ref_end)` bounds of the
+    /// pseudo-reference slices.
+    pub exon_bounds: Vec<(u32, u32, u32)>,
+}
+
+/// Refine every adjacent segment pair of a chain and concatenate its
+/// pseudo-reference.
 ///
 /// The read must be in alignment orientation (anchor `qpos` space).
 /// `segment_chain(chain, k, min_intron)` must yield ≥2 segments. Every
-/// adjacent segment pair is refined with [`refine_junction`] and gated by
+/// adjacent segment pair is refined with [`refine_junction_read`] and gated by
 /// min/max intron plus the per-pair S14 guards (short or NonCanonical intron
 /// without library support ⇒ `None`). The pseudo-reference concatenates one
-/// reference slice per segment — segment 0 starting `ALIGN_SPLICED_FLANK`
-/// before its first anchor, the last ending `ALIGN_SPLICED_FLANK` after its
-/// last, middle boundaries at the refined junction coordinates — and the
-/// read is extended over it with a direct diagonal hint. Failure anywhere
-/// returns `None`.
-#[allow(clippy::too_many_arguments)]
-pub fn align_spliced(
+/// reference slice per segment — segment 0 starting [`ALIGN_SPLICED_FLANK`]
+/// before its first anchor, the last ending [`ALIGN_SPLICED_FLANK`] after its
+/// last, middle boundaries at the refined junction coordinates. `None` on
+/// any refusal — exactly the conditions under which [`align_spliced`]
+/// rejects a chain before any DP work.
+pub fn prepare_spliced(
     reference: &Reference,
     lib: &JunctionLib,
     read: &[u8],
     chain: &crate::chain::Chain,
     k: u32,
     params: &SpliceParams,
-    extend_params: &ExtendParams,
-    buf: &mut ExtendBuffer,
-) -> Option<SplicedAlignment> {
+) -> Option<PreparedSpliced> {
     let segments = segment_chain(chain, k, params.min_intron);
     if segments.len() < 2 {
         return None;
@@ -547,10 +560,7 @@ pub fn align_spliced(
             reference,
             read,
             contig,
-            w[0].r_end,
-            w[1].r_start,
-            w[0].q_end,
-            w[1].q_start,
+                w[0].r_end, w[1].r_start, w[0].q_end, w[1].q_start,
             minus,
             lib,
             params,
@@ -594,6 +604,37 @@ pub fn align_spliced(
         ctg.decode_append(rs, re, &mut pseudo);
     }
 
+    Some(PreparedSpliced {
+        junctions,
+        pseudo,
+        exon_bounds,
+    })
+}
+
+/// Multi-segment spliced alignment of `read` across a chain's segments
+/// (pseudo-reference concatenation).
+///
+/// Preparation (refinement, guards, pseudo-reference) is shared with the
+/// construction lives in [`prepare_spliced`]; this function adds
+/// only the pseudo-reference extension and the genomic CIGAR stitching.
+/// Failure anywhere returns `None`.
+#[allow(clippy::too_many_arguments)]
+pub fn align_spliced(
+    reference: &Reference,
+    lib: &JunctionLib,
+    read: &[u8],
+    chain: &crate::chain::Chain,
+    k: u32,
+    params: &SpliceParams,
+    extend_params: &ExtendParams,
+    buf: &mut ExtendBuffer,
+) -> Option<SplicedAlignment> {
+    let PreparedSpliced {
+        junctions,
+        pseudo,
+        exon_bounds,
+    } = prepare_spliced(reference, lib, read, chain, k, params)?;
+
     // TEMP parity probe: ESP_PROBE_PSEUDO=/path dumps pseudo-reference + bounds.
     if let Ok(p) = std::env::var("ESP_PROBE_PSEUDO") {
         for &(ps, rs, re) in &exon_bounds {
@@ -601,6 +642,7 @@ pub fn align_spliced(
         }
         std::fs::write(p, &pseudo).ok();
     }
+    crate::prof::dp_call(crate::prof::DP_SPLICED);
     let extension = extend_hint(
         read,
         &pseudo,
@@ -634,6 +676,7 @@ pub fn score_tail_win(
     params: &ExtendParams,
     buf: &mut ExtendBuffer,
 ) -> Extension {
+    crate::prof::dp_call(crate::prof::DP_SPLICED);
     extend_hint(
         tail,
         ref_window,

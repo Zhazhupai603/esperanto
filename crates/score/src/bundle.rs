@@ -43,20 +43,10 @@ pub norms: [NormStats; N_FOLDS],
 /// Half-width of the encoding window (bp; feature_spec.sequence.half_window).
 /// v1.0 = 500 (1001bp); v1.2 = 250 (501bp). Missing spec file = 500 (backwards compatible).
     pub half_window: i64,
-    /// v1.3: pileup-only veto gate (Some only when all three components are present; partial presence = corrupted-bundle error).
-    /// Required by the score pipeline (mandatory since v1.3, no switch).
-    pub gate: Option<Gate>,
     /// v1.4.2: embedding cache identity (hash of feature_spec + window; cache files are checked for compatibility against it).
     pub cache_id: u64,
 }
 
-/// v1.3 veto gate: pileup-only 5-fold ensemble (= the ablate_seq EsperantoFusionHead with zero embedding).
-pub struct Gate {
-    pub heads: [FoldHead; N_FOLDS],
-    pub norms: [NormStats; N_FOLDS],
-    /// Veto threshold (feature_spec.gate.threshold): gate RE_PROB < threshold -> skip the encoder.
-    pub threshold: f64,
-}
 
 #[derive(Deserialize)]
 struct NormFold {
@@ -101,61 +91,6 @@ let norm_doc: HashMap<String, NormFold> =
         h.finish()
     };
 
-    // v1.3: gate three-piece set (gate_heads/ + gate_norm.json + feature_spec.gate.threshold).
-    // All missing = old bundle (None); partially missing = corrupted (hard error, no guessing).
-    let read_gate_threshold = |p: &Path| -> Option<f64> {
-        std::fs::read_to_string(p)
-            .ok()
-            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-            .and_then(|v| v.get("gate")?.get("threshold")?.as_f64())
-    };
-    let gate_threshold = read_gate_threshold(&dir.join("feature_spec.json"))
-        .or_else(|| dir.parent().and_then(|p| read_gate_threshold(&p.join("feature_spec.json"))));
-    let gate_dir = dir.join("gate_heads");
-    let gate_norm_path = dir.join("gate_norm.json");
-    let n_present = [gate_dir.exists(), gate_norm_path.exists(), gate_threshold.is_some()]
-        .iter()
-        .filter(|b| **b)
-        .count();
-    let gate = if n_present == 0 {
-        None
-    } else {
-        if n_present < 3 {
-            return Err(ScoreError::Missing(format!(
-                "incomplete gate triple (gate_heads={} gate_norm={} threshold={}) — corrupted bundle",
-                gate_dir.exists(),
-                gate_norm_path.exists(),
-                gate_threshold.is_some()
-            )));
-        }
-        let gate_norm_doc: HashMap<String, NormFold> =
-            serde_json::from_str(&std::fs::read_to_string(&gate_norm_path)?)?;
-        let mut g_heads: Vec<FoldHead> = Vec::with_capacity(N_FOLDS);
-        let mut g_norms: Vec<NormStats> = Vec::with_capacity(N_FOLDS);
-        for fold in 0..N_FOLDS {
-            let bytes = std::fs::read(gate_dir.join(format!("fold_{fold}.safetensors")))?;
-            let st = safetensors::SafeTensors::deserialize(&bytes)?;
-            g_heads.push(FoldHead::from_tensors(&st)?);
-            let nf = gate_norm_doc
-                .get(&format!("fold_{fold}"))
-                .ok_or_else(|| ScoreError::Missing(format!("gate norm fold_{fold}")))?;
-            g_norms.push(NormStats {
-                mean: nf.mean.clone().try_into().map_err(|_| ScoreError::Shape {
-                    name: "gate_norm.mean".into(), got: vec![nf.mean.len()], want: vec![9],
-                })?,
-                std: nf.std.clone().try_into().map_err(|_| ScoreError::Shape {
-                    name: "gate_norm.std".into(), got: vec![nf.std.len()], want: vec![9],
-                })?,
-            });
-        }
-        Some(Gate {
-            heads: g_heads.try_into().map_err(|_| ScoreError::Missing("gate heads<5".into()))?,
-            norms: g_norms.try_into().map_err(|_| ScoreError::Missing("gate norms<5".into()))?,
-            threshold: gate_threshold.unwrap(),
-        })
-    };
-
-
     let mut heads: Vec<FoldHead> = Vec::with_capacity(N_FOLDS);
     let mut norms: Vec<NormStats> = Vec::with_capacity(N_FOLDS);
     for fold in 0..N_FOLDS {
@@ -179,7 +114,6 @@ Ok(Bundle {
 heads: heads.try_into().map_err(|_| ScoreError::Missing("heads<5".into()))?,
 norms: norms.try_into().map_err(|_| ScoreError::Missing("norms<5".into()))?,
         half_window,
-        gate,
         cache_id,
 })
 }
@@ -321,6 +255,19 @@ impl EmbCache {
         self.dirty += 1;
     }
 
+    /// Batch insert of one chunk's fresh embeddings — the caller takes the cache lock
+    /// ONCE for the whole miss batch instead of once per site. Same semantics as
+    /// [`put`](Self::put): an existing key = redundant recomputation, overwritten with the
+    /// same value. Keys are moved in (no per-entry allocation under the lock beyond the
+    /// map insert itself).
+    pub fn put_batch(&mut self, entries: Vec<(String, u32, [u16; crate::caduceus::D_MODEL])>) {
+        let n = entries.len();
+        for (chrom, pos, emb_bits) in entries {
+            self.map.insert((chrom, pos), emb_bits);
+        }
+        self.dirty += n;
+    }
+
     /// Persist (dirty records already entered memory via put; this implementation rewrites the whole table --
     /// simple and atomically safe: write a temp file then rename, avoiding corruption from an interrupted append).
     pub fn flush(&mut self) -> std::io::Result<()> {
@@ -348,5 +295,55 @@ impl EmbCache {
         std::fs::rename(&tmp, &self.path)?;
         self.dirty = 0;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bits(v: u16) -> [u16; crate::caduceus::D_MODEL] {
+        [v; crate::caduceus::D_MODEL]
+    }
+
+    #[test]
+    fn put_batch_matches_put_and_persists_across_flush() {
+        let dir = std::env::temp_dir().join(format!("score-putbatch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("emb.bin");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut c = EmbCache::open(&path, 7, 250).unwrap();
+            assert_eq!(c.get("chr1", 10), None);
+            c.put_batch(vec![("chr1".to_string(), 10, bits(1))]);
+            c.put("chr2", 20, &bits(2));
+            // redundant recomputation of an existing key overwrites with the same semantics as put
+            c.put_batch(vec![
+                ("chr1".to_string(), 10, bits(3)),
+                ("chr3".to_string(), 30, bits(4)),
+            ]);
+            assert_eq!(c.get("chr1", 10), Some(bits(3)));
+            assert_eq!(c.get("chr2", 20), Some(bits(2)));
+            assert_eq!(c.get("chr3", 30), Some(bits(4)));
+            c.flush().unwrap();
+        }
+        let c = EmbCache::open(&path, 7, 250).unwrap();
+        assert_eq!(c.get("chr1", 10), Some(bits(3)));
+        assert_eq!(c.get("chr2", 20), Some(bits(2)));
+        assert_eq!(c.get("chr3", 30), Some(bits(4)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn put_batch_empty_marks_nothing_dirty() {
+        let dir =
+            std::env::temp_dir().join(format!("score-putbatch-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("emb.bin");
+        let _ = std::fs::remove_file(&path);
+        let mut c = EmbCache::open(&path, 7, 250).unwrap();
+        c.put_batch(Vec::new());
+        c.flush().unwrap();
+        assert!(!path.exists()); // dirty == 0 -> flush is a no-op
     }
 }

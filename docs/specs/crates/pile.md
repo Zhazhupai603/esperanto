@@ -16,12 +16,14 @@ Extracts 9-dimensional pileup features at given sites from a BAM. Semantics = an
 
 ## Constants
 
-`MIN_BASE_QUALITY = 13`, `MAXCNT = 8000`, `MERGE_GAP = 2000` (batch mode).
+`MIN_BASE_QUALITY = 13`, `MIN_MAPQ = 20` (standard mapping-quality gate), `MAXCNT = 8000`, `MERGE_GAP = 2000` (batch mode).
 
-Records tagged `RE:Z:collapsed` (collapsed-rescue placements) are excluded
-from feature extraction in both modes: their bases are alphabet-ambiguous
-(A==G, T==C), consistent with the scan evidence rule. On rescue-heavy
-samples the depth features differ from pre-rule output by design.
+Record intake gate (both modes, before the engine): records tagged
+`RE:Z:collapsed` (collapsed-rescue placements) only set the `hyperedited`
+flag — their bases are alphabet-ambiguous (A==G, T==C); records with
+MAPQ below the caller's `min_mapq` are skipped entirely, so the feature
+read set equals the read set the candidate scan counted. The BAM is the
+only record source.
 
 ## CIGAR Column State
 

@@ -16,11 +16,38 @@ const GENCODE_GTF_URL: &str =
 /// (same pin as install.sh).
 const RELEASE_TARBALL_URL: &str = "https://github.com/Zhazhupai603/esperanto/releases/download/v1.0.0/esperanto-1.0.0-linux-x86_64.tar.gz";
 
+/// Decoy sequence sources (Salmon selective-alignment rationale: reads whose
+/// source is absent from the primary reference must park on the decoy instead
+/// of force-mapping onto a paralog).
+const DECOY_SOURCES: [(&str, &str); 3] = [
+    (
+        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nuccore&id=KY962518.1&rettype=fasta&retmode=text",
+        "45S rDNA full repeat unit (KY962518.1)",
+    ),
+    (
+        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nuccore&id=NR_023363.1&rettype=fasta&retmode=text",
+        "5S rDNA repeat unit (NR_023363.1)",
+    ),
+    (
+        "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/000/786/075/GCA_000786075.2_hs38d1/GCA_000786075.2_hs38d1_genomic.fna.gz",
+        "GRCh38 decoy contigs (hs38d1)",
+    ),
+];
+
 #[derive(Args)]
 pub struct SetupArgs {
     /// Rebuild even when the index artifacts already exist.
     #[arg(long)]
     force: bool,
+    /// Fetch the standard decoy set (45S/5S rDNA, hs38d1) and include it in
+    /// the alignment index under the `decoy_` contig prefix.
+    #[arg(long)]
+    decoys: bool,
+    /// Generate the retrocopy / multicopy blacklists from the annotation
+    /// (junction-crossing simulated reads + exonic windows, gap-free mm<=2
+    /// scan against the alignment index; one-off, tens of minutes).
+    #[arg(long)]
+    blacklists: bool,
 }
 
 /// The fixed setup folder (`ESPERANTO_REFS` honored): shared resolver.
@@ -234,13 +261,54 @@ pub fn run(a: SetupArgs) -> anyhow::Result<()> {
         .and_then(|s| s.to_str())
         .ok_or_else(|| anyhow::anyhow!("bad fasta name {}", fasta.display()))?;
     let paidx = dir.join(format!("{stem}.paidx"));
+    let mut decoy_list: Vec<PathBuf> = Vec::new();
+    if a.decoys {
+        let decoy_fa = dir.join(format!("{stem}.decoys.fa"));
+        if decoy_fa.is_file() {
+            eprintln!("[setup] decoys present: {}", decoy_fa.display());
+        } else {
+            stage_decoys(&decoy_fa)?;
+        }
+        decoy_list.push(decoy_fa);
+    }
     if paidx.is_file() && !a.force {
         eprintln!(
             "[setup] {} exists; skipping (use --force to rebuild)",
             paidx.display()
         );
     } else {
-        crate::index::build_all(&fasta, human_gtf.as_deref(), &paidx, 15, 5)?;
+        crate::index::build_all(
+            &fasta,
+            human_gtf.as_deref(),
+            &decoy_list,
+            &paidx,
+            15,
+            5,
+            false, // rescue-control alphabet indexes are built via index --rescue-control
+        )?;
+    }
+
+    // --- retrocopy / multicopy blacklists (visible FILTER inputs) ---
+    if a.blacklists {
+        let gtf = human_gtf.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--blacklists needs the annotation GTF; place one in {} and re-run",
+                dir.display()
+            )
+        })?;
+        let index = esperanto_map::index_io::load(&paidx)
+            .map_err(|e| anyhow::anyhow!("loading {}: {e}", paidx.display()))?;
+        let retro = dir.join(format!("{stem}.retrocopy.bed"));
+        let multi = dir.join(format!("{stem}.multicopy.bed"));
+        eprintln!("[setup] blacklist: retrocopy scan (junction-crossing reads)...");
+        let (n, bp) = esperanto_map::blacklist::build_retrocopy(&index, gtf, &retro);
+        eprintln!("[setup] wrote {} ({} intervals, {} bp)", retro.display(), n, bp);
+        eprintln!("[setup] blacklist: multicopy scan (exonic windows)...");
+        let rmsk = crate::resolve::find_all(&dir, &[".rmsk.bed"])?
+            .into_iter()
+            .next();
+        let (n, bp) = esperanto_map::blacklist::build_multicopy(&index, gtf, rmsk.as_deref(), &multi);
+        eprintln!("[setup] wrote {} ({} intervals, {} bp)", multi.display(), n, bp);
     }
 
     // --- user-placed mouse baseline: fai + validation only (hybrid
@@ -272,6 +340,50 @@ pub fn run(a: SetupArgs) -> anyhow::Result<()> {
     eprintln!("[setup] done. Run with:");
     eprintln!("  esperanto run --r1 <reads.fq.gz> --out out/");
     eprintln!("  esperanto run --r1 <reads.fq.gz> --out out/ --hybrid APOE    (knock-in mouse)");
+    Ok(())
+}
+
+/// Fetch every decoy source and write the concatenated `decoy_`-prefixed
+/// FASTA. Sources arriving gzipped are decompressed on the fly.
+fn stage_decoys(out: &Path) -> anyhow::Result<()> {
+    use std::io::Read as _;
+    let mut combined: Vec<u8> = Vec::new();
+    for (url, label) in DECOY_SOURCES {
+        eprintln!("[setup] fetching decoy: {label}");
+        let tmp = out.with_extension("part");
+        download(url, &tmp)?;
+        let raw = std::fs::read(&tmp)?;
+        let text: Vec<u8> = if url.ends_with(".gz") {
+            let mut dec = flate2::read::GzDecoder::new(&raw[..]);
+            let mut t = Vec::new();
+            dec.read_to_end(&mut t)?;
+            t
+        } else {
+            raw
+        };
+        std::fs::remove_file(&tmp)?;
+        for line in text.split(|&b| b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with(b">") {
+                let name_end = line[1..]
+                    .iter()
+                    .position(|b| b.is_ascii_whitespace())
+                    .unwrap_or(line.len() - 1);
+                combined.push(b'>');
+                if !line[1..1 + name_end].starts_with(b"decoy_") {
+                    combined.extend_from_slice(b"decoy_");
+                }
+                combined.extend_from_slice(&line[1..]);
+            } else {
+                combined.extend_from_slice(line);
+            }
+            combined.push(b'\n');
+        }
+    }
+    std::fs::write(out, &combined)?;
+    eprintln!("[setup] wrote {} ({} bytes)", out.display(), combined.len());
     Ok(())
 }
 

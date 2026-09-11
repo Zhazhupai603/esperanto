@@ -4,7 +4,6 @@ use std::path::PathBuf;
 
 use clap::Args;
 use esperanto_flow::DeviceAsk;
-use esperanto_scan::LibType;
 
 use crate::confirm::DeviceArg;
 
@@ -16,6 +15,13 @@ pub struct RunArgs {
     /// R2 FASTQ inputs (empty = single-end).
     #[arg(long, value_delimiter = ',')]
     r2: Vec<PathBuf>,
+    /// Also run the negative-control (A>C / T>G) rescue passes, count-only.
+    #[arg(long)]
+    rescue_control: bool,
+    /// Stop after this stage (qc|map|sort|scan|verify|hyper|score|vcf);
+    /// the run directory stays resumable.
+    #[arg(long)]
+    stop_after: Option<String>,
     /// Input BAM (Bam entry; must be coordinate-sorted + indexed).
     #[arg(long)]
     bam: Option<PathBuf>,
@@ -31,9 +37,10 @@ pub struct RunArgs {
     /// Optional GTF (default: refs discovery).
     #[arg(long)]
     gtf: Option<PathBuf>,
-    /// gnomAD VCF (default: refs discovery).
+    /// Known-SNP VCF; listed positions are removed from the candidates
+    /// (default: refs discovery).
     #[arg(long)]
-    gnomad: Option<PathBuf>,
+    snp: Option<PathBuf>,
     /// Model bundle root (default: zero-config 5-level fallback).
     #[arg(long)]
     bundle: Option<PathBuf>,
@@ -43,9 +50,6 @@ pub struct RunArgs {
     /// Optional L1 engine bundle.
     #[arg(long)]
     l1_bundle: Option<PathBuf>,
-    /// Library strandedness.
-    #[arg(long, default_value = "unstranded", value_parser = ["unstranded", "stranded"])]
-    lib: String,
     /// Output root directory.
 #[arg(long)]
     out: PathBuf,
@@ -73,7 +77,7 @@ let bundle = crate::resolve::bundle(&a.bundle)?;
     let mut index = a.index;
     let mut fasta = a.fasta;
     let mut gtf = a.gtf;
-    let mut gnomad = a.gnomad;
+    let mut snp = a.snp;
     let mut run_manifest: Option<esperanto_flow::manifest::SpeciesManifest> = None;
     if let Some(h) = &a.hybrid {
         let genes = if h.is_empty() {
@@ -88,12 +92,12 @@ let bundle = crate::resolve::bundle(&a.bundle)?;
         gtf = g.is_file().then_some(g);
         run_manifest = esperanto_flow::manifest::SpeciesManifest::read(&dir);
     }
-    if index.is_none() || fasta.is_none() || gtf.is_none() || gnomad.is_none() {
+    if index.is_none() || fasta.is_none() || gtf.is_none() || snp.is_none() {
         if let Some(refs) = crate::resolve::refs() {
             refs.fill_index(&mut index);
             refs.fill_fasta(&mut fasta);
             refs.fill_gtf(&mut gtf);
-            refs.fill_gnomad(&mut gnomad);
+            refs.fill_snp(&mut snp);
         }
     }
     let l1_bundle = index
@@ -120,20 +124,17 @@ let bundle = crate::resolve::bundle(&a.bundle)?;
         index,
         fasta,
         gtf,
-        gnomad,
+        snp,
         bundle,
         caduceus: a.caduceus,
         l1_bundle,
-        lib: if a.lib == "stranded" {
-            LibType::Stranded
-        } else {
-            LibType::Unstranded
-        },
         out_dir: out_dir.clone(),
         threads: crate::resolve::threads(a.threads),
         batch: a.batch,
         device: a.device.resolve(),
         device_ask: Some(DeviceAsk::new(crate::confirm::ask_use_gpu)),
+        rescue_control: a.rescue_control,
+        stop_after: a.stop_after,
     };
     let _lock = esperanto_flow::resume::RunLock::acquire(&out_dir)?;
     esperanto_flow::resume::write_run_json(&out_dir, &sample, &params)?;
@@ -186,16 +187,17 @@ mod tests {
             index: None,
             fasta: None,
             gtf: None,
-            gnomad: None,
+            snp: None,
             bundle: None,
             caduceus: None,
             l1_bundle: None,
-            lib: "unstranded".to_string(),
             out: "out".into(),
             sample: None,
             hybrid: None,
             threads: 0,
             batch: 64,
+            rescue_control: false,
+            stop_after: None,
             device: crate::confirm::DeviceArg::Auto,
         }
     }

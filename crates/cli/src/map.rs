@@ -28,11 +28,14 @@ pub struct MapArgs {
     /// Worker threads (0 = all cores).
     #[arg(long, default_value_t = 0)]
     threads: usize,
+    /// Also run the negative-control (A>C / T>G) rescue passes, count-only.
+    #[arg(long)]
+    rescue_control: bool,
 }
 
 pub fn run(a: MapArgs) -> anyhow::Result<()> {
     let l1 = crate::resolve::l1_bundle(&a.l1_bundle, &a.index);
-    let raw = esperanto_flow::map_stage(
+    let (raw, _index, _l1) = esperanto_flow::map_stage(
         &a.index,
         a.gtf.as_deref(),
         l1.as_deref(),
@@ -40,6 +43,7 @@ pub fn run(a: MapArgs) -> anyhow::Result<()> {
         a.r2.as_deref(),
         &a.out,
         crate::resolve::threads(a.threads),
+        a.rescue_control,
     )?;
     eprintln!("[map] wrote {}", raw.display());
     Ok(())

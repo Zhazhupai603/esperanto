@@ -36,6 +36,9 @@ pub enum FlowError {
     /// Plain I/O failure.
     #[error("io: {0}")]
     Io(#[from] io::Error),
+    /// JSON read/write failure in run bookkeeping.
+    #[error("json: {0}")]
+    Json(String),
     /// A stage crate failed; the original error is preserved as source.
     #[error("stage {stage} failed: {source}")]
     Stage {

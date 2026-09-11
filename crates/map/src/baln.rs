@@ -40,7 +40,10 @@ pub fn write_record(mut w: impl Write, rec: &BamRecord) -> io::Result<()> {
         Some(Err(e)) => Err(e),
         None => Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("baln: fast-path declined for record {}", rec.name),
+            format!(
+                "baln: fast-path declined for record {}",
+                String::from_utf8_lossy(&rec.name)
+            ),
         )),
     }
 }

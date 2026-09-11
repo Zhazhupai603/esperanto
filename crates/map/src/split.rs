@@ -190,7 +190,9 @@ pub fn retry_tail_start(
             num: 1,
             den: 1,
         };
+        crate::prof::dp_call(crate::prof::DP_TAIL);
         let le = extend_hint(lseg, &lwin, extend_params, buf, hint);
+        crate::prof::dp_call(crate::prof::DP_TAIL);
         let re = extend_hint(rseg, &rwin, extend_params, buf, hint);
         let l_aligned = le.read_end.saturating_sub(le.read_start) as usize;
         let r_aligned = re.read_end.saturating_sub(re.read_start) as usize;
@@ -347,6 +349,7 @@ pub(crate) fn extend_tail(
         return None;
     }
     let win = ctg.slice_ascii(win_lo, win_hi);
+    crate::prof::dp_call(crate::prof::DP_TAIL);
     let ext = extend_hint(
         tail,
         &win,
@@ -439,6 +442,9 @@ fn dinuc_before(win: &[u8], lo: u32, p: u32) -> [u8; 2] {
 }
 
 fn dinuc_after(win: &[u8], lo: u32, p: u32) -> [u8; 2] {
+    if p < lo {
+        return *b"NN";
+    }
     let i = (p - lo) as usize;
     if i + 2 > win.len() {
         return *b"NN";
@@ -447,8 +453,11 @@ fn dinuc_after(win: &[u8], lo: u32, p: u32) -> [u8; 2] {
 }
 
 fn matches_at(win: &[u8], lo: u32, p: u32, pat: &[u8]) -> bool {
+    if p < lo {
+        return false;
+    }
     let i = (p - lo) as usize;
-    if p < lo || i + pat.len() > win.len() {
+    if i + pat.len() > win.len() {
         return false;
     }
     win[i..i + pat.len()]

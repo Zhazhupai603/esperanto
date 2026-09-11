@@ -212,6 +212,22 @@ pub fn collect_anchors(
     occ_cap: u32,
 ) -> (Vec<crate::seed::Anchor>, usize) {
     let mut anchors = Vec::new();
+    let seeds_hit = collect_anchors_into(index, read_mins, read_len, k, occ_cap, &mut anchors);
+    (anchors, seeds_hit)
+}
+
+/** [`collect_anchors`] into a reusable buffer (`anchors` is cleared, then
+ * filled; same anchors, same order).
+ */
+pub fn collect_anchors_into(
+    index: &Index,
+    read_mins: &[Minimizer],
+    read_len: u32,
+    k: u32,
+    occ_cap: u32,
+    anchors: &mut Vec<crate::seed::Anchor>,
+) -> usize {
+    anchors.clear();
     let mut seeds_hit = 0usize;
     for m in read_mins {
         let hit = index.query(m.kmer);
@@ -230,7 +246,7 @@ pub fn collect_anchors(
             });
         }
     }
-    (anchors, seeds_hit)
+    seeds_hit
 }
 
 /// Reverse-complement a 2-bit k-mer of length `k`.

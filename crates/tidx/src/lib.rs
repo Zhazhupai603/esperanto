@@ -989,6 +989,19 @@ fn take<'a>(data: &'a [u8], off: &mut usize, len: u64, what: &str) -> Result<&'a
 
 /// Validate and parse a whole `.tidx` byte buffer.
 fn parse_index(data: &[u8]) -> Result<Tidx> {
+    // The parallel decode below uses par_chunks_exact on hundreds of millions
+    // of entries. Run it on a dedicated pool with large worker stacks: on the
+    // global pool (384 threads, 2 MiB stacks) rayon's work-stealing recursion
+    // was observed to overflow a worker stack and abort the process during
+    // L1 bundle load. 64 MiB is reserved address space only.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .stack_size(64 << 20)
+        .build()
+        .map_err(|e| Error::Inconsistent(format!("decode pool: {e}")))?;
+    pool.install(|| parse_index_inner(data))
+}
+
+fn parse_index_inner(data: &[u8]) -> Result<Tidx> {
     if data.len() < HEADER_LEN {
         return Err(Error::Truncated(format!(
             "file is {} bytes, shorter than the {HEADER_LEN}-byte header",

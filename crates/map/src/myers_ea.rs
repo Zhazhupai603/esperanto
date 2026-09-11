@@ -156,6 +156,19 @@ pub fn infix_best_end(read: &[u8], text: &[u8]) -> (i32, usize) {
 /// returned `start` is the inclusive 0-based start of the best-scoring
 /// alignment in the original text (`text.len() − rev_end`).
 pub fn infix_best_start(read: &[u8], text: &[u8]) -> (i32, usize) {
+    let (mut rread, mut rtext) = (Vec::new(), Vec::new());
+    infix_best_start_into(read, text, &mut rread, &mut rtext)
+}
+
+/** [`infix_best_start`] with reusable reversed-copy buffers (cleared, then
+ * filled; same result).
+ */
+pub fn infix_best_start_into(
+    read: &[u8],
+    text: &[u8],
+    rread: &mut Vec<u8>,
+    rtext: &mut Vec<u8>,
+) -> (i32, usize) {
     let m = read.len();
     if m == 0 {
         return (0, 0);
@@ -163,9 +176,11 @@ pub fn infix_best_start(read: &[u8], text: &[u8]) -> (i32, usize) {
     if m > LONG_MAX {
         return (m as i32, 0);
     }
-    let rread: Vec<u8> = read.iter().rev().copied().collect();
-    let rtext: Vec<u8> = text.iter().rev().copied().collect();
-    let (score, rev_end) = infix_best_end(&rread, &rtext);
+    rread.clear();
+    rread.extend(read.iter().rev().copied());
+    rtext.clear();
+    rtext.extend(text.iter().rev().copied());
+    let (score, rev_end) = infix_best_end(rread, rtext);
     (score, text.len() - rev_end)
 }
 
@@ -268,16 +283,29 @@ pub mod long {
 
     /// 2-block [`super::infix_best_start`](crate::myers_ea::infix_best_start).
     pub fn infix_best_start(read: &[u8], text: &[u8]) -> (i32, usize) {
+        let (mut rread, mut rtext) = (Vec::new(), Vec::new());
+        infix_best_start_into(read, text, &mut rread, &mut rtext)
+    }
+
+    /// 2-block [`infix_best_start_into`](crate::myers_ea::infix_best_start_into).
+    pub fn infix_best_start_into(
+        read: &[u8],
+        text: &[u8],
+        rread: &mut Vec<u8>,
+        rtext: &mut Vec<u8>,
+    ) -> (i32, usize) {
         let m = read.len();
         if m <= 128 {
-            return super::infix_best_start(read, text);
+            return super::infix_best_start_into(read, text, rread, rtext);
         }
         if m > 256 {
             return (m as i32, 0);
         }
-        let rread: Vec<u8> = read.iter().rev().copied().collect();
-        let rtext: Vec<u8> = text.iter().rev().copied().collect();
-        let (score, rev_end) = infix_best_end(&rread, &rtext);
+        rread.clear();
+        rread.extend(read.iter().rev().copied());
+        rtext.clear();
+        rtext.extend(text.iter().rev().copied());
+        let (score, rev_end) = infix_best_end(rread, rtext);
         (score, text.len() - rev_end)
     }
 }

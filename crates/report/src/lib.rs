@@ -85,6 +85,15 @@ struct Metrics {
     recodings: u64,
     /// Hybrid runs: sites on contigs with no matching model.
     unscored: u64,
+    /// Channel signal-to-noise (editing sites / mean control sites).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel_snr: Option<f64>,
+    /// mean(C1,C2)/E before verify.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    implied_fdr: Option<f64>,
+    /// mean(C1,C2)/E after verify.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    implied_fdr_post: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -227,6 +236,23 @@ fn read_metrics(out_dir: &Path) -> anyhow::Result<(u64, f64, u64)> {
     Ok((reads_in, map_rate, rescued))
 }
 
+/// channel metrics inputs: `scan/channels.json` `snr`, `implied_fdr` and
+/// `implied_fdr_post` (present only when the verify stage ran). Missing
+/// artifacts read as None and are omitted from the pack.
+fn read_channels(out_dir: &Path) -> (Option<f64>, Option<f64>, Option<f64>) {
+    let Ok(text) = std::fs::read_to_string(out_dir.join("scan").join("channels.json")) else {
+        return (None, None, None);
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return (None, None, None);
+    };
+    (
+        v["snr"].as_f64(),
+        v["implied_fdr"].as_f64(),
+        v["implied_fdr_post"].as_f64(),
+    )
+}
+
 /// Reportable chromosomes straight from the `.fai` in file order:
 /// `chr`-prefixed, no `_` (decoys/alternates), excluding `chrM`.
 /// Reportable chromosomes: with a hybrid manifest (`species.json` in the run
@@ -243,7 +269,9 @@ fn report_chroms(fa: &FastaIndex, out_dir: &Path) -> Vec<ChromLen> {
                 return fa
                     .contigs()
                     .iter()
-                    .filter(|(n, _)| declared.contains(n.as_str()) && n != "chrM")
+                    .filter(|(n, _)| {
+                        declared.contains(n.as_str()) && n != "chrM" && !n.starts_with("decoy_")
+                    })
                     .map(|(n, l)| ChromLen {
                         chrom: n.clone(),
                         len: *l,
@@ -254,7 +282,9 @@ fn report_chroms(fa: &FastaIndex, out_dir: &Path) -> Vec<ChromLen> {
     }
     fa.contigs()
         .iter()
-        .filter(|(n, _)| n.starts_with("chr") && !n.contains('_') && n != "chrM")
+        .filter(|(n, _)| {
+            n.starts_with("chr") && !n.contains('_') && n != "chrM" && !n.starts_with("decoy_")
+        })
         .map(|(n, l)| ChromLen {
             chrom: n.clone(),
             len: *l,
@@ -286,11 +316,27 @@ fn mkheat(sites: &[Site], chroms: &[ChromLen], win: i64) -> BTreeMap<String, Vec
         .collect()
 }
 
-/// Rescued-read placements from `map/rescued.bed` (`chrom<TAB>pos` 0-based
-/// rows, one per rescued placement), grouped by chromosome with positions
-/// sorted ascending. A missing or unparsable sidecar yields an empty map
-/// (pre-sidecar runs stay reportable).
+/// Rescued-read placements for the hyperedited-density track:
+/// `hyper/regions.bed` (clustered, midpoint per region) when the hyper stage
+/// ran, else the raw `map/rescued.bed` per-read positions. A missing or
+/// unparsable sidecar yields an empty map (pre-sidecar runs stay reportable).
 fn read_rescued(out_dir: &Path) -> BTreeMap<String, Vec<i64>> {
+    if let Ok(text) = std::fs::read_to_string(out_dir.join("hyper").join("regions.bed")) {
+        let mut pos: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+        for line in text.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() < 3 {
+                continue;
+            }
+            if let (Ok(s), Ok(e)) = (f[1].parse::<i64>(), f[2].parse::<i64>()) {
+                pos.entry(f[0].to_owned()).or_default().push((s + e) / 2);
+            }
+        }
+        for v in pos.values_mut() {
+            v.sort_unstable();
+        }
+        return pos;
+    }
     let Ok(text) = std::fs::read_to_string(out_dir.join("map").join("rescued.bed")) else {
         return BTreeMap::new();
     };
@@ -359,6 +405,7 @@ pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<Path
     let mut fa = FastaIndex::open(fasta)?;
     let chroms = report_chroms(&fa, out_dir);
     let (reads_in, map_rate, rescued) = read_metrics(out_dir)?;
+    let (channel_snr, implied_fdr, implied_fdr_post) = read_channels(out_dir);
     let rescued_pos = read_rescued(out_dir);
 
     // Gene annotation + aggregation + recoding in one VCF-order pass.
@@ -497,6 +544,9 @@ pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<Path
             rescued,
             recodings: recodings.len() as u64,
             unscored: sites.iter().filter(|s| s.unscored).count() as u64,
+            channel_snr,
+            implied_fdr,
+            implied_fdr_post,
         },
         chroms,
         heat5,
@@ -569,6 +619,9 @@ mod tests {
                 rescued: 0,
                 recodings: 0,
                 unscored: 0,
+                channel_snr: None,
+                implied_fdr: None,
+                implied_fdr_post: None,
             },
             chroms: vec![],
             heat5: BTreeMap::new(),

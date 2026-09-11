@@ -9,6 +9,7 @@ members = [
     "crates/bamio",
     "crates/map",
 "crates/scan",
+    "crates/verify",
     "crates/score",
     "crates/report",
     "crates/flow",
@@ -16,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.4"
+version = "1.0.5"
 edition = "2021"
 license = "MIT"
 
