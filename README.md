@@ -83,7 +83,7 @@ cargo build --release
 esperanto setup
 ```
 
-Setup works in the refs directory — default `~/.local/share/esperanto/refs`, override with `ESPERANTO_REFS`. It detects a reference FASTA + GTF placed there, or downloads the GENCODE GRCh38 reference + annotation when the directory is empty, validates the files before building, and builds the index in place. It also installs the scoring model bundle when none is present.
+Setup works in the refs directory — default `~/.local/share/esperanto/refs`, override with `ESPERANTO_REFS`. It detects a reference FASTA + GTF placed there, or downloads the GENCODE GRCh38 primary-assembly reference and the GENCODE v48 primary annotation when the directory is empty, fetches the standard decoy set (45S/5S rDNA + hs38d1) by default — repeat-derived reads park on decoy contigs instead of force-mapping onto paralogs (skip with `--no-decoys`) — validates the files before building, and builds the index in place. It also installs the scoring model bundle when none is present.
 
 After setup, no reference flags are needed — the index, FASTA, GTF, and L1 engine bundle are all auto-resolved from the refs directory:
 
