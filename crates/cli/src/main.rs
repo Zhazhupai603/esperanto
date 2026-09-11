@@ -10,14 +10,18 @@ mod pile;
 mod qc;
 mod report;
 mod resolve;
+mod resume;
+mod confirm;
+mod delete;
 mod run;
 mod scan;
 mod score;
 mod setup;
+mod update;
 
 use clap::{Parser, Subcommand};
 
-/// ESPERANTO RNA editing analysis (1.0.0).
+/// ESPERANTO RNA editing analysis.
 #[derive(Parser)]
 #[command(name = "esperanto", version, about, propagate_version = true)]
 struct Cli {
@@ -41,11 +45,17 @@ Index(index::IndexArgs),
     Score(score::ScoreArgs),
     /// Full pipeline: qc → map → sort → scan → score → vcf.
     Run(run::RunArgs),
-    /// Regenerate the standalone HTML report for a finished run directory.
+/// Regenerate the standalone HTML report for a finished run directory.
     Report(report::ReportArgs),
+    /// Continue an interrupted run from the first broken stage.
+    Resume(resume::ResumeArgs),
     /// One-step reference environment: detect or download reference files
     /// in the refs directory, then build the index in place.
     Setup(setup::SetupArgs),
+    /// Remove local reference/index data or the model bundle (asks first).
+    Delete(delete::DeleteArgs),
+    /// Check for a newer release; download and install it (asks first).
+    Update(update::UpdateArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -59,6 +69,9 @@ fn main() -> anyhow::Result<()> {
         Cmd::Score(a) => score::run(a),
         Cmd::Run(a) => run::run(a),
         Cmd::Report(a) => report::run(a),
+        Cmd::Resume(a) => resume::run(a),
         Cmd::Setup(a) => setup::run(a),
+        Cmd::Delete(a) => delete::run(a),
+        Cmd::Update(a) => update::run(a),
     }
 }

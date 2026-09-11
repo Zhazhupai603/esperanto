@@ -72,7 +72,7 @@ pub enum QcError {
     Params(String),
     /// Input looks Phred+64 encoded; only Phred+33 is supported.
     #[error(
-        "input appears to be Phred+64 encoded (quality byte {byte} >= 75 in \
+        "input appears to be Phred+64 encoded (lowest quality byte {byte} >= 64 in \
          first 10000 reads); only Phred+33 is supported"
     )]
     Phred64 {
