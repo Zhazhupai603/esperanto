@@ -49,6 +49,14 @@ pub struct AlignStats {
     /// pre-filters (flow patches this key after the rescue stage).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rescue_prefiltered_collapsed: Option<u64>,
+    /// Control-alphabet (A>C / T>G) rescue verifications — the negative
+    /// control for the collapsed channel (flow patches this key when
+    /// `--rescue-control` ran; absent otherwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rescue_control_verified: Option<u64>,
+    /// Reads whose best placement sits on a decoy contig.
+    #[serde(default)]
+    pub decoy_reads: u64,
     /// Wall-clock seconds (parity-exempt).
     pub elapsed_seconds: f64,
 }
@@ -63,6 +71,7 @@ pub struct StatsAcc {
     rescued: u64,
     rescue_fail: u64,
     proper_pairs: u64,
+    decoy: u64,
     inserts: InsertStats,
 }
 
@@ -76,6 +85,7 @@ impl Default for StatsAcc {
             rescued: 0,
             rescue_fail: 0,
             proper_pairs: 0,
+            decoy: 0,
             inserts: InsertStats::default(),
         }
     }
@@ -110,6 +120,11 @@ impl StatsAcc {
     /// Record one failed rescue attempt.
     pub fn push_rescue_fail(&mut self) {
         self.rescue_fail += 1;
+    }
+
+    /// Record one read placed on a decoy contig.
+    pub fn push_decoy(&mut self) {
+        self.decoy += 1;
     }
 
     /// Record one proper pair (PE runs only).
@@ -147,6 +162,8 @@ impl StatsAcc {
             rescued_collapsed: None,
             rescue_rejected_collapsed: None,
             rescue_prefiltered_collapsed: None,
+            rescue_control_verified: None,
+            decoy_reads: self.decoy,
             elapsed_seconds,
         }
     }

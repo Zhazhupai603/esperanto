@@ -1,403 +1,377 @@
-//! Call driver — wires the scatter engine to scoring + candidates.bed output.
-//!
-//! Per (contig, 32Mbp chunk): load refseq (cached) → scatter_block → per-site
-//! feature assembly → spec.score → Candidate. Semantics mirror process_column
-//! (legacy htslib path) point for point.
+//! Scan driver: per (contig, block) pileup -> candidate assembly -> bed.
 
-use crate::count::{self, SeqCache};
 use crate::error::CallError;
+use crate::filters;
 use crate::out::{self, Candidate};
 use crate::scatter::{self, BlockAcc};
-use crate::score::{CallSpec, ScoreFeatures};
-use crate::strand::{infer_strand, StrandCall};
-use crate::{annot, CallParams, LibType};
+use crate::snp::SnpSet;
+use crate::{CallParams, CallStats, Channel};
 use rayon::prelude::*;
-static T_REFSEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static T_SCATTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static T_EMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 use rust_htslib::bam::Read as BamRead;
-use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-/// Load one contig's reference sequence (shared cache; None when no fasta or
-/// contig missing — majority pseudo-ref fallback, mirroring legacy).
-fn load_refseq(
-    chrom: &str,
-    len: u32,
-    fasta: Option<&Path>,
-    cache: &SeqCache,
-) -> Option<Arc<Vec<u8>>> {
-    let fa = fasta?;
-    if let Some(s) = cache.read().ok().and_then(|c| c.get(chrom).cloned()) {
-        return Some(s);
-    }
-    // P0 (observed on STAR BAMs): when the fasta lacks this contig, htslib faidx_fetch_seq64 sets a negative length,
-    // and rust-htslib 0.49 fetch_seq calls Vec::from_raw_parts(len as usize) internally, panicking on
-    // capacity overflow — the Result semantics break down (.ok() cannot catch it). Pre-check against the .fai list
-    // (missing → None; this contig degrades to
-    // majority pseudo-ref counting, never panics.
-    if !count::fasta_has_contig(fa, chrom) {
-        return None;
-    }
-    let faidx = rust_htslib::faidx::Reader::from_path(fa).ok()?;
-    let s = faidx
-        .fetch_seq(chrom, 0usize, (len as usize).saturating_sub(1))
-        .ok()?;
-    let seq: Vec<u8> = s.iter().map(|b| b.to_ascii_uppercase()).collect();
-    let arc = Arc::new(seq);
-    if let Ok(mut w) = cache.write() {
-        w.entry(chrom.to_string()).or_insert_with(|| arc.clone());
-    }
-    Some(arc)
+const BLOCK: u64 = 32_000_000;
+
+/// Contig list from the BAM header (name, length).
+fn bam_contigs(bam: &Path) -> Result<Vec<(String, u64)>, CallError> {
+    let reader = rust_htslib::bam::IndexedReader::from_path(bam)?;
+    let h = reader.header();
+    Ok((0..h.target_count())
+        .filter_map(|tid| {
+            let name = String::from_utf8_lossy(h.tid2name(tid)).into_owned();
+            h.target_len(tid).map(|l| (name, l))
+        })
+        .collect())
 }
 
-/// First two .fai columns → true contig length table (correction source for baln-derived lengths).
-fn fai_lengths(fasta: Option<&Path>) -> std::collections::HashMap<String, u32> {
-    let mut m = std::collections::HashMap::new();
-    if let Some(fa) = fasta {
-        let fai = format!("{}.fai", fa.display());
-        if let Ok(text) = std::fs::read_to_string(&fai) {
-            for line in text.lines() {
-                let mut it = line.split('\t');
-                if let (Some(name), Some(len)) = (it.next(), it.next()) {
-                    if let Ok(l) = len.parse::<u32>() {
-                        m.insert(name.to_string(), l);
-                    }
-                }
-            }
-        }
-    }
-    m
+/// Contig names present in the fasta index.
+fn fai_contigs(fasta: &Path) -> Result<std::collections::HashSet<String>, CallError> {
+    let fai = format!("{}.fai", fasta.display());
+    let text = std::fs::read_to_string(&fai).map_err(|e| CallError::Io {
+        path: fai.clone(),
+        source: e,
+    })?;
+    Ok(text
+        .lines()
+        .filter_map(|l| l.split('\t').next().map(str::to_string))
+        .collect())
 }
 
-fn base_idx(b: u8) -> Option<usize> {
-    match b {
-        b'A' => Some(0),
-        b'C' => Some(1),
-        b'G' => Some(2),
-        b'T' => Some(3),
-        _ => None,
-    }
+fn load_contig(fasta: &Path, chrom: &str, len: u64) -> Result<Arc<Vec<u8>>, CallError> {
+    let fa = rust_htslib::faidx::Reader::from_path(fasta)?;
+    let s = fa
+        .fetch_seq(chrom, 0, (len as usize).saturating_sub(1))
+        .map_err(|e| CallError::Fasta {
+            path: fasta.display().to_string(),
+            msg: format!("fetch {chrom}: {e}"),
+        })?;
+    Ok(Arc::new(s.iter().map(|b| b.to_ascii_uppercase()).collect()))
 }
 
-/// Assemble candidates for one chunk from its scatter result.
+/// Assemble candidates for one block in one mismatch channel.
+///
+/// Decoy contigs never emit: their reads are already explained (the source
+/// is absent from the primary reference), and any column called there would
+/// be a placement artifact, not editing.
 #[allow(clippy::too_many_arguments)]
-fn emit_chunk(
+fn emit_block(
     chrom: &str,
-    cs: u64,
     acc: &BlockAcc,
-    refseq: Option<&[u8]>,
-    lib: LibType,
-    enable_cu: bool,
-    gtf: Option<&annot::GtfIndex>,
-    gnomad: Option<&annot::GnomadIndex>,
-    spec: &CallSpec,
-    min_call_score: Option<f64>,
+    refseq: &[u8],
+    snp: Option<&SnpSet>,
+    p: &CallParams,
+    stats: &BlockStats,
+    channel: Channel,
     out: &mut Vec<Candidate>,
-) -> Result<(), CallError> {
-    let jbounds: BTreeSet<i64> = acc.jbounds.iter().map(|&x| x as i64).collect();
-    let mut positions: Vec<u32> = acc.sites.keys().copied().collect();
+) {
+    if chrom.starts_with("decoy_") {
+        return;
+    }
+    let mut positions: Vec<u32> = acc.mism.keys().copied().collect();
     positions.sort_unstable();
-
     for gpos in positions {
-        let li = (gpos as u64 - cs) as usize;
-        let site = &acc.sites[&gpos];
-        let fwd_d = acc.depth_fwd[li] as u64;
-        let rev_d = acc.depth_rev[li] as u64;
-        let depth = fwd_d + rev_d;
-        if depth == 0 {
+        let rb = refseq[gpos as usize];
+        let Some(alt_i) = channel.alt_index(rb) else {
+            continue;
+        };
+        let ref_i = match rb {
+            b'A' => 0,
+            b'T' => 3,
+            _ => continue,
+        };
+        let m = acc.mism[&gpos];
+        let depth = acc.depth[(gpos as u64 - acc.cs) as usize];
+        let n_alt = m[alt_i];
+        if n_alt == 0 {
             continue;
         }
-
-        // Tally per strand. full_tally mode (N-ref / no fasta): site.cnt holds
-        // every base; normal mode: mismatches only, matched = depth - mm.
-        let ref_base = refseq.and_then(|s| base_idx(s[gpos as usize]));
-        let full_tally = ref_base.is_none();
-        let mm_total: u64 = site.cnt.iter().map(|&x| x as u64).sum::<u64>();
-
-        let majority = {
-            let mut tc = [0u64; 4];
-            for (b, t) in tc.iter_mut().enumerate() {
-                *t = site.cnt[b] as u64 + site.cnt[b + 4] as u64;
+        let freq = f64::from(n_alt) / f64::from(depth);
+        if depth < p.min_depth || n_alt < p.min_edit_reads || freq < p.min_edit_freq {
+            if channel == Channel::Edit {
+                stats.below_threshold.fetch_add(1, Ordering::Relaxed);
             }
-            if !full_tally {
-                let rb = ref_base.unwrap();
-                tc[rb] += depth - mm_total;
+            continue;
+        }
+        if snp.is_some_and(|s| s.contains(chrom, gpos)) {
+            if channel == Channel::Edit {
+                stats.snp_removed.fetch_add(1, Ordering::Relaxed);
             }
-            tc.iter()
-                .enumerate()
-                .max_by_key(|(_, c)| *c)
-                .map(|(i, _)| i)
-                .unwrap_or(0)
-        };
-        let ref_idx = ref_base.unwrap_or(majority);
-
-        let mut fwd_cnt = [0u64; 4];
-        let mut rev_cnt = [0u64; 4];
-        for b in 0..4 {
-            fwd_cnt[b] = site.cnt[b] as u64;
-            rev_cnt[b] = site.cnt[b + 4] as u64;
+            continue;
         }
-        if !full_tally {
-            fwd_cnt[ref_idx] += fwd_d - fwd_cnt.iter().sum::<u64>().min(fwd_d);
-            rev_cnt[ref_idx] += rev_d - rev_cnt.iter().sum::<u64>().min(rev_d);
-        }
-
-        let total_cnt = [
-            fwd_cnt[0] + rev_cnt[0],
-            fwd_cnt[1] + rev_cnt[1],
-            fwd_cnt[2] + rev_cnt[2],
-            fwd_cnt[3] + rev_cnt[3],
-        ];
-        let var_reads = depth - total_cnt[ref_idx];
-        if var_reads == 0 {
-            continue; // pure-reference site is not a candidate
-        }
-
-        // A>I-consistent alt frequency per strand (legacy `ai` closure).
-        let ai =
-            |ref_i: usize, var_i: usize, cu_ref: usize, cu_var: usize, cnt: &[u64; 4], d: u64| {
-                if d == 0 {
-                    return 0.0;
-                }
-                let mut v = if ref_idx == ref_i {
-                    cnt[var_i] as f64 / d as f64
-                } else {
-                    0.0
-                };
-                if enable_cu && ref_idx == cu_ref {
-                    v = v.max(cnt[cu_var] as f64 / d as f64);
-                }
-                v
-            };
-        let fwd_ai = ai(0, 2, 1, 3, &fwd_cnt, fwd_d);
-        let rev_ai = ai(3, 1, 2, 0, &rev_cnt, rev_d);
-
-        let gtf_hit = gtf.map(|g| g.strands_at(chrom, gpos as i64));
-        let (strand, evid_primary) = infer_strand(
-            lib,
-            fwd_d,
-            rev_d,
-            acc.junc_plus[li],
-            acc.junc_minus[li],
-            gtf_hit,
-        );
-        let edit_frac = match strand {
-            StrandCall::Plus => fwd_ai,
-            StrandCall::Minus => rev_ai,
-            StrandCall::Amb => fwd_ai.max(rev_ai),
-        };
-
-        let var_fwd = fwd_d - fwd_cnt[ref_idx];
-        let var_rev = rev_d - rev_cnt[ref_idx];
-        let strand_bias =
-            (var_fwd as f64 - var_rev as f64).abs() / (var_fwd + var_rev).max(1) as f64;
-
-        let hp = refseq.map(|s| count::hp_len(s, gpos as usize)).unwrap_or(0);
-        let jdist = count::nearest_dist(&jbounds, gpos as i64);
-        let gnomad_af = match gnomad {
-            Some(g) => g.af_at(chrom, gpos as i64)?,
-            None => None,
-        };
-
-        let feats = ScoreFeatures {
-            depth,
-            edit_frac,
-            mean_bq: acc.bq_sum[li] as f64 / depth as f64,
-            mean_mapq: acc.mapq_sum[li] as f64 / depth as f64,
-            strand_bias,
-            gnomad_af,
-            hp_len: hp,
-            junction_dist: jdist.filter(|d| *d <= count::JUNCTION_EVID_DIST),
-        };
-        let score = spec.score(&feats);
-
-        let mut evid = evid_primary.to_string();
-        if let Some(d) = feats.junction_dist {
-            evid.push_str(&format!(",JD{d}"));
-        }
-        if hp >= count::HP_MIN {
-            evid.push_str(&format!(",HP{hp}"));
-        }
-        if gnomad_af.is_some() {
-            evid.push_str(",GNOMAD");
-        }
-        if min_call_score.is_some_and(|t| score >= t) {
-            evid.push_str(",MS");
-        }
-
+        let mut counts = m;
+        counts[ref_i] = depth - m.iter().sum::<u32>();
         out.push(Candidate {
             chrom: chrom.to_string(),
-            pos0: gpos as i64,
-            strand,
-            evid,
-            score,
+            pos0: gpos,
+            ref_base: rb,
             depth,
-            var_freq: var_reads as f64 / depth as f64,
-            fwd_freq: fwd_ai,
-            rev_freq: rev_ai,
+            counts,
+            edit_freq: freq,
+            filters: String::new(),
+            channel,
         });
     }
-    Ok(())
 }
 
-/// Engine entry: scatter + scoring/output contract.
-pub fn run_call(params: &CallParams) -> Result<crate::CallStats, CallError> {
-    let spec = CallSpec::load(params.spec.as_deref())?;
-    let gtf = params
-        .gtf
-        .as_deref()
-        .map(annot::GtfIndex::load)
-        .transpose()?;
-    let gnomad = params
-        .gnomad
-        .as_deref()
-        .map(annot::GnomadIndex::load)
-        .transpose()?;
+#[derive(Default)]
+struct BlockStats {
+    below_threshold: AtomicUsize,
+    snp_removed: AtomicUsize,
+}
 
-    // .baln fast path — build the coordinate index in a single pass (Arc shared across block tasks); the contig list
-    // and derived lengths come from the index; the BAM path is unchanged (both sources share the emit/score/output contract).
-    let baln_idx: Option<std::sync::Arc<crate::baln::BalnIndex>> = params
-        .baln
-        .as_deref()
-        .map(crate::baln::build_index)
-        .transpose()?
-        .map(std::sync::Arc::new);
-    let contigs: Vec<(String, u32)> = match &baln_idx {
-        Some(bi) => {
-            // .baln derived length = coverage upper bound, which can truncate a terminal homopolymer run
-            // (4/5.3M rows differ in HP annotation). Prefer true lengths from the fasta .fai when available;
-            // with no fasta (hp always 0) or a missing contig, the derived value suffices.
-            let fai = fai_lengths(params.fasta.as_deref());
-            bi.contigs
-                .iter()
-                .zip(bi.tid_len.iter())
-                .map(|(n, dl)| (n.clone(), fai.get(n).copied().unwrap_or(*dl)))
-                .collect()
-        }
-        None => {
-            let bam = rust_htslib::bam::IndexedReader::from_path(&params.bam)?;
-            let h = bam.header();
-            (0..h.target_count())
-                .filter_map(|tid| {
-                    let name = String::from_utf8_lossy(h.tid2name(tid)).into_owned();
-                    h.target_len(tid).map(|l| (name, l as u32))
-                })
-                .collect()
-        }
-    };
-    if let Some(g) = gnomad.as_ref() {
-        let names: Vec<String> = contigs.iter().map(|(n, _)| n.clone()).collect();
-        g.prepare(&names)?;
-    }
-
+pub fn run_call(params: &CallParams) -> Result<CallStats, CallError> {
+    let snp = params.snp.as_deref().map(SnpSet::load).transpose()?;
+    let contigs = bam_contigs(&params.bam)?;
+    let in_fasta = fai_contigs(&params.fasta)?;
     let pool = match params.threads {
         0 => rayon::ThreadPoolBuilder::new().build(),
         n => rayon::ThreadPoolBuilder::new().num_threads(n).build(),
     }
     .map_err(CallError::Pool)?;
+    let stats = BlockStats::default();
+    let filter_set = filters::FilterSet::load(
+        &params
+            .fasta
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::Path::new(".").to_path_buf()),
+    );
 
-    let seq_cache = SeqCache::default();
-    const CHUNK: u64 = 32_000_000;
-    let mut tasks: Vec<(usize, u64, u64)> = Vec::new();
-    for (ci, (_, len)) in contigs.iter().enumerate() {
-        let n_chunks = (*len as u64).div_ceil(CHUNK);
-        for k in 0..n_chunks {
-            tasks.push((ci, k * CHUNK, ((k + 1) * CHUNK).min(*len as u64)));
-        }
-    }
-
-    let results: Vec<Result<Vec<Candidate>, CallError>> = pool.install(|| {
-        tasks
+    // One task per (contig, block); the contig sequence is loaded once per
+    // contig and shared by its blocks.
+    let per_contig: Vec<Result<Vec<Candidate>, CallError>> = pool.install(|| {
+        contigs
             .par_iter()
-            .map(|&(ci, cs, ce)| {
-                let (chrom, len) = &contigs[ci];
-                let t0 = std::time::Instant::now();
-                let refseq = load_refseq(chrom, *len, params.fasta.as_deref(), &seq_cache);
-                let t_ref = t0.elapsed();
-                let t1 = std::time::Instant::now();
-                let acc = if let Some(bi) = &baln_idx {
-                    scatter::scatter_block_baln(
-                        params.baln.as_ref().expect("baln set iff index built"),
-                        &bi.idx,
-                        bi.max_span,
-                        ci as i32,
-                        cs,
-                        ce,
-                        match &refseq {
-                            Some(v) => v.as_slice(),
-                            None => &[],
-                        },
-                        refseq.is_some(),
-                    )?
-                } else {
-                    scatter::scatter_block(
-                        &params.bam,
-                        chrom,
-                        cs,
-                        ce,
-                        match &refseq {
-                            Some(v) => v.as_slice(),
-                            None => &[],
-                        },
-                        refseq.is_some(),
-                    )?
-                };
-                let t_scat = t1.elapsed();
-                let t2 = std::time::Instant::now();
-                let mut out = Vec::new();
-                emit_chunk(
-                    chrom,
-                    cs,
-                    &acc,
-                    refseq.as_ref().map(|v| v.as_slice()),
-                    params.lib,
-                    params.enable_cu,
-                    gtf.as_ref(),
-                    gnomad.as_ref(),
-                    &spec,
-                    params.min_call_score,
-                    &mut out,
-                )?;
-                let t_emit = t2.elapsed();
-                T_REFSEQ.fetch_add(
-                    t_ref.as_nanos() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                T_SCATTER.fetch_add(
-                    t_scat.as_nanos() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                T_EMIT.fetch_add(
-                    t_emit.as_nanos() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                Ok(out)
+            .filter(|(name, _)| in_fasta.contains(name))
+            .map(|(chrom, len)| {
+                let refseq = load_contig(&params.fasta, chrom, *len)?;
+                let blocks: Vec<(u64, u64)> = (0..len.div_ceil(BLOCK))
+                    .map(|k| (k * BLOCK, ((k + 1) * BLOCK).min(*len)))
+                    .collect();
+                let per_block: Vec<Result<Vec<Candidate>, CallError>> = blocks
+                    .par_iter()
+                    .map(|&(cs, ce)| {
+                        let acc = scatter::scatter_block(
+                            &params.bam,
+                            chrom,
+                            cs,
+                            ce,
+                            &refseq,
+                            params.min_mapq,
+                            params.min_bq,
+                        )?;
+                        let mut out = Vec::new();
+                        for ch in [Channel::Edit, Channel::Ctrl1, Channel::Ctrl2] {
+                            emit_block(
+                                chrom, &acc, &refseq, snp.as_ref(), params, &stats, ch, &mut out,
+                            );
+                        }
+                        Ok(out)
+                    })
+                    .collect();
+                let mut all = Vec::new();
+                for b in per_block {
+                    all.extend(b?);
+                }
+                // Standard evidence filters (visible tags, never silent
+                // drops) — annotated here where the contig sequence lives.
+                for c in &mut all {
+                    // The site sits at index 8 of the 17 bp context window;
+                    // near the contig start the window clamps and the center
+                    // follows it (was hardcoded 8, pointing at the wrong base).
+                    let center = (c.pos0 as usize).min(8);
+                    let ctx_start = c.pos0.saturating_sub(8) as usize;
+                    let ctx_end = ((c.pos0 + 9) as usize).min(refseq.len());
+                    let ctx = refseq.get(ctx_start..ctx_end).unwrap_or(&[]);
+                    let f = filter_set.site(chrom, c.pos0, ctx, center);
+                    c.filters = f.tags().join(",");
+                }
+                Ok(all)
             })
             .collect()
     });
 
-    eprintln!(
-        "[scan timing] refseq={:.1}s scatter={:.1}s emit={:.1}s",
-        T_REFSEQ.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
-        T_SCATTER.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
-        T_EMIT.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9
-    );
-    let mut all: Vec<Candidate> = Vec::new();
-    for r in results {
-        all.extend(r?);
+    let mut edit_cands: Vec<Candidate> = Vec::new();
+    let mut control_cands: Vec<Candidate> = Vec::new();
+    let mut channel_stats = [crate::ChannelStat::default(); 3];
+    for c in per_contig {
+        for cand in c? {
+            // Channel accounting rides the filter-clean subset, matching the
+            // editing channel's own candidate contract.
+            if cand.filters.is_empty() {
+                let ci = match cand.channel {
+                    Channel::Edit => 0,
+                    Channel::Ctrl1 => 1,
+                    Channel::Ctrl2 => 2,
+                };
+                channel_stats[ci].sites += 1;
+                if let Some(ai) = cand.channel.alt_index(cand.ref_base) {
+                    channel_stats[ci].alt_reads += u64::from(cand.counts[ai]);
+                }
+            }
+            match cand.channel {
+                Channel::Edit => edit_cands.push(cand),
+                _ => control_cands.push(cand),
+            }
+        }
     }
-    let n = all.len();
-    let gnomad_hits = if gnomad.is_some() {
-        all.iter().filter(|c| c.evid.contains("GNOMAD")).count()
+    let mut cands = edit_cands;
+    cands.sort_by(|a, b| a.chrom.cmp(&b.chrom).then(a.pos0.cmp(&b.pos0)));
+    let parent = params.out.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    out::write_control_bed(&parent.join("control_candidates.bed"), &mut control_cands)?;
+    let (e, c1, c2) = (channel_stats[0], channel_stats[1], channel_stats[2]);
+    let ctrl_mean = (c1.sites + c2.sites) as f64 / 2.0;
+    let snr = if ctrl_mean > 0.0 {
+        e.sites as f64 / ctrl_mean
     } else {
-        0
+        f64::INFINITY
     };
-    out::write_bed(&params.out, &mut all)?;
-    Ok(crate::CallStats {
-        candidates: n,
-        contigs: contigs.len(),
-        gnomad_hits,
+    let implied_fdr = if e.sites > 0 {
+        ctrl_mean / e.sites as f64
+    } else {
+        0.0
+    };
+    let channels_doc = format!(
+        "{{\n  \"editing\": {{\"sites\": {}, \"alt_reads\": {}}},\n  \"control_1\": {{\"sites\": {}, \"alt_reads\": {}}},\n  \"control_2\": {{\"sites\": {}, \"alt_reads\": {}}},\n  \"snr\": {:.4},\n  \"implied_fdr\": {:.6}\n}}\n",
+        e.sites, e.alt_reads, c1.sites, c1.alt_reads, c2.sites, c2.alt_reads, snr, implied_fdr
+    );
+    let channels_path = parent.join("channels.json");
+    if let Err(e2) = std::fs::write(&channels_path, channels_doc) {
+        return Err(CallError::Io {
+            path: channels_path.display().to_string(),
+            source: std::io::Error::other(e2.to_string()),
+        });
+    }
+
+    // Filter bookkeeping: per-tag counts land next to the bed for the run
+    // report, and the tags themselves ride the bed's trailing column (the
+    // verify stage appends after them; the VCF stage merges everything).
+    let mut counts: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+    for c in &cands {
+        for tag in c.filters.split(',').filter(|t| !t.is_empty()) {
+            *counts.entry(tag).or_insert(0) += 1;
+        }
+    }
+    let json_path = params.out.with_extension("filters.json");
+    let mut doc = String::from("{\n");
+    for (i, (k, v)) in counts.iter().enumerate() {
+        let comma = if i + 1 < counts.len() { "," } else { "" };
+        doc.push_str(&format!("  \"{k}\": {v}{comma}\n"));
+    }
+    doc.push_str("}\n");
+    if let Err(e) = std::fs::write(&json_path, doc) {
+        return Err(CallError::Io {
+            path: json_path.display().to_string(),
+            source: std::io::Error::other(e.to_string()),
+        });
+    }
+    out::write_bed(&params.out, &mut cands)?;
+    Ok(CallStats {
+        candidates: cands.len(),
+        below_threshold: stats.below_threshold.load(Ordering::Relaxed),
+        snp_removed: stats.snp_removed.load(Ordering::Relaxed),
+        channels: channel_stats,
     })
+}
+
+/// Reference base at `pos0`, used by tests and by the VCF writer through the
+/// bed contract; `N` when off the contig.
+pub fn ref_base(seq: &[u8], pos0: usize) -> u8 {
+    seq.get(pos0).copied().map(|b| b.to_ascii_uppercase()).unwrap_or(b'N')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn params() -> CallParams {
+        CallParams::standard("x.bam".into(), "o.bed".into(), "r.fa".into())
+    }
+
+    fn acc_with(cs: u64, depth: &[u32], mism: &[(u32, [u32; 4])]) -> BlockAcc {
+        BlockAcc {
+            cs,
+            depth: depth.to_vec(),
+            mism: mism.iter().copied().collect::<HashMap<_, _>>(),
+        }
+    }
+
+    #[test]
+    fn emits_a_to_g_and_t_to_c_only() {
+        let refseq = b"ATCG".to_vec();
+        let acc = acc_with(
+            0,
+            &[20, 20, 20, 20],
+            &[
+                (0, [0, 0, 5, 0]), // A>G: candidate
+                (1, [0, 5, 0, 0]), // T>C: candidate
+                (2, [0, 0, 0, 5]), // C>T: not A-to-I
+                (3, [5, 0, 0, 0]), // G>A: not A-to-I
+            ],
+        );
+        let stats = BlockStats::default();
+        let mut out = Vec::new();
+        emit_block("chr1", &acc, &refseq, None, &params(), &stats, Channel::Edit, &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].counts, [15, 0, 5, 0]);
+        assert_eq!(out[1].counts, [0, 5, 0, 15]);
+        assert!((out[0].edit_freq - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn applies_thresholds_and_counts_them() {
+        let refseq = b"AAA".to_vec();
+        let acc = acc_with(
+            0,
+            &[9, 200, 20],
+            &[
+                (0, [0, 0, 5, 0]), // depth 9 < 10
+                (1, [0, 0, 1, 0]), // 1 read < 2
+                (2, [0, 0, 2, 0]), // 2/20 = 10%: kept
+            ],
+        );
+        let stats = BlockStats::default();
+        let mut out = Vec::new();
+        emit_block("chr1", &acc, &refseq, None, &params(), &stats, Channel::Edit, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(stats.below_threshold.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn a_site_with_only_non_editing_mismatch_is_not_a_candidate() {
+        let refseq = b"A".to_vec();
+        let acc = acc_with(0, &[20], &[(0, [0, 5, 0, 5])]); // A>C and A>T only
+        let stats = BlockStats::default();
+        let mut out = Vec::new();
+        emit_block("chr1", &acc, &refseq, None, &params(), &stats, Channel::Edit, &mut out);
+        assert!(out.is_empty());
+        assert_eq!(stats.below_threshold.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn control_channels_count_the_same_thresholds() {
+        let refseq = b"AT".to_vec();
+        let acc = acc_with(
+            0,
+            &[20, 20],
+            &[
+                (0, [0, 3, 5, 4]), // A: C=3, G=5, T=4 -> E/C1/C2 all pass
+                (1, [4, 5, 3, 0]), // T: A=4, C=5, G=3 -> all pass
+            ],
+        );
+        let stats = BlockStats::default();
+        for (ch, alt_idx) in [(Channel::Edit, [2usize, 1usize]), (Channel::Ctrl1, [1, 2]), (Channel::Ctrl2, [3, 0])] {
+            let mut out = Vec::new();
+            emit_block("chr1", &acc, &refseq, None, &params(), &stats, ch, &mut out);
+            assert_eq!(out.len(), 2, "{ch:?}");
+            assert_eq!(out[0].counts[alt_idx[0]], acc.mism[&0][alt_idx[0]]);
+            assert_eq!(out[1].counts[alt_idx[1]], acc.mism[&1][alt_idx[1]]);
+            assert!(out.iter().all(|c| c.channel == ch));
+        }
+        // below-threshold accounting stays on the editing channel only.
+        assert_eq!(stats.below_threshold.load(Ordering::Relaxed), 0);
+    }
 }

@@ -8,6 +8,7 @@
 //! emitted only once.
 
 use crate::fasta::Base;
+use std::collections::VecDeque;
 
 /// Minimizer extraction parameters.
 #[derive(Clone, Copy, Debug)]
@@ -46,7 +47,7 @@ impl Strand {
 }
 
 /// One minimizer: canonical 2-bit k-mer at a position.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Minimizer {
     /// Canonical (min of k-mer and revcomp) 2-bit encoding.
     pub kmer: u64,
@@ -57,7 +58,7 @@ pub struct Minimizer {
 }
 
 /// A seed hit pairing a read minimizer with a reference position.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Anchor {
     /// Read position (minimizer start).
     pub qpos: u32,
@@ -80,31 +81,80 @@ pub fn mix64(mut x: u64) -> u64 {
 
 const N_CODE: u64 = 0xFF;
 
-/// Extract minimizers from an ASCII read sequence.
-pub fn minimizers(seq: &[u8], params: SeedParams) -> Vec<Minimizer> {
-    let codes: Vec<u64> = seq
-        .iter()
-        .map(|&b| match Base::from_ascii(b).code() {
-            Some(c) => c as u64,
-            None => N_CODE,
-        })
-        .collect();
-    minimizers_from_codes(&codes, params.k, params.w)
+/** Reusable buffers for minimizer extraction (per-thread scratch).
+ *
+ * Allocation-elimination only: every buffer is cleared before refill, so
+ * results are identical to the fresh-`Vec` path.
+ */
+#[derive(Default)]
+pub struct SeedScratch {
+    codes: Vec<u64>,
+    keys: Vec<Option<(u64, u64, Strand)>>,
+    dq: VecDeque<usize>,
 }
 
-/// Extract minimizers from pre-encoded 2-bit codes (`N` must be 0xFF).
-///
-/// Shared by read seeding and index construction. Uses a monotonic queue so
-/// the whole pass is O(n).
+/// Extract minimizers from an ASCII read sequence.
+pub fn minimizers(seq: &[u8], params: SeedParams) -> Vec<Minimizer> {
+    let mut out = Vec::new();
+    minimizers_into(seq, params, &mut SeedScratch::default(), &mut out);
+    out
+}
+
+/// [`minimizers`] into reusable buffers (`out` is cleared, then filled).
+pub fn minimizers_into(
+    seq: &[u8],
+    params: SeedParams,
+    scratch: &mut SeedScratch,
+    out: &mut Vec<Minimizer>,
+) {
+    let SeedScratch { codes, keys, dq } = scratch;
+    codes.clear();
+    codes.extend(
+        seq.iter()
+            .map(|&b| match Base::from_ascii(b).code() {
+                Some(c) => c as u64,
+                None => N_CODE,
+            }),
+    );
+    minimizers_core(codes, params.k, params.w, keys, dq, out);
+}
+
+/** Extract minimizers from pre-encoded 2-bit codes (`N` must be 0xFF).
+ *
+ * Shared by read seeding and index construction. Uses a monotonic queue so
+ * the whole pass is O(n).
+ */
 pub fn minimizers_from_codes(codes: &[u64], k: u32, w: u32) -> Vec<Minimizer> {
+    let mut out = Vec::new();
+    minimizers_core(
+        codes,
+        k,
+        w,
+        &mut Vec::new(),
+        &mut VecDeque::new(),
+        &mut out,
+    );
+    out
+}
+
+fn minimizers_core(
+    codes: &[u64],
+    k: u32,
+    w: u32,
+    keys: &mut Vec<Option<(u64, u64, Strand)>>,
+    dq: &mut VecDeque<usize>,
+    out: &mut Vec<Minimizer>,
+) {
+    out.clear();
     let k = k as usize;
     let w = w as usize;
     if codes.len() < k || w == 0 || k == 0 || k > 32 {
-        return Vec::new();
+        return;
     }
     let n_kmers = codes.len() - k + 1;
     // Per-k-mer (sort key, kmer, strand); k-mers overlapping an N are invalid.
-    let mut keys: Vec<Option<(u64, u64, Strand)>> = Vec::with_capacity(n_kmers);
+    keys.clear();
+    keys.reserve(n_kmers);
     let mut fwd: u64 = 0;
     let mut rev: u64 = 0;
     let mut valid_run = 0usize; // current N-free run length
@@ -138,8 +188,7 @@ pub fn minimizers_from_codes(codes: &[u64], k: u32, w: u32) -> Vec<Minimizer> {
     // Sliding-window minimum (monotonic queue); a window containing invalid
     // k-mers still selects among its VALID members (only fully-invalid
     // windows emit nothing).
-    let mut out: Vec<Minimizer> = Vec::new();
-    let mut dq: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    dq.clear();
     for i in 0..n_kmers {
         if keys[i].is_some() {
             while let Some(&b) = dq.back() {
@@ -176,6 +225,35 @@ pub fn minimizers_from_codes(codes: &[u64], k: u32, w: u32) -> Vec<Minimizer> {
             }
         }
     }
-    out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scratch_reuse_yields_independent_results() {
+        let params = SeedParams { k: 5, w: 2 };
+        let s1: &[u8] = b"ACGTACGTACGTTTACGGATC";
+        let s2: &[u8] = b"TTTNGGGCCCCAAATGCA"; // N run: invalid windows
+        let mut scratch = SeedScratch::default();
+        let mut out = Vec::new();
+
+        minimizers_into(s1, params, &mut scratch, &mut out);
+        assert_eq!(out, minimizers(s1, params));
+        assert!(!out.is_empty());
+
+        // Second call through the same buffers: different input must give
+        // exactly the fresh-call result (no state leak).
+        minimizers_into(s2, params, &mut scratch, &mut out);
+        assert_eq!(out, minimizers(s2, params));
+
+        // Too-short input must clear the reused out buffer.
+        minimizers_into(b"AC", params, &mut scratch, &mut out);
+        assert!(out.is_empty());
+
+        // And the first input again, reproducing the first result.
+        minimizers_into(s1, params, &mut scratch, &mut out);
+        assert_eq!(out, minimizers(s1, params));
+    }
+}

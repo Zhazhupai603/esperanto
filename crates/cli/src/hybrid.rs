@@ -312,9 +312,12 @@ fn build(
     crate::index::build_all(
         &hybrid_fa,
         Some(&hybrid_gtf),
+        &[],
+        // hybrid indexes never need the rescue-control alphabets
         &dir.join("hybrid.paidx"),
         15,
         5,
+            false,
     )?;
     Ok(())
 }

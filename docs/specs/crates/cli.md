@@ -50,7 +50,7 @@ The produced paidx connects directly to `run`/`map`'s `--index`; `rna_default`'s
 | `--out` | PathBuf | **required** | output directory |
 | `--threads` | usize | 0 | threads |
 
-Behavior contract: `AlignConfig::rna_default()` + `extend.editing_aware=true`; RNA always 2-pass; `jkmer=None`. Fixed artifact names: `raw.bam` (streamed, unsorted; sorting happens in run's sort step) + `unmapped.fq.gz` + `align_qc.json` + `align.baln`.
+Behavior contract: `AlignConfig::rna_default()` unchanged (`extend.edit_dir = EditDir::Off` — Tier 1 is strict; the editing exemption belongs to the Tier-2 rescue in flow); RNA always 2-pass; `jkmer=None`. Fixed artifact names: `raw.bam` (streamed, unsorted; sorting happens in run's sort step) + `unmapped.fq.gz` + `align_qc.json` + `align.baln`.
 
 ### pile — pileup features (→ `pile::extract_pileup_features[_batch]`)
 
@@ -60,23 +60,23 @@ Behavior contract: `AlignConfig::rna_default()` + `extend.editing_aware=true`; R
 | `--chrom` + `--pos` | String / i64 | single-site mode | 1-based site |
 | `--sites` | PathBuf | batch mode | `chrom\tpos` (1-based) file |
 | `--out` | PathBuf | stdout | output TSV |
+| `--min-mapq` | u8 | 20 | reads below this MAPQ do not count |
 
-Single-site and batch are mutually exclusive; giving both is an error. Output columns: `chrom pos depth A_count C_count G_count T_count mean_base_quality strand_bias mean_mapq` (FEATURE_NAMES order, values Display); batch output row order = input order.
+Single-site and batch are mutually exclusive; giving both is an error. Output columns: `chrom pos depth A_count C_count G_count T_count mean_base_quality strand_bias mean_mapq hyperedited` (FEATURE_NAMES order, values Display); batch output row order = input order.
 
 ### scan — candidate-site discovery (→ `scan::run_call`)
 
 | flag | type | default | meaning |
 |---|---|---|---|
-| `--bam` | PathBuf | **required** | input BAM |
-| `--baln` | PathBuf | None | .baln dual source (takes precedence when given, ignores bam) |
+| `--bam` | PathBuf | **required** | input BAM (sorted, indexed) |
 | `--out` | PathBuf | **required** | candidates.bed |
-| `--fasta` | PathBuf | None (refs probing by default; if still absent → majority pseudo-ref) | reference |
-| `--gtf` | PathBuf | None | strand-decision evidence |
-| `--gnomad` | PathBuf | None (refs probing by default) | soft down-weighting |
-| `--lib` | unstranded\|stranded | unstranded | library strand specificity |
-| `--enable-cu` | bool | false | C>U symmetric mode |
-| `--min-call-score` | f64 | None | threshold (marks only, never deletes; contract owned by scan) |
-| `--spec` | PathBuf | None (built-in v2) | scoring spec JSON |
+| `--fasta` | PathBuf | refs probing by default | reference (needs .fai) |
+| `--snp` | PathBuf or `none` | refs probing by default | known-SNP VCF; listed positions are removed; `none` disables |
+| `--min-mapq` | u8 | 20 | reads below this MAPQ do not count |
+| `--min-bq` | u8 | 30 | bases below this quality do not count |
+| `--min-depth` | u32 | 10 | minimum counted depth |
+| `--min-edit-reads` | u32 | 2 | minimum editing-consistent alternate reads |
+| `--min-edit-freq` | f64 | 0.01 | minimum editing-consistent alternate frequency |
 | `--threads` | usize | 0 | threads |
 
 ### score — RE_PROB scoring (→ `score::pipeline::score_sites_batched`)
@@ -90,7 +90,7 @@ Single-site and batch are mutually exclusive; giving both is an error. Output co
 | `--caduceus` | PathBuf | resolved within bundle | encoder directory |
 | `--out` | PathBuf | **required** | TSV `chrom\tpos\tprob` |
 | `--threads` | usize | 0 | threads |
-| `--batch` | usize | 64 | batch size |
+| `--batch` | usize | 256 | batch size |
 
 ### run — full-pipeline orchestration (→ `flow::run_pipeline`)
 
@@ -102,11 +102,10 @@ Single-site and batch are mutually exclusive; giving both is an error. Output co
 | `--index` | PathBuf | required for FASTQ entries | paidx |
 | `--fasta` | PathBuf | refs probing by default | reference (needs .fai) |
 | `--gtf` | PathBuf | None (refs probing by default) | annotation |
-| `--gnomad` | PathBuf | None (refs probing by default) | gnomAD |
+| `--snp` | PathBuf | None (refs probing by default) | known-SNP VCF (candidate exclusion) |
 | `--bundle` | PathBuf | zero-config 5-level | model bundle |
 | `--caduceus` | PathBuf | resolved within bundle | encoder |
 | `--l1-bundle` | PathBuf | None | L1 engine |
-| `--lib` | unstranded\|stranded | unstranded | strand specificity |
 | `--out` | PathBuf | **required** | output root |
 | `--threads` | usize | 0 | threads |
 | `--batch` | usize | 256 | score batch |
@@ -128,11 +127,11 @@ Everything follows "explicit flag first; probing only fills blanks". The first l
 
 Validity at each level: the directory contains `norm.json`.
 
-### refs (4 levels, used by run's fasta/gtf/gnomad and score's fasta)
+### refs (4 levels, used by run's fasta/gtf/snp/index, scan's fasta/snp and score's fasta)
 
 1. `ESPERANTO_REFS`; 2. `<exe>/refs` and `<exe>/../refs`; 3. `~/.local/share/esperanto/refs`; 4. `./refs`.
 
-Directory validity: contains a `*.fa` with a same-named `.fai`. File location: fasta = `hg38.fa` preferred, otherwise the first `*.fa` in lexicographic order; gtf = first `*.gtf`; gnomad = a `*.vcf.gz` starting with `dbsnp*` or `gnomad*`. **Only fills blanks; never overrides explicit values.**
+Directory validity: contains a `*.fa` with a same-named `.fai`. File location: fasta = `hg38.fa` preferred, otherwise the first `*.fa` in lexicographic order; gtf = first `*.gtf`; snp = the first `*.vcf`/`*.vcf.gz` whose name contains `snp`; index = first `*.paidx`. **Only fills blanks; never overrides explicit values.**
 
 ### caduceus
 

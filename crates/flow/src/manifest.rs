@@ -24,6 +24,10 @@ pub struct SpeciesManifest {
     /// builder so score stages resolve the right model per contig.
     #[serde(default)]
     pub bundles: BTreeMap<String, PathBuf>,
+    /// Decoy contig names in the reference (`decoy_` prefix contract),
+    /// recorded for audit; consumers key off the name prefix itself.
+    #[serde(default)]
+    pub decoys: Vec<String>,
 }
 
 impl SpeciesManifest {
@@ -35,6 +39,7 @@ impl SpeciesManifest {
             human_loci: Vec::new(),
             contig_owner: BTreeMap::new(),
             bundles: BTreeMap::new(),
+            decoys: Vec::new(),
         }
     }
 

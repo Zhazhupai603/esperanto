@@ -1,71 +1,135 @@
-//! esperanto-scan — strand-resolved candidate editing-site caller (scatter engine).
+//! esperanto-scan — A-to-I candidate site discovery.
 //!
-//! Role (spec: docs/specs/crates/scan.md): genome-wide scan from BAM/.baln, emitting
-//! candidates.bed (10-column contract). No hard filters: strand-resolved statistics, the soft score
-//! CALL_SCORE (0–1), and the evidence codes EVID all pass through, consumed downstream with thresholds.
-//! The threshold parameter only marks (evid gains `,MS`); by default all candidates are emitted.
+//! Genome-wide pileup over a coordinate-sorted BAM: every read that passes the
+//! mapping-quality gate contributes its bases (above the base-quality gate) to
+//! per-position depth and base counts. A position is a candidate when the
+//! reference base is A or T and the editing-consistent alternate base (G for
+//! A, C for T) is supported by enough reads. Known SNP positions are removed
+//! when a SNP VCF is given.
 //!
-//! Chromosome-level parallelism (rayon); output sorted by (chrom, pos), thread-count independent, byte-identical.
+//! The counting convention matches the standard REDItools workflow (MAPQ >= 20,
+//! base quality >= 30, coverage >= 10, no read-orientation split), so
+//! candidate tables are directly comparable across pipelines.
+//!
+//! One filter is applied on top: a candidate whose read-length neighbourhood
+//! holds both editing directions is not one transcript's editing and is
+//! dropped (see [`strand`]).
+//!
+//! Parallel over (contig, 32 Mbp block); output sorted by (chrom, pos) and
+//! independent of the thread count.
 
-pub mod annot;
-pub mod baln;
 pub mod call;
-pub mod count;
+pub mod filters;
 pub mod error;
 pub mod out;
 pub mod scatter;
-pub mod score;
-pub mod strand;
+pub mod snp;
 
 pub use error::CallError;
-pub use score::CallSpec;
-pub use strand::StrandCall;
 
 use std::path::PathBuf;
 
-/// Library strandedness: Stranded (dUTP-type; read direction maps directly to the transcribed strand) / Unstranded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LibType {
-    Unstranded,
-    Stranded,
-}
-
 #[derive(Debug, Clone)]
 pub struct CallParams {
-    /// Input BAM (requires .csi/.bai index).
+    /// Input BAM (coordinate-sorted, with `.bai`/`.csi`).
     pub bam: PathBuf,
     /// Output candidates.bed.
     pub out: PathBuf,
-    /// Reference FASTA (requires .fai): ref base / homopolymer / junction orientation; without it, falls back to majority pseudo-ref.
-    pub fasta: Option<PathBuf>,
-    /// Gene annotation GTF (strand-call evidence priority 3).
-    pub gtf: Option<PathBuf>,
-    /// gnomAD VCF single file or per-chrom directory (soft down-weighting, never removes); configured but unusable = hard error.
-    pub gnomad: Option<PathBuf>,
-    pub lib: LibType,
-    /// C>U symmetric-mode switch (off by default).
-    pub enable_cu: bool,
-    /// Threshold marks only, never removes; None = emit all candidates.
-    pub min_call_score: Option<f64>,
-    /// Override scoring spec JSON; None = crate-bundled call_spec.v2.json.
-    pub spec: Option<PathBuf>,
+    /// Reference FASTA (with `.fai`).
+    pub fasta: PathBuf,
+    /// Known-SNP VCF (plain or gzip); listed positions are excluded.
+    pub snp: Option<PathBuf>,
+    /// Reads below this MAPQ do not count.
+    pub min_mapq: u8,
+    /// Bases below this Phred quality do not count.
+    pub min_bq: u8,
+    /// Minimum counted depth at a candidate.
+    pub min_depth: u32,
+    /// Minimum reads carrying the editing-consistent alternate base.
+    pub min_edit_reads: u32,
+    /// Minimum editing-consistent alternate frequency.
+    pub min_edit_freq: f64,
     /// Thread count; 0 = all cores.
     pub threads: usize,
-    /// Binary input: map-output .baln (skips BAM decompression/indexing). When Some, the bam field is not opened;
-    /// the contig list and read set both come from the .baln coordinate index (single-pass scan); output is
-    /// byte-identical to the BAM path (both sources share the same scatter kernel scatter_one_record).
-    pub baln: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy)]
+impl CallParams {
+    /// Standard thresholds (REDItools convention): MAPQ 20, BQ 30, depth 10,
+    /// 2 alternate reads, 1% frequency.
+    pub fn standard(bam: PathBuf, out: PathBuf, fasta: PathBuf) -> Self {
+        Self {
+            bam,
+            out,
+            fasta,
+            snp: None,
+            min_mapq: 20,
+            min_bq: 30,
+            min_depth: 10,
+            min_edit_reads: 2,
+            min_edit_freq: 0.01,
+            threads: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
 pub struct CallStats {
+    /// Candidates written.
     pub candidates: usize,
-    pub contigs: usize,
-    /// Number of sites hit by gnomAD soft down-weighting (0 when gnomad is not enabled).
-    pub gnomad_hits: usize,
+    /// Positions with editing-consistent evidence that failed a threshold.
+    pub below_threshold: usize,
+    /// Positions removed as known SNPs.
+    pub snp_removed: usize,
+    /// Per-channel site / alt-read totals over filter-clean positions,
+    /// indexed [Edit, Ctrl1, Ctrl2].
+    pub channels: [ChannelStat; 3],
 }
 
-/// Sole engine entry point: the scatter caller.
+/// Mismatch channel over an A/T reference column: the editing class plus
+/// the two control classes counted with identical thresholds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    /// Editing: A->G, T->C.
+    Edit,
+    /// Control 1: A->C, T->G.
+    Ctrl1,
+    /// Control 2: A->T, T->A.
+    Ctrl2,
+}
+
+impl Channel {
+    /// Alternate-base index (A, C, G, T order) for this channel over
+    /// `ref_base`; None when the reference base is not A/T.
+    pub fn alt_index(self, ref_base: u8) -> Option<usize> {
+        Some(match (self, ref_base) {
+            (Channel::Edit, b'A') => 2,
+            (Channel::Edit, b'T') => 1,
+            (Channel::Ctrl1, b'A') => 1,
+            (Channel::Ctrl1, b'T') => 2,
+            (Channel::Ctrl2, b'A') => 3,
+            (Channel::Ctrl2, b'T') => 0,
+            _ => return None,
+        })
+    }
+    /// Bed column label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Channel::Edit => "E",
+            Channel::Ctrl1 => "C1",
+            Channel::Ctrl2 => "C2",
+        }
+    }
+}
+
+/// Per-channel totals over filter-clean positions.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChannelStat {
+    /// Candidate positions passing every gate.
+    pub sites: usize,
+    /// Alternate-base reads summed over those positions.
+    pub alt_reads: u64,
+}
+
 pub fn run_call(params: &CallParams) -> Result<CallStats, CallError> {
     call::run_call(params)
 }

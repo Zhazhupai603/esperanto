@@ -20,9 +20,6 @@ pub struct ScoreArgs {
     /// Reference FASTA (default: refs discovery).
     #[arg(long)]
     fasta: Option<PathBuf>,
-    /// Optional .baln fast channel for the pileup pass (default: BAM).
-    #[arg(long)]
-    baln: Option<PathBuf>,
     /// Model bundle root (default: zero-config 5-level fallback).
     #[arg(long)]
     bundle: Option<PathBuf>,
@@ -70,7 +67,6 @@ pub fn run(a: ScoreArgs) -> anyhow::Result<()> {
         None,
         a.device.resolve(),
         Some(&ask),
-        a.baln.as_deref(),
         score_pipeline::ReferenceCheck::Guardrail,
     )?;
     let mut buf = String::new();

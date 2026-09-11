@@ -79,7 +79,18 @@ pub const FEATURE_NAMES: [&str; N_FEATURES] = [
 ];
 
 /// Minimum (possibly overlap-tweaked) base quality for a read to be counted.
-pub const MIN_BASE_QUALITY: u8 = 13;
+/// Same gate as the candidate scan (BQ 30): the training pileup and the
+/// scan's vote counting must see the same bases.
+pub const MIN_BASE_QUALITY: u8 = 30;
+
+/// Read-end trim: bases within this distance of either end never contribute.
+/// Single source of truth: the candidate scan's constant (Ramaswami et al.,
+/// Nat Methods 9:490, 2012).
+pub use esperanto_scan::scatter::READ_END_TRIM;
+
+/// Standard mapping-quality gate for scoring features: reads below this
+/// MAPQ are not part of the pileup (the candidate scan uses the same gate).
+pub const MIN_MAPQ: u8 = 20;
 
 /// htslib pileup engine default maximum depth; excess reads starting at the
 /// engine position are silently dropped at push time.
@@ -113,7 +124,7 @@ pub enum PileError {
     #[error("failed to read BAM record: {0}")]
     Read(#[from] rust_htslib::errors::Error),
 
-    /// I/O failure (includes the `.baln` channel).
+    /// I/O failure.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -139,9 +150,10 @@ pub fn extract_pileup_features(
     bam: &mut IndexedReader,
     chrom: &str,
     pos_1based: i64,
+    min_mapq: u8,
 ) -> Result<[f32; N_FEATURES], PileError> {
     let (tid, pos0) = resolve_site(bam, chrom, pos_1based)?;
-    let (records, has_collapsed) = collect_site_records(bam, tid, pos0)?;
+    let (records, has_collapsed) = collect_site_records(bam, tid, pos0, min_mapq)?;
     Ok(run_site(pos0, records, has_collapsed))
 }
 
@@ -157,6 +169,7 @@ pub fn extract_pileup_features(
 pub fn extract_pileup_features_batch(
     bam: &mut IndexedReader,
     sites: &[(&str, i64)],
+    min_mapq: u8,
 ) -> Result<Vec<[f32; N_FEATURES]>, PileError> {
     if sites.is_empty() {
         return Ok(Vec::new());
@@ -193,6 +206,7 @@ pub fn extract_pileup_features_batch(
             g_first_pos0,
             last_pos0,
             &order[group_start..group_end],
+            min_mapq,
             &mut out,
         )?;
 
@@ -211,6 +225,7 @@ pub fn extract_pileup_features_batch(
 fn stream_core<R: PileRecord>(
     records: impl Iterator<Item = Result<R, PileError>>,
     group: &[(i32, i64, usize)],
+    min_mapq: u8,
     out: &mut [[f32; N_FEATURES]],
 ) -> Result<bool, PileError> {
     let mut plp: EventPlp<R> = EventPlp::new();
@@ -230,10 +245,10 @@ fn stream_core<R: PileRecord>(
             }
             let r = records.next().expect("peeked")?;
             plp.retire_until(r.tid(), r.pos());
-            if !r.is_collapsed() {
-                plp.push(r);
-            } else {
+            if r.is_collapsed() {
                 collapsed_end = collapsed_end.max(r.pos() + r.ref_len());
+            } else if r.mapq() >= min_mapq {
+                plp.push(r);
             }
         }
         plp.retire_until(tid, pos0);
@@ -255,6 +270,7 @@ fn sweep_group_bam(
     first_pos0: i64,
     last_pos0: i64,
     group: &[(i32, i64, usize)],
+    min_mapq: u8,
     out: &mut [[f32; N_FEATURES]],
 ) -> Result<(), PileError> {
     let fetch = |bam: &mut IndexedReader| {
@@ -270,6 +286,7 @@ fn sweep_group_bam(
     let dropped = stream_core(
         bam.records().map(|r| r.map_err(PileError::Read)),
         group,
+        min_mapq,
         out,
     )?;
     if dropped {
@@ -278,64 +295,16 @@ fn sweep_group_bam(
             .records()
             .map(|r| r.map_err(PileError::Read))
             .collect::<Result<Vec<_>, _>>()?;
-        legacy_sweep_group(records, group, out)?;
+        legacy_sweep_group(records, group, min_mapq, out)?;
     }
     Ok(())
 }
 
-/// `.baln` sweep for one site group: same structure as
-/// [`sweep_group_bam`]; the fallback re-reads the window.
-fn sweep_group_baln(
-    index: &esperanto_bamio::baln::BalnIndex,
-    file: &std::fs::File,
-    tid: i32,
-    first_pos0: i64,
-    last_pos0: i64,
-    group: &[(i32, i64, usize)],
-    out: &mut [[f32; N_FEATURES]],
-) -> Result<(), PileError> {
-    let raw = baln_window_records(index, file, tid, first_pos0, last_pos0)?;
-    let dropped = stream_core(raw.into_iter().map(Ok), group, out)?;
-    if dropped {
-        let raw = baln_window_records(index, file, tid, first_pos0, last_pos0)?;
-        legacy_sweep_group(raw, group, out)?;
-    }
-    Ok(())
-}
-
-/// Records overlapping `[first_pos0, last_pos0]` from the `.baln` channel
-/// (index window `pos < last+1 && pos+span > first`, htslib fetch overlap
-/// semantics).
-fn baln_window_records(
-    index: &esperanto_bamio::baln::BalnIndex,
-    file: &std::fs::File,
-    tid: i32,
-    first_pos0: i64,
-    last_pos0: i64,
-) -> Result<Vec<BalnPileRecord>, PileError> {
-    let lo_pos = first_pos0 - index.max_span;
-    let lo = index
-        .idx
-        .partition_point(|e| (e.0, e.1) < (tid, lo_pos));
-    let hi = index
-        .idx
-        .partition_point(|e| (e.0, e.1) < (tid, last_pos0 + 1));
-    let mut raw: Vec<BalnPileRecord> = Vec::new();
-    for &(t, pos, off, span) in &index.idx[lo..hi] {
-        if t != tid || pos + span <= first_pos0 {
-            continue;
-        }
-        let Some(rec) = esperanto_bamio::baln::read_record_at(file, off)? else {
-            continue;
-        };
-        raw.push(BalnPileRecord::new(rec)?);
-    }
-    Ok(raw)
-}
 
 fn legacy_sweep_group<R: PileRecord>(
     records: impl IntoIterator<Item = R>,
     group: &[(i32, i64, usize)],
+    min_mapq: u8,
     out: &mut [[f32; N_FEATURES]],
 ) -> Result<(), PileError> {
     let mut active: Vec<R> = Vec::new();
@@ -352,10 +321,10 @@ fn legacy_sweep_group<R: PileRecord>(
                 },
             };
             if rec.pos() <= pos0 {
-                if !rec.is_collapsed() {
-                    active.push(rec);
-                } else {
+                if rec.is_collapsed() {
                     collapsed_end = collapsed_end.max(rec.pos() + rec.ref_len());
+                } else if rec.mapq() >= min_mapq {
+                    active.push(rec);
                 }
             } else {
                 pending = Some(rec);
@@ -367,67 +336,6 @@ fn legacy_sweep_group<R: PileRecord>(
         out[orig_idx] = run_site(pos0, active.iter().cloned(), has_collapsed);
     }
     Ok(())
-}
-
-/// Extract pileup features for many sites from the `.baln` fast channel.
-///
-/// Same grouping, sweep and engine as the BAM path; the coordinate index
-/// selects exactly the records htslib fetch would deliver, so features are
-/// bit-identical to [`extract_pileup_features_batch`]. Output order follows
-/// the input `sites` order.
-pub fn extract_pileup_features_batch_baln(
-    index: &esperanto_bamio::baln::BalnIndex,
-    file: &std::fs::File,
-    sites: &[(&str, i64)],
-) -> Result<Vec<[f32; N_FEATURES]>, PileError> {
-    if sites.is_empty() {
-        return Ok(Vec::new());
-    }
-    let tid_of = |chrom: &str| -> Result<i32, PileError> {
-        index
-            .contigs
-            .iter()
-            .position(|c| c == chrom)
-            .map(|i| i as i32)
-            .ok_or_else(|| PileError::ContigNotFound(chrom.to_string()))
-    };
-    let mut order: Vec<(i32, i64, usize)> = Vec::with_capacity(sites.len());
-    for (i, (chrom, pos_1based)) in sites.iter().enumerate() {
-        if *pos_1based < 1 {
-            return Err(PileError::InvalidPosition(*pos_1based));
-        }
-        order.push((tid_of(chrom)?, pos_1based - 1, i));
-    }
-    order.sort_by_key(|&(tid, pos0, _)| (tid, pos0));
-
-    let mut out: Vec<[f32; N_FEATURES]> = vec![[0.0; N_FEATURES]; sites.len()];
-
-    let mut group_start = 0usize;
-    while group_start < order.len() {
-        let (g_tid, g_first_pos0, _) = order[group_start];
-        let mut group_end = group_start + 1;
-        while group_end < order.len() {
-            let &(tid, pos0, _) = &order[group_end];
-            let &(_, prev_pos0, _) = &order[group_end - 1];
-            if tid != g_tid || pos0 - prev_pos0 > MERGE_GAP {
-                break;
-            }
-            group_end += 1;
-        }
-        let last_pos0 = order[group_end - 1].1;
-        sweep_group_baln(
-            index,
-            file,
-            g_tid,
-            g_first_pos0,
-            last_pos0,
-            &order[group_start..group_end],
-            &mut out,
-        )?;
-
-        group_start = group_end;
-    }
-    Ok(out)
 }
 
 /// Resolve a (chrom, 1-based pos) site into (tid, 0-based pos).
@@ -452,6 +360,7 @@ fn collect_site_records(
     bam: &mut IndexedReader,
     tid: i32,
     pos0: i64,
+    min_mapq: u8,
 ) -> Result<(Vec<Record>, bool), PileError> {
     bam.fetch((tid, pos0, pos0 + 1))
         .map_err(|source| PileError::Fetch {
@@ -464,18 +373,16 @@ fn collect_site_records(
     let mut has_collapsed = false;
     for rec in bam.records() {
         let rec = rec?;
-        if !is_collapsed(&rec) {
-            records.push(rec);
-        } else {
+        if is_collapsed(&rec) {
             has_collapsed = true;
+        } else if rec.mapq() >= min_mapq {
+            records.push(rec);
         }
     }
     Ok((records, has_collapsed))
 }
 
-/// Record abstraction for the pileup engine: implemented by htslib
-/// `Record` (BAM source) and by [`BalnPileRecord`] (`.baln` source), so the
-/// engine runs without re-encoding either representation.
+/// Record abstraction for the pileup engine (implemented by htslib `Record`).
 pub trait PileRecord: Clone {
     /// Reference id (-1 = unmapped).
     fn tid(&self) -> i32;
@@ -525,69 +432,6 @@ impl PileRecord for Record {
     fn cigar_at(&self, i: usize) -> Cigar { self.cigar()[i] }
     fn ref_len(&self) -> i64 { cigar_rlen(self) }
     fn is_collapsed(&self) -> bool { is_collapsed(self) }
-}
-
-/// `.baln` record prepared for the pileup engine: fields plus the decoded
-/// CIGAR (computed once at conversion; no sequence re-encoding).
-#[derive(Clone)]
-pub struct BalnPileRecord {
-    rec: esperanto_bamio::baln::BalnRecord,
-    cigar: Vec<Cigar>,
-}
-
-impl BalnPileRecord {
-    /// Convert a parsed `.baln` record (cheap: CIGAR words to enums only).
-    pub fn new(rec: esperanto_bamio::baln::BalnRecord) -> Result<BalnPileRecord, PileError> {
-        let mut cigar = Vec::with_capacity(rec.cigar.len());
-        for &c in &rec.cigar {
-            let len = c >> 4;
-            cigar.push(match c & 0xF {
-                0 => Cigar::Match(len),
-                1 => Cigar::Ins(len),
-                2 => Cigar::Del(len),
-                3 => Cigar::RefSkip(len),
-                4 => Cigar::SoftClip(len),
-                5 => Cigar::HardClip(len),
-                6 => Cigar::Pad(len),
-                7 => Cigar::Equal(len),
-                8 => Cigar::Diff(len),
-                other => {
-                    return Err(PileError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("baln record: unknown cigar op code {other}"),
-                    )))
-                }
-            });
-        }
-        Ok(BalnPileRecord { rec, cigar })
-    }
-}
-
-impl PileRecord for BalnPileRecord {
-    fn tid(&self) -> i32 { self.rec.tid }
-    fn mtid(&self) -> i32 { self.rec.mtid }
-    fn pos(&self) -> i64 { self.rec.pos }
-    fn mpos(&self) -> i64 { self.rec.mpos }
-    fn insert_size(&self) -> i64 { self.rec.isize }
-    fn flags(&self) -> u16 { self.rec.flag }
-    fn mapq(&self) -> u8 { self.rec.mapq }
-    fn qname(&self) -> &[u8] { &self.rec.name }
-    fn seq_len(&self) -> usize { self.rec.l_seq }
-    fn qual(&self) -> &[u8] { &self.rec.qual }
-    fn base_at(&self, i: usize) -> u8 { self.rec.seq_ascii[i] }
-    fn cigar_len(&self) -> usize { self.cigar.len() }
-    fn cigar_at(&self, i: usize) -> Cigar { self.cigar[i] }
-    fn ref_len(&self) -> i64 {
-        self.cigar
-            .iter()
-            .map(|c| match c {
-                Cigar::Match(n) | Cigar::Del(n) | Cigar::RefSkip(n) | Cigar::Equal(n)
-                | Cigar::Diff(n) => *n as i64,
-                _ => 0,
-            })
-            .sum()
-    }
-    fn is_collapsed(&self) -> bool { self.rec.re.as_deref() == Some("collapsed") }
 }
 
 /// Run the pileup engine over one site's record sequence and extract features.
@@ -798,6 +642,10 @@ impl<R: PileRecord> EventPlp<R> {
             if qpos >= seq_len {
                 continue;
             }
+            // Read-end trim, same convention as the candidate scan.
+            if qpos < READ_END_TRIM || qpos + READ_END_TRIM >= seq_len {
+                continue;
+            }
             let qual_slice = node.qual.as_deref().unwrap_or_else(|| rec.qual());
             let qual = if qpos < qual_slice.len() {
                 qual_slice[qpos]
@@ -869,6 +717,10 @@ fn features_from_column<R: PileRecord>(plp: &Plp<R>, col: &Column, has_collapsed
         // Spec quality rule: qpos >= l_qseq -> quality treated as 0 (filtered
         // below); this also guards sequence/quality slice access.
         if qpos >= seq_len {
+            continue;
+        }
+        // Read-end trim, same convention as the candidate scan.
+        if qpos < READ_END_TRIM || qpos + READ_END_TRIM >= seq_len {
             continue;
         }
         // Reference quality gate: beyond-l_qseq reads as 0 (filtered); a

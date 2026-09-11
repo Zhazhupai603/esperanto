@@ -1,7 +1,7 @@
 //! score pipeline: BAM + sites -> RE_PROB (row order = input order).
 //!
 //! Reference preload + species guard + (chrom,pos) sorted batching + batch-level rayon;
-//! within a batch: pileup -> veto gate -> embed the kept-site sub-batch -> fusion head.
+//! within a batch: pileup -> embed -> fusion head.
 //! Deterministic: thread count / batch size do not change the numerics.
 //! Semantics from flow::score_sites_batched (the corrected feature source is out of scope for 1.0.0).
 //!
@@ -19,10 +19,10 @@ use rayon::prelude::*;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::bundle::{load_bundle, Bundle, EmbCache, Gate};
+use crate::bundle::{load_bundle, Bundle, EmbCache};
 use crate::caduceus::{CaduceusEncoder, EmbedBatchBufs, D_MODEL};
 use crate::encoder::{fetch_window_mem_hw, tokenize};
-use crate::head::{gate_prob_ensemble, re_prob_ensemble};
+use crate::head::re_prob_ensemble;
 
 /// Batch-level worker: one per rayon thread (BAM reader + reused encoding buffers).
 /// Compute device for the encoder stage (CLI `--device`).
@@ -88,14 +88,13 @@ impl Embedder<'_> {
 /// Shared per-chunk context (everything the batch body needs beyond the worker state).
 struct ChunkCtx<'a> {
     bundle: &'a Bundle,
-    gate: &'a Gate,
     refmap: &'a std::collections::HashMap<String, Arc<Vec<u8>>>,
     half_window: i64,
     tok_len: usize,
     emb_cache: Option<&'a Arc<Mutex<EmbCache>>>,
 }
 
-/// CPU-side half of a batch (the GPU pipeline's producer work): pileup -> veto gate ->
+/// CPU-side half of a batch (the GPU pipeline's producer work): pileup ->
 /// cache split -> tokenize misses. Everything before the device-dependent embed; carried
 /// across the producer->consumer channel by the GPU overlap pipeline.
 struct ChunkCpuWork {
@@ -106,28 +105,16 @@ struct ChunkCpuWork {
     toks: Vec<i64>,
 }
 
-/// Producer half of `process_chunk`: gate + cache split + tokenize (no embed, no head).
-/// Pileup features arrive precomputed from the region-sweep pass (phase 1) —
-/// the veto gate consumes them ahead of caching/encoding.
+/// Producer half of `process_chunk`: cache split + tokenize (no embed, no head).
+/// Pileup features arrive precomputed from the region-sweep pass (phase 1).
 fn process_chunk_cpu_half(
     ctx: &ChunkCtx,
     chunk: &[(String, i64)],
     piles: Vec<[f32; esperanto_pile::N_FEATURES]>,
 ) -> Result<ChunkCpuWork, String> {
-    // Veto gate: gate RE_PROB < threshold -> skip the encoder and emit the gate probability directly;
-    // kept sites take the original path (embed + fusion head, numerically bit-identical to no-gate).
-    let mut final_probs: Vec<Option<f64>> = Vec::with_capacity(chunk.len());
-    let mut keep_idx: Vec<usize> = Vec::new();
-    for (bi2, pl) in piles.iter().enumerate() {
-        let gp = gate_prob_ensemble(ctx.gate, pl).map_err(|e| format!("gate: {e}"))?;
-        if gp < ctx.gate.threshold {
-            final_probs.push(Some(gp));
-        } else {
-            final_probs.push(None);
-            keep_idx.push(bi2);
-        }
-    }
-    // Cache split (kept sites only) -- a hit yields the fp16 bit pattern (bit-identical to online
+    let final_probs: Vec<Option<f64>> = vec![None; chunk.len()];
+    let keep_idx: Vec<usize> = (0..chunk.len()).collect();
+    // Cache split -- a hit yields the fp16 bit pattern (bit-identical to online
     // embed); misses are collected into the toks batch (order preserved).
     let mut kept_hit: Vec<Option<[u16; D_MODEL]>> = keep_idx.iter().map(|_| None).collect();
     let mut toks: Vec<i64> = Vec::with_capacity(keep_idx.len() * ctx.tok_len);
@@ -185,6 +172,10 @@ fn process_chunk_rest(
     let miss_embs = embedder.embed(&toks, ctx.tok_len, bufs)?;
     // Kept sites: cache hit / freshly computed embedding -> fusion head; write back to cache (new computations only).
     let mut miss_iter = miss_embs.into_iter();
+    // Batch cache writeback: collect this chunk's fresh embeddings and take the cache
+    // lock ONCE after the loop (was: one lock acquisition per missed site, contended
+    // across every rayon worker).
+    let mut wb: Vec<(String, u32, [u16; D_MODEL])> = Vec::new();
     for (ki, &bi2) in keep_idx.iter().enumerate() {
         let e: [half::f16; D_MODEL] = match kept_hit[ki] {
             Some(bits) => {
@@ -196,10 +187,10 @@ fn process_chunk_rest(
             }
             None => {
                 let e = miss_iter.next().expect("miss count mismatch");
-                if let Some(c) = ctx.emb_cache {
+                if ctx.emb_cache.is_some() {
                     let bits: [u16; D_MODEL] = std::array::from_fn(|k| e[k].to_bits());
                     let (chrom, pos) = &chunk[bi2];
-                    c.lock().unwrap().put(chrom, *pos as u32, &bits);
+                    wb.push((chrom.clone(), *pos as u32, bits));
                 }
                 e
             }
@@ -209,6 +200,11 @@ fn process_chunk_rest(
         let p = re_prob_ensemble(ctx.bundle, &emb.view(), &piles[bi2])
             .map_err(|e| format!("head: {e}"))?;
         final_probs[bi2] = Some(p);
+    }
+    if !wb.is_empty() {
+        if let Some(c) = ctx.emb_cache {
+            c.lock().unwrap().put_batch(wb);
+        }
     }
     let out: Vec<f64> = final_probs
         .into_iter()
@@ -225,7 +221,6 @@ fn process_chunk_rest(
 /// IndexedReader each. Results follow `sorted` order.
 fn pileup_all(
     bam: &Path,
-    baln: Option<&Path>,
     sorted: &[(String, i64)],
     threads: usize,
 ) -> Result<Vec<[f32; esperanto_pile::N_FEATURES]>> {
@@ -250,35 +245,6 @@ fn pileup_all(
         n => rayon::ThreadPoolBuilder::new().num_threads(n).build(),
     }
     .context("build pileup thread pool")?;
-    // Fast channel: `.baln` is uncompressed flat binary and pread-shareable —
-    // one file handle serves every group, no BGZF, no per-worker readers.
-    if let Some(baln) = baln {
-        // The coordinate index is built once per run and shared read-only;
-        // the file handle is pread-shared across group workers.
-        let bindex = esperanto_bamio::baln::BalnReader::build_index(baln)
-            .map_err(|e| anyhow!("baln index {}: {e}", baln.display()))?;
-        let bfile = std::fs::File::open(baln)?;
-        let per_group: Vec<Result<Vec<[f32; esperanto_pile::N_FEATURES]>, String>> = pool
-            .install(|| {
-                groups
-                    .par_iter()
-                    .map(|&(lo, hi)| {
-                        let refs: Vec<(&str, i64)> = sorted[lo..hi]
-                            .iter()
-                            .map(|(c, p)| (c.as_str(), *p))
-                            .collect();
-                        esperanto_pile::extract_pileup_features_batch_baln(&bindex, &bfile, &refs)
-                            .map_err(|e| format!("pileup group (baln): {e}"))
-                    })
-                    .collect()
-            });
-        let mut out = Vec::with_capacity(sorted.len());
-        for (gi, g) in per_group.into_iter().enumerate() {
-            let g = g.map_err(|e| anyhow!("pileup group {gi}: {e}"))?;
-            out.extend_from_slice(&g);
-        }
-        return Ok(out);
-    }
     let per_group: Vec<Result<Vec<[f32; esperanto_pile::N_FEATURES]>, String>> = pool.install(|| {
         groups
             .par_iter()
@@ -295,7 +261,7 @@ fn pileup_all(
                         .iter()
                         .map(|(c, p)| (c.as_str(), *p))
                         .collect();
-                    esperanto_pile::extract_pileup_features_batch(r, &refs)
+                    esperanto_pile::extract_pileup_features_batch(r, &refs, esperanto_pile::MIN_MAPQ)
                         .map_err(|e| format!("pileup group: {e}"))
                 },
             )
@@ -380,17 +346,10 @@ pub fn score_sites_batched(
     // Invoked at most once per call, only for `Auto` when a GPU is actually available
     // (the CLI's interactive once-per-process selector; `None` = never ask -> CPU).
     device_ask: Option<&(dyn Fn() -> bool + Send + Sync)>,
-    // Optional `.baln` fast channel for the pileup pass (falls back to BAM).
-    baln: Option<&Path>,
     // Species-guard mode (Guardrail for all standalone callers).
     reference_check: ReferenceCheck,
 ) -> Result<Vec<f64>> {
     let bundle = load_bundle(bundle).context("load bundle")?;
-    // The veto gate is mandatory for score (bundle contract; no switch, no fallback).
-    let gate = bundle
-        .gate
-        .as_ref()
-        .context("bundle missing the gate triple (required for score since v1.3)")?;
     let enc = Arc::new(CaduceusEncoder::load(caduceus).context("load caduceus")?);
     let batch = batch.max(1);
     // Window token length is decided by the bundle (v1.4.1: 2x250+2 = 502).
@@ -488,7 +447,6 @@ pub fn score_sites_batched(
 
     let ctx = ChunkCtx {
         bundle: &bundle,
-        gate,
         refmap: &refmap,
         half_window: bundle.half_window,
         tok_len,
@@ -500,7 +458,7 @@ pub fn score_sites_batched(
     // record set per site as the per-batch calls), so every BGZF region is
     // decompressed once per worker instead of once per 64-site batch.
     let tp = std::time::Instant::now();
-    let piles_all = pileup_all(bam, baln, &sorted, threads)?;
+    let piles_all = pileup_all(bam, &sorted, threads)?;
     eprintln!(
         "[score] pileup: {} sites, {:.1}s",
         sorted.len(),

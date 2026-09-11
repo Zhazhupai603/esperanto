@@ -62,18 +62,16 @@ pub struct RunParams {
     pub index: Option<PathBuf>,
     /// Reference FASTA (requires `<fasta>.fai`).
     pub fasta: PathBuf,
-    /// Optional GTF (junction library for map; annotation for scan).
+    /// Optional GTF (junction library for map; gene annotation for the report).
     pub gtf: Option<PathBuf>,
-    /// Optional gnomAD VCF for scan.
-    pub gnomad: Option<PathBuf>,
+    /// Optional known-SNP VCF; listed positions are removed from the candidates.
+    pub snp: Option<PathBuf>,
     /// score bundle root.
     pub bundle: PathBuf,
     /// Optional caduceus encoder path; defaults to bundle resolution.
     pub caduceus: Option<PathBuf>,
     /// Optional L1 engine bundle (`engine::L1Index::open`).
     pub l1_bundle: Option<PathBuf>,
-    /// Library strandedness (passed through to scan).
-    pub lib: esperanto_scan::LibType,
     /// Output root; stages write under `<out_dir>/<stage>/`.
     pub out_dir: PathBuf,
     /// Worker threads.
@@ -85,6 +83,11 @@ pub struct RunParams {
     /// Interactive auto-mode device ask (arrow-key selector at the CLI; invoked at most once,
     /// right before the first score batch; `None` = never ask -> CPU). Headless callers pass None.
     pub device_ask: Option<DeviceAsk>,
+    /// Also run the negative-control (A>C / T>G) collapsed-alphabet rescue
+    /// passes, count-only (`align_qc.json: rescue_control_verified`).
+    pub rescue_control: bool,
+    /// Stop after this stage (`--stop-after qc|map|sort|scan|verify|hyper|score|vcf`).
+    pub stop_after: Option<String>,
 }
 
 impl RunParams {

@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use clap::Args;
 use esperanto_flow::resume;
 use esperanto_flow::{DeviceAsk, RunParams};
-use esperanto_scan::LibType;
 use esperanto_score::pipeline::DeviceChoice;
 
 #[derive(Args)]
@@ -42,15 +41,10 @@ pub fn run(a: ResumeArgs) -> anyhow::Result<()> {
         index: doc.params.index.clone(),
         fasta: doc.params.fasta.clone(),
         gtf: doc.params.gtf.clone(),
-        gnomad: doc.params.gnomad.clone(),
+        snp: doc.params.snp.clone(),
         bundle: doc.params.bundle.clone(),
         caduceus: doc.params.caduceus.clone(),
         l1_bundle: doc.params.l1_bundle.clone(),
-        lib: if doc.params.lib == "stranded" {
-            LibType::Stranded
-        } else {
-            LibType::Unstranded
-        },
         out_dir: a.dir.clone(),
         threads: doc.params.threads,
         batch: doc.params.batch,
@@ -60,15 +54,20 @@ pub fn run(a: ResumeArgs) -> anyhow::Result<()> {
             _ => DeviceChoice::Auto,
         },
         device_ask: Some(DeviceAsk::new(crate::confirm::ask_use_gpu)),
+        // Frozen runs predate the control pass; a resumed run completes the
+        // pass set it started with.
+        rescue_control: false,
+        // run.json does not freeze --stop-after: it is a one-off inspection
+        // switch; `resume` always means "finish the run".
+        stop_after: None,
     };
     esperanto_flow::stages::preflight(&params, entry)?;
     // Lock before any artifact reads: a concurrent run must not race the walk.
     let _lock = resume::RunLock::acquire(&a.dir)?;
-let has_cpaidx = params
-        .index
-        .as_ref()
-        .is_some_and(|i| i.with_extension("cpaidx").is_file());
-    let start = resume::walk(&a.dir, entry, has_cpaidx, params.gtf.is_some());
+let has_rescue_index = params.index.as_ref().is_some_and(|i| {
+        i.with_extension("ag.paidx").is_file() || i.with_extension("tc.paidx").is_file()
+    });
+    let start = resume::walk(&a.dir, entry, has_rescue_index, params.gtf.is_some());
     let report_done = params.gtf.is_none() || {
         let sample = a
             .dir

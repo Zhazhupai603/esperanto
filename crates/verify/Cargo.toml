@@ -1,0 +1,12 @@
+[package]
+name = "esperanto-verify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+esperanto-map = { path = "../map" }
+esperanto-engine = { path = "../engine" }
+rust-htslib.workspace = true
+rayon.workspace = true
+thiserror.workspace = true

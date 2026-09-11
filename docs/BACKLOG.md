@@ -2,17 +2,13 @@
 
 Non-blocking enhancements tracked for future releases. Mainline correctness and evaluation gates take priority; every item below must be validated against reference data before landing.
 
-## Resume / run-state persistence
+## Stage selection
 
-Per-stage checkpointing with a persisted run state, so a failed run can resume from the last completed stage (`--resume`), plus stage selection flags (`--only`, `--stop-after`).
+Stage selection flags (`--only`, `--stop-after`) on top of the existing `resume` subcommand.
 
 ## Track-2 (jkmer) wiring in the pipeline
 
 The mapper's Track-2 junction k-mer index is currently not wired into `flow`; the transcriptome-first engine and 2-pass alignment are the primary paths. Wiring the jkmer index build and pipeline hook is deferred.
-
-## Precise VCF ALT allele inference
-
-The VCF currently reports a symbolic `<RE>` ALT. Inferring the exact alternate allele (e.g. A>G, T>C) requires per-strand allele counting from the pileup; deferred to a later release.
 
 ## Automatic sorting of user-provided BAMs
 
@@ -26,9 +22,9 @@ A YAML config layer with preset profiles (standard / strict / exploratory) and a
 
 A `build-ref` subcommand to produce the full reference bundle (paidx + transcript index + transcript map), and a `fetch-refs` subcommand to download and install a reference set. The `index` subcommand (paidx build) is already available.
 
-## `ui` / `web` / `report` / `bfq2fq` subcommands
+## `ui` / `web` / `bfq2fq` subcommands
 
-Optional TUI dashboard, web service, HTML report, and a `.bfq`→FASTQ conversion utility. The HTML report is planned for a later release alongside VCF refinements.
+Optional TUI dashboard, web service, and a `.bfq`→FASTQ conversion utility.
 
 ## `--keep-*` intermediate cleanup flags
 

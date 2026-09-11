@@ -90,15 +90,3 @@ let sum = (0..5)
 .sum::<Result<f64, ScoreError>>()?;
 Ok(sum / 5.0)
 }
-
-/// v1.3 veto-gate probability: 5-fold ensemble, zero embedding (isomorphic to the v02 pileup_only model step by step).
-pub fn gate_prob_ensemble(
-    gate: &crate::bundle::Gate,
-    pileup: &[f32; 9],
-) -> Result<f64, ScoreError> {
-    let zero = Array1::<f32>::zeros(CADUCEUS_DIM);
-    let sum = (0..5)
-        .map(|f| re_prob_fold(&gate.heads[f], &gate.norms[f], &zero.view(), pileup))
-        .sum::<Result<f64, ScoreError>>()?;
-    Ok(sum / 5.0)
-}

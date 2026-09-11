@@ -53,7 +53,7 @@ fn reg2bin(start: usize, end: usize) -> u16 {
 /// supported by this fast path (caller falls back to noodles RecordBuf).
 pub fn try_encode(buf: &mut Vec<u8>, rec: &OutRecord) -> Option<io::Result<()>> {
     // Name validity (mirrors noodles name::is_valid).
-    let name = rec.name.as_bytes();
+    let name = &rec.name;
     if !(1..=254).contains(&name.len()) || name == b"*" {
         return None;
     }
@@ -117,7 +117,7 @@ fn encode(buf: &mut Vec<u8>, rec: &OutRecord, n_cigar: usize) -> io::Result<()> 
     buf.extend_from_slice(&tlen.to_le_bytes());
 
     // --- read_name (NUL-terminated) ---
-    buf.extend_from_slice(rec.name.as_bytes());
+    buf.extend_from_slice(&rec.name);
     buf.push(0);
 
     // --- cigar ops (u32 LE, kind | len<<4) ---

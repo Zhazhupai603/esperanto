@@ -123,6 +123,159 @@ feature lets the model recognize these sites directly; retraining on
 retrained — its threshold is low enough that hyperedited sites pass
 through, so its 8-dim weights are zero-padded to 9 dims.
 
+## Candidate convention (2026-09-04)
+
+Candidate discovery follows the REDItools counting convention: reads with
+MAPQ >= 20, bases with Phred >= 30, no read-orientation split, coverage
+>= 10, >= 2 reads carrying the editing-consistent alternate (G at a
+reference A, C at a reference T), frequency >= 1%. On the same BAM the
+resulting table is identical to REDItools `analyze -q 20 -bq 30` under the
+same rule (89,837 sites on the validation sample, every depth and base
+count equal). Motivation: the previous caller counted MAPQ 0 reads, split
+evidence by read orientation (which discards half of it for unstranded
+libraries and zeroes low-frequency sites whose variant reads all fall in
+one orientation), ranked with a logistic score whose threshold arm let
+non-editing substitutions through, and lost exactly-two-read sites to a
+decimal-rounding artifact in the downstream filter. The transcript strand
+of an A-to-I site is implied by its reference base (A → plus, T → minus)
+and is no longer inferred from junctions or annotation. The scoring
+pileup uses the same MAPQ gate, so the model sees the reads the scan
+counted.
+
+Known SNPs (dbSNP common) are removed from the candidates before scoring
+when a SNP VCF is present; the retrained model rejects most homozygous
+sites on its own but heterozygous common SNPs in the editing direction
+remained the main source of high-VAF false positives.
+
+The pileup-only veto gate was removed from scoring: it skipped the encoder
+for 3.6% of real candidates at the cost of a second head set in the
+bundle and a zero-padding shim, and every site now takes the full model
+path.
+
+## Strand consistency, neither level (2026-09-05)
+
+A-to-I editing on a single transcript is single-stranded. Seen against the
+forward genome, a plus-strand transcript's edits are only ref A / read G and
+a minus-strand transcript's only ref T / read C. Two consequences were
+implemented and measured; neither survived, and the site-level one taught
+the more useful lesson.
+
+**Site level (implemented, then dropped).** A candidate whose
+one-read-length neighbourhood held both directions was dropped together
+with the opposite-direction neighbours that made it mixed. On the simulated
+corpus this cut false candidates 905 -> 172, FDR 3.84% -> 0.76%, for 292
+true sites (1.9% of hyper-edited ones), and the same filter on a STAR BAM
+moved 0.43% -> 0.27% FDR at no cost to hyper-edited sites — which was read
+as evidence that it was not compensating for this aligner.
+
+Real data falsified that reading. It removed 313,136 esperanto candidates
+(80.3%) against 13,609 of STAR's (17.5%), and kept 41.78% of esperanto's
+REDIportal calls against 83.31% of STAR's. A filter that costs one aligner
+half its real calls and the other a sixth is compensating for the first
+one. The filter is gone (`esperanto_scan::strand`,
+`BlockAcc::max_read_len` and `CallStats::strand_conflict` with it).
+
+The cause was first diagnosed as alignment exempting ref-A/read-G and
+ref-T/read-C *simultaneously*, letting a mis-placed read carry tolerated
+substitutions in both directions at once, so that much of the mixing the
+filter detected was manufactured. **That diagnosis is retracted.** With
+strict four-letter Tier-1 alignment, one direction per rescue index, and
+`min(ea_ag, ea_tc)` charged against `identity`, the same filter re-measured
+post-hoc on the new architecture's real-data candidates removes 80.6% of
+them against STAR's unchanged 17.5% (`mapbench/report-esp-final-20260907.md`,
+task 3) — the asymmetry is intact to within 0.3 pp of the old aligner's
+80.3%. Removing the simultaneous exemption changed nothing, so it was not
+the source. The mixing the filter detects is real and its origin is
+elsewhere; the mechanism is open.
+
+A second candidate cause was raised by the same run, measured, rejected —
+and then the rejection was itself retracted on re-measurement. On chr1,
+403,659 gate-passing reads exceed a 1%-of-aligned-length mismatch ceiling;
+94.8% sit at exactly MAPQ 60 and 53.5% carry no editing exemption, and the
+divergence ceiling in `mapq::mapq_of` exempted them by construction
+through a `q < 60` guard. That looked like a hole. The first measurement
+said it was not: the `(q = 60, over ceiling, ea = 0)` population is
+275,049 reads of which 732 are mis-placed — 0.27%, the same rate as the
+whole gate-passing population — so capping it would discard 274,317
+correct reads to remove 732 wrong ones.
+
+That measurement was taken at the wrong threshold, and threshold choice
+was its whole content. A ceiling of 1% of read length is 1.5
+substitutions on a 150 bp read, inside sequencing-error range, so the
+population it selected was about a hundredfold larger than the one the
+gate acts on and correspondingly diluted. Re-measured at the gate's own
+threshold (`mapbench/ceil60.py --ceiling 0.05`): gate-passing reads at
+exactly MAPQ 60 whose unexplained density reaches
+`HYPEREDIT_MIN_DENSITY` are 676 mis-placed of 1,592 — **42.5%**. MAPQ 60
+asserts an error rate of 1e-6; 42.5% is MAPQ 4. The guard is gone, and
+the gate now runs in `mapq_of` after both MAPQ paths converge rather than
+inside the genomic formula's tail — 54.5% of the real sample's
+gate-passing over-dense reads carry `mapq_src=l1` and every one sat at 60,
+so a gate on the formula's own output reached under half the population it
+is for. Hyperediting is unaffected by construction: `unexplained` charges
+`min(ea_ag, ea_tc)`, zero for a single-direction read however densely
+edited. Real-sample effect, chr1: candidates 413,854 -> 116,978, and the
+esperanto-only partition's REDIportal enrichment goes from 3.99% — below
+its own 5.46% displaced control, i.e. no evidence of editing — to 10.21%
+against the same control, 1.87x.
+
+The measurement carries a second, larger consequence. The simulated corpus
+cannot discriminate here, because it is built from annotated transcripts
+and therefore contains no read whose true locus is absent from the
+reference — no rRNA, no contamination, no unassembled or unannotated
+sequence. Real data does. A read from an absent locus places on its
+nearest paralogue with no competitor, which is exactly the input for which
+MAPQ 60 is wrong and exactly the input the corpus omits. That matches the
+read-level finding below (these reads fail because the true locus is not
+in the candidate list) and it explains why a site-level win of 3.8x on
+simulated hyper-edited sites coexists with real-data candidates carrying
+no enrichment over their own size-matched control. Specificity on real
+data is therefore not a scoring problem and is not measurable on this
+corpus; both the mechanism and the corpus are open.
+
+**Read level (rejected).** Ranking competing placements one direction at a
+time was implemented and reverted. The premise holds — single-direction
+placements are 0.27% mis-placed against 15.98% for those with two
+minority-direction exemptions and 74.15% for three or more — but the
+affected population is 5,903 of 215,418 ambiguous reads and re-ranking left
+it unchanged (`mapbench/eadir.log` vs `eadir7.log`). These reads fail
+because the true locus is absent from the candidate list, not because it
+was out-ranked; no scoring change can fix that. Only the single definition
+of the exemption (`extend::EditDir` / `exempt_dir`, replacing four
+hardcoded copies of the base test) was kept.
+
+An earlier claim that the read-level split addressed the root cause of the
+215k ambiguous population was wrong and is retracted: direction mixing
+accounts for 8.4% of that population's errors, and 58% of them come from
+reads carrying no exemptions at all.
+
+## MAPQ floor for uncontested placements (2026-09-05)
+
+`mapq = 60 x (1 - second/best) x min(1, n_anchors/10)` holds a placement
+below the downstream pileup gate whenever the read yielded few anchors,
+even when nothing competes with it in either scoring domain. Such
+placements are now floored at MAPQ 20 provided their editing-aware
+substitutions are single-directional.
+
+Both halves of the condition are derived rather than fitted. 20 is
+`-10*log10(0.01)`, the error rate the pileup gate already assumes, so the
+floor claims no more accuracy than the gate requires; the admitted
+population measures 0.844% wrong, i.e. honest MAPQ 20.7. Direction-mixing
+is the exclusion because a placement carrying both exempt directions is a
+paralogous locus rather than an edited transcript, and those reads measure
+18.9-98.5% wrong. An `ea <= 5` magnitude cutoff was considered and rejected:
+it would admit 922 more reads at the price of a tuned number.
+
+The floor is not a waiver of the anchor divisor. Waiving it would yield
+MAPQ 60 — a claimed error rate of 1e-6 for a population measured at
+0.844% — which the honest-MAPQ criterion forbids.
+
+Measured: MAPQ >= 20 read coverage 90.56% -> 91.87% at 0.216% -> 0.226%
+error; +223 true edited sites (151 hyper-edited) for +4 false ones. With
+the site filter in place the hyper-edited yield (5,753) exceeds the
+unfiltered baseline (5,709), so the two changes together cost no
+hyper-editing sensitivity and cut FDR five-fold.
+
 ## Pending decisions
 
 Deferred until wet-lab / further data is available:

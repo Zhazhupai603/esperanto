@@ -25,7 +25,7 @@ This spec is the single source of truth. The legacy research tree is a read-only
 | chain | ChainParams::rna_default | max_gap=1_000_000, min_chain_score=40, k=15, rna=true, min_intron=20, intron_penalty=8 |
 | chain | TOP_CANDIDATES (decisive-round candidate cap) | 24 |
 | extend | ExtendParams | match=2, mismatch=−4, gap_open=4, gap_ext=2 |
-| extend | production editing_aware | true (explicitly enabled by align-prod) |
+| extend | production edit_dir | `EditDir::Off` (Tier 1 is strict; the exemption belongs to the Tier-2 rescue's reduced alphabets) |
 | extend | acceptance threshold | aligned segment ≥85% perfect (perfect = full-score bases within M) |
 | extend | banded initial width | 30, doubled on failure up to the full band |
 | align | coverage gate | 0.7 (aligned fraction of the read below this ⇒ None) |
@@ -46,8 +46,11 @@ This spec is the single source of truth. The legacy research tree is a read-only
 | split/span | tail extension acceptance | `aligned ≥ tail_len*4/5 and score>0` |
 | span | donor range | `(aln.pos+2, ref_end−1)`, candidates in ascending start order, first success returns |
 | span | micro tail | <4bp full match accepted directly; ≥4bp goes through extension |
-| mapq | formula | `round(60 × (1 − s2/s1) × min(1, n_anchors/10))`; chain_score≤0 ⇒ 0 |
-| pair | proper-pair span cap | 1000 |
+| mapq | formula | minimap2 `mm_set_mapq2`: `identity × pen_cm × 40 × (1 − x²) × ln(score/2)`; score≤0 ⇒ 0; clamp 0..=60 |
+| mapq | Q_COEF / MATCH_SCORE | 40 / 2 |
+| mapq | PILEUP_GATE (rescued & L1 ceiling) | 20 = `-10·log10(0.01)`, the error rate the gate assumes |
+| mapq | HYPEREDIT_MIN_DENSITY / MAX_NON_EDIT_MM | 0.05 (8 substitutions on a 150bp read) / 2 |
+| pair | proper-pair span cap | 1000 (transcript span: genomic span minus intronic N skips) |
 | pair | InsertStats | count/sum/sum_sq (f64), push takes \|tlen\|, stdev = population standard deviation `sqrt(E[x²]−m²)` (max 0) |
 | pipeline | CHUNK (streaming block) | 100_000 reads |
 | pipeline | 2-pass filter | support≥2 and mean MAPQ≥20 (mqsum ≥ c×20) and span ≤500_000 |
@@ -95,7 +98,8 @@ pub struct ReadAlignment {             // all field semantics frozen
     pub cigar: Vec<CigarOp>,
     pub n_anchors: usize,              // number of chain anchors
     pub junctions: Vec<RefinedJunction>, // empty = non-spliced
-    pub ea_count: u32,                 // number of editing-aware tolerated A>G/T>C (EA tag)
+    pub ea_ag: u32, pub ea_tc: u32,    // editing-aware tolerated substitutions, split by
+                                       // implied transcript strand; ea_count() = their sum (EA tag)
     pub mm_count: u32,                 // ordinary mismatch count (EK mm)
     pub n_seeds: usize,                // seed count (EK seeds)
     pub rescued: bool,                 // rescue/re-seed/Track2 (RE tag)
@@ -164,7 +168,7 @@ positions ×u64
 
 ## extend — Gotoh Banded DP (editing-aware)
 
-- `ExtendParams` (see parameter table); when `editing_aware=true`, substitution goes through **SubstLut 5×5**: read relative to reference (plus-strand coordinates) A>G / T>C penalized 0 (A>I editing not penalized), all other mismatches = −4.
+- `ExtendParams` (see parameter table). `edit_dir: EditDir` selects which A-to-I substitution scores 0 — `Off` (neither, the production Tier-1 setting), `Ag` (ref A / read G, plus-strand transcript) or `Tc` (ref T / read C, minus-strand). One direction at a time, never both: a placement free to take both is free to match a paralogue. `EditDir::exempt` and `exempt_dir(ref_b, read_b)` are the single definition of the exemption — every scoring and counting path routes through them, so the rule cannot drift. All other mismatches = −4.
 - `Extension{read_start, read_end, ref_start, cigar, score}`; unaligned parts at both read ends are written as SoftClip (end-trimmed, conserved: the M/I/S consumption of the CIGAR equals exactly the read length).
 - `extend(read, ref_window, params, buf)` full window; `extend_hint(read, ref_window, params, buf, DiagHint{offset,num,den})` banded along a diagonal hint.
 - The band schedule has **two tiers** `[30, usize::MAX]` (not doubling): the first tier has half-bandwidth 30; **tier-upgrade gate**: `ext.score*20 < perfect*17` (perfect = read_len × match_score; i.e., score < 85% of perfect) ⇒ second tier recomputes the full matrix; the second-tier result is returned unconditionally. band ≥ ref_window.len() counts as already full-matrix and is accepted directly.
@@ -186,15 +190,51 @@ positions ×u64
 
 ## mapq — Mapping Quality
 
+minimap2's alignment-stage function (`mm_set_mapq2`, `hit.c`), short-read
+spliced case:
+
 ```
-mapq = round( 60 × (1 − second/best) × min(1, n_anchors/10) )
-best ≤ 0 ⇒ 0; second=0 ⇒ factor 1.
+mapq   = identity × pen_cm × 40 × (1 − x²) × ln(score / 2)
+pen_cm = min(pen_s1, if n_anchors > 10 { 1 } else { 0.1 × n_anchors })
+pen_s1 = if score > 100 { 1 } else { 0.01 × score }
+x      = second / best            (extension pair; (1 − x) on the chain pair)
+score ≤ 0 ⇒ 0; q ≤ 0 but second < best ⇒ 1; otherwise clamped to 0..=60.
 ```
-- Inputs come from ReadAlignment{chain_score, second_chain_score, n_anchors}; **Track 2 synthetic records also go through this same formula** (see the pipeline::try_track2 note).
+- `margin(aln)` picks the best/second pair and names it for the EK tag:
+  `ext_margin` when `second_score > 0`, else `chain_margin` when
+  `second_chain_score > 0`, else `unique`; `l1` when `mapq_override` is set.
+  The pair must come from one domain — a chain score is anchor-covered span
+  and an extension score is read length, so dividing one by the other
+  produced ratios below zero. The extension pair is preferred because
+  minimap2 takes the same branch for short spliced reads.
+- `uniq_ratio` and `− 4.343 ln(n_sub + 1)` are absent: esperanto tracks
+  neither the read's repeat-covered length nor a count of sub-optimal
+  placements. Both would only lower MAPQ; `(1 − x²)` is what guards repeats.
+- **Editing enters through `identity`**, not as an exemption from scrutiny.
+  `identity = (matches − mm_count − min(ea_ag, ea_tc)) / aligned_columns`:
+  one transcript is edited in one direction only, so the minor editing
+  direction is divergence editing cannot explain and is charged like an
+  ordinary mismatch, while the major direction is free.
+- **Divergence ceiling**: a placement scored below 60 whose
+  `unexplained_density = (mm_count + min(ea_ag, ea_tc)) / aligned_columns`
+  reaches `HYPEREDIT_MIN_DENSITY` is capped at `PILEUP_GATE − 1 = 19`. Both
+  halves are load-bearing: such reads are 97.4% mis-placed below 60 but only
+  32% mis-placed at 60, where the read has no competitor and so nowhere else
+  to go. Gating on density alone would discard 1,940 correct placements.
+- **`mapq_override`** carries a MAPQ decided by a layer that does not produce
+  these inputs (the L1 transcriptome engine finalises its own from cluster
+  competition) or by caller-side policy (`force_mapq0`). It must be set
+  explicitly rather than encoded into `chain_score`/`n_anchors`/`second_*`,
+  which made the other layer's quality a function of this formula's shape.
+- **Rescued and L1-sourced placements are capped at `PILEUP_GATE = 20`**:
+  won on evidence outside their own seeds, they may enter the pileup but must
+  not outrank a directly seeded placement. 20 is `-10·log10(0.01)`, the error
+  rate the gate itself assumes, which is what makes it derived rather than
+  tuned.
 
 ## pair — PE Relation and Insert Statistics
 
-- `PairRelation`; `relate(r1, r2)`: R1 on the left and Plus, R2 on the right and Minus, span ≤1000 ⇒ proper pair.
+- `PairRelation`; `relate(r1, r2)`: same contig, mates on opposite strands (FR or RF; same-strand pairs are discordant), transcript span ≤1000 ⇒ proper pair. `transcript_span` = reference span from the leftmost start to the rightmost end minus the intronic RefSkip (N) intervals of both mates inside that span, so spliced mates adjacent on the transcript stay proper. `template_length` uses the same span, signed from R1's viewpoint.
 - `template_length`: signed, from R1's perspective (left end positive, right end negative).
 - `ref_end(aln)`: advanced by CIGAR M/D/N.
 - `InsertStats{count, sum, sum_sq}`: push takes |tlen|; mean/stdev per the parameter table (population standard deviation).
@@ -246,7 +286,7 @@ best ≤ 0 ⇒ 0; second=0 ⇒ factor 1.
 
 ## align — Single-Read Main Flow (order frozen)
 
-- `AlignConfig{seed:SeedParams, chain:ChainParams, extend:ExtendParams, rna:bool}`; `rna_default()` = k15/w5 + chain rna + extend defaults + rna=true; production additionally sets `extend.editing_aware=true` explicitly.
+- `AlignConfig{seed:SeedParams, chain:ChainParams, extend:ExtendParams, rna:bool}`; `rna_default()` = k15/w5 + chain rna + extend defaults + rna=true, and production takes it unchanged: `ExtendParams::default()` carries `edit_dir: EditDir::Off`, so Tier 1 is strict. The Tier-2 rescue is the only caller that sets a direction.
 - `Aligner::new(&Index, AlignConfig)`; `align_read(read: &[u8]) -> Option<ReadAlignment>`. Flow (any stage succeeding returns immediately, failures fall through in order):
 
 1. **L1 transcriptome fast path** (only when `l1: Option<Arc<L1Runtime>>` is provided): call engine::align_read; on successful placement, wrap into a ReadAlignment via the **conservativeness guard** (CIGAR conservative validation) and chain_score reverse-engineering (MAPQ compatibility); on `Fallback`/validation failure, fall to the genomic path.

@@ -81,7 +81,8 @@ pub struct AlnView {
 /// A record to write out (single SE record or one end of a PE pair).
 #[derive(Clone, Debug)]
 pub struct OutRecord {
-    pub name: String,
+    /// Read name, raw bytes end-to-end (FASTQ names need not be UTF-8).
+    pub name: Vec<u8>,
     pub flag: u16,
     /// ≤60; unmapped records encode as 255 (BAM convention).
     pub mapq: u8,
@@ -192,8 +193,9 @@ pub fn write_record_slow<W: IoWrite>(
     header: &Header,
     rec: &OutRecord,
 ) -> io::Result<()> {
+    let name = String::from_utf8_lossy(&rec.name);
     let mut rb = RecordBuf::builder()
-        .set_name(rec.name.as_str())
+        .set_name(name.as_ref())
         .set_flags(noodles::sam::alignment::record::Flags::from(rec.flag))
         .set_sequence(rec.seq.clone().into())
         .set_quality_scores(rec.qual.clone().into());

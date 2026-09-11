@@ -750,7 +750,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-bamio"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "noodles",
  "noodles-bgzf",
@@ -760,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-cli"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -774,6 +774,7 @@ dependencies = [
  "esperanto-scan",
  "esperanto-score",
  "esperanto-tidx",
+ "esperanto-verify",
  "flate2",
  "rust-htslib",
  "tar",
@@ -782,7 +783,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-engine"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "esperanto-tidx",
  "esperanto-txmap",
@@ -792,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-flow"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "esperanto-bamio",
@@ -802,6 +803,7 @@ dependencies = [
  "esperanto-report",
  "esperanto-scan",
  "esperanto-score",
+ "esperanto-verify",
  "flate2",
  "rayon",
  "rust-htslib",
@@ -812,11 +814,12 @@ dependencies = [
 
 [[package]]
 name = "esperanto-map"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "bytemuck",
  "esperanto-bamio",
  "esperanto-engine",
+ "esperanto-tidx",
  "flate2",
  "memmap2",
  "noodles",
@@ -830,16 +833,16 @@ dependencies = [
 
 [[package]]
 name = "esperanto-pile"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
- "esperanto-bamio",
+ "esperanto-scan",
  "rust-htslib",
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "esperanto-qc"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "flate2",
  "rayon",
@@ -850,7 +853,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-report"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "serde",
@@ -859,20 +862,17 @@ dependencies = [
 
 [[package]]
 name = "esperanto-scan"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
- "esperanto-bamio",
  "flate2",
  "rayon",
  "rust-htslib",
- "serde",
- "serde_json",
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "esperanto-score"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -891,7 +891,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-tidx"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "blake3",
  "rayon",
@@ -900,9 +900,20 @@ dependencies = [
 
 [[package]]
 name = "esperanto-txmap"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "blake3",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "esperanto-verify"
+version = "1.0.5"
+dependencies = [
+ "esperanto-engine",
+ "esperanto-map",
+ "rayon",
+ "rust-htslib",
  "thiserror 2.0.20",
 ]
 

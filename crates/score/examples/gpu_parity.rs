@@ -97,7 +97,7 @@ fn main() -> Result<()> {
     // ---- pileup features for the shared head (production pile path) ----
     let mut bam = rust_htslib::bam::IndexedReader::from_path(&bam_path).context("open bam")?;
     let refs: Vec<(&str, i64)> = sites.iter().map(|(c, p)| (c.as_str(), *p)).collect();
-    let piles = esperanto_pile::extract_pileup_features_batch(&mut bam, &refs)
+    let piles = esperanto_pile::extract_pileup_features_batch(&mut bam, &refs, esperanto_pile::MIN_MAPQ)
         .map_err(|e| anyhow!("pileup: {e}"))
         .context("pileup batch")?;
 

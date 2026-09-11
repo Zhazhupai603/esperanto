@@ -41,16 +41,15 @@ pub struct ParamsJson {
     pub fasta: PathBuf,
     /// Optional GTF.
     pub gtf: Option<PathBuf>,
-    /// Optional gnomAD VCF.
-    pub gnomad: Option<PathBuf>,
+    /// Optional known-SNP VCF.
+    #[serde(default, alias = "gnomad")]
+    pub snp: Option<PathBuf>,
     /// score bundle root.
     pub bundle: PathBuf,
     /// Optional caduceus encoder dir.
     pub caduceus: Option<PathBuf>,
     /// Optional L1 engine bundle.
     pub l1_bundle: Option<PathBuf>,
-    /// Library strandedness ("unstranded" | "stranded").
-    pub lib: String,
     /// Worker threads.
     pub threads: usize,
     /// score batch size.
@@ -139,14 +138,10 @@ pub fn write_run_json(dir: &Path, sample: &str, params: &RunParams) -> Result<()
             index: params.index.clone(),
             fasta: params.fasta.clone(),
             gtf: params.gtf.clone(),
-            gnomad: params.gnomad.clone(),
+            snp: params.snp.clone(),
             bundle: params.bundle.clone(),
             caduceus: params.caduceus.clone(),
             l1_bundle: params.l1_bundle.clone(),
-            lib: match params.lib {
-                esperanto_scan::LibType::Stranded => "stranded".to_string(),
-                esperanto_scan::LibType::Unstranded => "unstranded".to_string(),
-            },
             threads: params.threads,
             batch: params.batch,
             device: match params.device {
@@ -246,6 +241,10 @@ pub enum Stage {
     Sort,
     /// scan + candidate filter (one artifact, one stage).
     Scan,
+    /// supporting-read re-alignment (scan/candidates.verified.bed).
+    Verify,
+    /// hyperedited-region caller over map/rescued.tsv (hyper/regions.bed).
+    Hyper,
     /// score.
     Score,
     /// vcf.
@@ -255,6 +254,21 @@ pub enum Stage {
 }
 
 impl Stage {
+    /// Parse a `--stop-after` stage name (qc|map|sort|scan|verify|hyper|score|vcf).
+    pub fn parse(s: &str) -> Option<Stage> {
+        Some(match s {
+            "qc" => Stage::Qc,
+            "map" => Stage::Map,
+            "sort" => Stage::Sort,
+            "scan" => Stage::Scan,
+            "verify" => Stage::Verify,
+            "hyper" => Stage::Hyper,
+            "score" => Stage::Score,
+            "vcf" => Stage::Vcf,
+            _ => return None,
+        })
+    }
+
     /// First stage executed for an entry type.
     pub fn first_for(entry: Entry) -> Stage {
         match entry {
@@ -272,6 +286,8 @@ impl Stage {
             Stage::Rescue => "rescue",
             Stage::Sort => "sort",
             Stage::Scan => "scan",
+            Stage::Verify => "verify",
+            Stage::Hyper => "hyper",
             Stage::Score => "score",
             Stage::Vcf => "vcf",
             Stage::Report => "report",
@@ -377,8 +393,8 @@ serde_json::from_str::<serde_json::Value>(&t)
 
 /// Map-stage three-state check: done / only the rescue is pending / rerun.
 /// The seal is raw.bam + align_qc.json + unmapped.fq.gz + align.baln intact;
-/// `has_cpaidx` decides whether the rescue is expected at all.
-fn map_state(out_dir: &Path, has_cpaidx: bool) -> Stage {
+/// `has_rescue_index` decides whether the rescue is expected at all.
+fn map_state(out_dir: &Path, has_rescue_index: bool) -> Stage {
     let map_dir = out_dir.join("map");
     let seal = valid_bgzf(&map_dir.join("raw.bam"))
         && valid_json(&map_dir.join("align_qc.json"))
@@ -387,7 +403,7 @@ fn map_state(out_dir: &Path, has_cpaidx: bool) -> Stage {
     if !seal {
         return Stage::Map;
     }
-    if has_cpaidx && !rescue_recorded(&map_dir) {
+    if has_rescue_index && !rescue_recorded(&map_dir) {
         return Stage::Rescue;
     }
     Stage::Sort
@@ -424,7 +440,7 @@ fn valid_report(out_dir: &Path) -> bool {
 
 /// Walk qc → report and return the first stage whose artifacts fail
 /// validation; `Report` when everything is intact.
-pub fn walk(out_dir: &Path, entry: Entry, has_cpaidx: bool, has_gtf: bool) -> Stage {
+pub fn walk(out_dir: &Path, entry: Entry, has_rescue_index: bool, has_gtf: bool) -> Stage {
     let first = Stage::first_for(entry);
     if first <= Stage::Qc {
         let qc_dir = out_dir.join("qc");
@@ -441,7 +457,7 @@ pub fn walk(out_dir: &Path, entry: Entry, has_cpaidx: bool, has_gtf: bool) -> St
         }
     }
     if first <= Stage::Map {
-        let st = map_state(out_dir, has_cpaidx);
+        let st = map_state(out_dir, has_rescue_index);
         if st != Stage::Sort {
             return st;
         }
@@ -456,6 +472,17 @@ pub fn walk(out_dir: &Path, entry: Entry, has_cpaidx: bool, has_gtf: bool) -> St
     }
     if first <= Stage::Scan && !valid_bed(&out_dir.join("scan").join("candidates.bed")) {
         return Stage::Scan;
+    }
+    if first <= Stage::Verify
+        && !valid_nonempty(&out_dir.join("scan").join("candidates.verified.bed"))
+    {
+        return Stage::Verify;
+    }
+    if first <= Stage::Hyper
+        && out_dir.join("map").join("rescued.tsv").is_file()
+        && !valid_bed(&out_dir.join("hyper").join("regions.bed"))
+    {
+        return Stage::Hyper;
     }
     if first <= Stage::Score && !valid_scores(&out_dir.join("score").join("scores.tsv")) {
         return Stage::Score;
@@ -585,6 +612,8 @@ mod tests {
         let scan = root.join("scan");
         fs::create_dir_all(&scan).unwrap();
         fs::write(scan.join("candidates.bed"), "chr1\t0\t100\t+\tx\ty\t10\tz\n").unwrap();
+        fs::write(scan.join("candidates.verified.bed"), "chr1\t0\t100\tA\t10\t0\t0\t2\t0\t0.2\t\t2\t0\n")
+            .unwrap();
         let score = root.join("score");
         fs::create_dir_all(&score).unwrap();
         fs::write(score.join("scores.tsv"), "chr1\t100\t0.9\n").unwrap();
@@ -702,17 +731,18 @@ mod tests {
             index: Some(d.join("ref.paidx")),
             fasta: d.join("ref.fa"),
             gtf: None,
-            gnomad: None,
+            snp: None,
             bundle: d.join("bundle"),
             caduceus: None,
             l1_bundle: None,
-            lib: esperanto_scan::LibType::Unstranded,
             out_dir: d.clone(),
             threads: 4,
             batch: 64,
             device: esperanto_score::pipeline::DeviceChoice::Auto,
             device_ask: None,
-        };
+                rescue_control: false,
+        stop_after: None,
+    };
         write_run_json(&d, "s1", &params).unwrap();
         let doc = read_run_json(&d).unwrap();
         assert_eq!(doc.sample, "s1");
