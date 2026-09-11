@@ -1,17 +1,18 @@
-# pile — 8-Dimensional Pileup Feature Extraction
+# pile — 9-Dimensional Pileup Feature Extraction
 
-Extracts 8-dimensional pileup features at given sites from a BAM. Semantics = an exact replica of the **pysam pileup(stepper="nofilter") default behavior** (feature_spec.json v1), including two hidden htslib stages: the PE overlap quality tweak and the maxcnt=8000 cap. This is model input; values must match the reference implementation bit-for-bit (rtol=0).
+Extracts 9-dimensional pileup features at given sites from a BAM. Semantics = an exact replica of the **pysam pileup(stepper="nofilter") default behavior** (feature_spec.json v1), including two hidden htslib stages: the PE overlap quality tweak and the maxcnt=8000 cap. This is model input; values must match the reference implementation bit-for-bit (rtol=0).
 
 ## Feature Definition
 
-`[depth, A_count, C_count, G_count, T_count, mean_base_quality, strand_bias, mean_mapq]`
+`[depth, A_count, C_count, G_count, T_count, mean_base_quality, strand_bias, mean_mapq, hyperedited]`
 
 - depth = number of reads at the site column whose query_position is valid (CIGAR falls on M/=/X) and whose (possibly tweaked) quality is ≥13
 - A/C/G/T_count = base counts of these reads at qpos (both upper- and lowercase counted); **N and other non-ACGT characters do not enter the four buckets, but do count toward depth/mean qualities/strand/MAPQ** (audit fix: the initial spec incorrectly stated N does not count toward depth; both the legacy version and pysam count it)
 - mean_base_quality = mean phred at qpos (**f32 single-precision division**, bit-identical to the legacy version; missing qualities handled per the rules below)
 - strand_bias = fraction of forward-strand reads (forward / depth)
 - mean_mapq = mean MAPQ
-- depth==0 → all-zero vector
+- hyperedited = 1.0 if any collapsed-rescue (RE:Z:collapsed) read covers the site, else 0.0
+- depth==0 → all-zero vector except hyperedited, which stays 1.0 when a collapsed read covers the site
 
 ## Constants
 

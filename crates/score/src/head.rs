@@ -10,7 +10,7 @@ pub const PILEUP_HIDDEN: usize = 32;
 pub const HEAD_HIDDEN: usize = 128;
 
 pub struct FoldHead {
-    pe0_w: Array2<f32>, pe0_b: Array1<f32>, // (32,8) (32,)
+    pe0_w: Array2<f32>, pe0_b: Array1<f32>, // (32,9) (32,)
     pe2_w: Array2<f32>, pe2_b: Array1<f32>, // (32,32)
     h0_w: Array2<f32>, h0_b: Array1<f32>,   // (128,150)
     h2_w: Array2<f32>, h2_b: Array1<f32>,   // (2,128)
@@ -19,7 +19,7 @@ pub struct FoldHead {
 impl FoldHead {
     pub fn from_tensors(st: &safetensors::SafeTensors) -> Result<Self, ScoreError> {
         Ok(Self {
-            pe0_w: take_matrix(st, "pileup_encoder.net.0.weight", 32, 8)?,
+            pe0_w: take_matrix(st, "pileup_encoder.net.0.weight", 32, 9)?,
             pe0_b: take_vector(st, "pileup_encoder.net.0.bias", 32)?,
             pe2_w: take_matrix(st, "pileup_encoder.net.2.weight", 32, 32)?,
             pe2_b: take_vector(st, "pileup_encoder.net.2.bias", 32)?,
@@ -35,14 +35,14 @@ fn relu(v: &mut Array1<f32>) {
     v.mapv_inplace(|x| if x > 0.0 { x } else { 0.0 });
 }
 
-/// Single-fold RE_PROB. pileup is the raw 8-dim feature (z-score applied internally).
+/// Single-fold RE_PROB. pileup is the raw 9-dim feature (z-score applied internally).
 /// Returns ScoreError when emb length is not CADUCEUS_DIM (was a debug_assert, ineffective in
 /// release; promoted to a hard error, effective in all build modes).
 pub fn re_prob_fold(
     head: &FoldHead,
     norm: &NormStats,
     emb: &ArrayView1<f32>,
-    pileup: &[f32; 8],
+    pileup: &[f32; 9],
 ) -> Result<f64, ScoreError> {
     if emb.len() != CADUCEUS_DIM {
         return Err(ScoreError::Shape {
@@ -53,7 +53,7 @@ pub fn re_prob_fold(
     }
 
     // per-fold z-score (feature_spec normalization)
-    let z: Vec<f32> = (0..8)
+    let z: Vec<f32> = (0..9)
         .map(|i| ((pileup[i] as f64 - norm.mean[i]) / norm.std[i]) as f32)
         .collect();
     let z = Array1::from_vec(z);
@@ -83,7 +83,7 @@ pub fn re_prob_fold(
 pub fn re_prob_ensemble(
 bundle: &crate::bundle::Bundle,
 emb: &ArrayView1<f32>,
-pileup: &[f32; 8],
+pileup: &[f32; 9],
 ) -> Result<f64, ScoreError> {
 let sum = (0..5)
 .map(|f| re_prob_fold(&bundle.heads[f], &bundle.norms[f], emb, pileup))
@@ -94,7 +94,7 @@ Ok(sum / 5.0)
 /// v1.3 veto-gate probability: 5-fold ensemble, zero embedding (isomorphic to the v02 pileup_only model step by step).
 pub fn gate_prob_ensemble(
     gate: &crate::bundle::Gate,
-    pileup: &[f32; 8],
+    pileup: &[f32; 9],
 ) -> Result<f64, ScoreError> {
     let zero = Array1::<f32>::zeros(CADUCEUS_DIM);
     let sum = (0..5)

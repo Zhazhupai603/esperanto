@@ -30,7 +30,7 @@ fn median(v: &mut [f64]) -> f64 {
 fn main() -> Result<()> {
     let home = std::env::var("HOME").context("HOME")?;
     let bundle_dir = PathBuf::from(home)
-        .join(".local/share/esperanto/bundle/human/esperanto-model-v1.4.1-501_40ep/rust");
+        .join(".local/share/esperanto/bundle/human/esperanto-model-v1.6.0/rust");
     let mut args = std::env::args().skip(1);
     let (bam_path, vcf_path, fasta_path) = match (args.next(), args.next(), args.next()) {
         (Some(b), Some(v), Some(f)) => (PathBuf::from(b), PathBuf::from(v), PathBuf::from(f)),

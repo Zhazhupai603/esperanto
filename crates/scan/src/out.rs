@@ -1,6 +1,11 @@
 //! candidates.bed output (10-column contract, DESIGN §1.3):
 //! chrom  pos  pos+1  strand(+/-/amb)  evid  call_score  depth  var_freq  fwd_freq  rev_freq
 //!
+//! var_freq is the any-mismatch frequency (non-reference reads over depth).
+//! fwd_freq / rev_freq are the editing-consistent frequencies per strand
+//! (forward A>G, reverse T>C); both are zero for a site whose reference
+//! base cannot be A-to-I edited (REF=C or REF=G).
+//!
 //! pos is 0-based (BED half-open interval [pos, pos+1)). Sorted by (chrom, pos) before writing:
 //! deterministic output, thread-count independent.
 
@@ -17,8 +22,11 @@ pub struct Candidate {
     pub evid: String,
     pub score: f64,
     pub depth: u64,
+    /// Any-mismatch frequency: non-reference reads over depth.
     pub var_freq: f64,
+    /// Editing-consistent frequency on the forward strand (A>G).
     pub fwd_freq: f64,
+    /// Editing-consistent frequency on the reverse strand (T>C).
     pub rev_freq: f64,
 }
 

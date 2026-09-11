@@ -63,7 +63,7 @@ use rust_htslib::bam::{IndexedReader, Read as _};
 use thiserror::Error;
 
 /// Number of features per site.
-pub const N_FEATURES: usize = 8;
+pub const N_FEATURES: usize = 9;
 
 /// Feature names, in output order.
 pub const FEATURE_NAMES: [&str; N_FEATURES] = [
@@ -75,6 +75,7 @@ pub const FEATURE_NAMES: [&str; N_FEATURES] = [
     "mean_base_quality",
     "strand_bias",
     "mean_mapq",
+    "hyperedited",
 ];
 
 /// Minimum (possibly overlap-tweaked) base quality for a read to be counted.
@@ -140,8 +141,8 @@ pub fn extract_pileup_features(
     pos_1based: i64,
 ) -> Result<[f32; N_FEATURES], PileError> {
     let (tid, pos0) = resolve_site(bam, chrom, pos_1based)?;
-    let records = collect_site_records(bam, tid, pos0)?;
-    Ok(run_site(pos0, records))
+    let (records, has_collapsed) = collect_site_records(bam, tid, pos0)?;
+    Ok(run_site(pos0, records, has_collapsed))
 }
 
 /// Extract pileup features for many sites in one pass.
@@ -214,6 +215,7 @@ fn stream_core<R: PileRecord>(
 ) -> Result<bool, PileError> {
     let mut plp: EventPlp<R> = EventPlp::new();
     let mut records = records.peekable();
+    let mut collapsed_end: i64 = i64::MIN;
     for &(tid, pos0, orig_idx) in group {
         // Feed every record starting at or before the site (stream is
         // (tid,pos)-sorted, same order the per-column engine consumes).
@@ -230,10 +232,13 @@ fn stream_core<R: PileRecord>(
             plp.retire_until(r.tid(), r.pos());
             if !r.is_collapsed() {
                 plp.push(r);
+            } else {
+                collapsed_end = collapsed_end.max(r.pos() + r.ref_len());
             }
         }
         plp.retire_until(tid, pos0);
-        out[orig_idx] = plp.features_at(pos0);
+        let has_collapsed = pos0 < collapsed_end;
+        out[orig_idx] = plp.features_at(pos0, has_collapsed);
         if plp.dropped_maxcnt {
             return Ok(true);
         }
@@ -336,6 +341,7 @@ fn legacy_sweep_group<R: PileRecord>(
     let mut active: Vec<R> = Vec::new();
     let mut pending: Option<R> = None;
     let mut records = records.into_iter();
+    let mut collapsed_end: i64 = i64::MIN;
     for &(_tid, pos0, orig_idx) in group {
         loop {
             let rec = match pending.take() {
@@ -348,6 +354,8 @@ fn legacy_sweep_group<R: PileRecord>(
             if rec.pos() <= pos0 {
                 if !rec.is_collapsed() {
                     active.push(rec);
+                } else {
+                    collapsed_end = collapsed_end.max(rec.pos() + rec.ref_len());
                 }
             } else {
                 pending = Some(rec);
@@ -355,7 +363,8 @@ fn legacy_sweep_group<R: PileRecord>(
             }
         }
         active.retain(|r| r.pos() + r.ref_len() > pos0);
-        out[orig_idx] = run_site(pos0, active.iter().cloned());
+        let has_collapsed = pos0 < collapsed_end;
+        out[orig_idx] = run_site(pos0, active.iter().cloned(), has_collapsed);
     }
     Ok(())
 }
@@ -443,7 +452,7 @@ fn collect_site_records(
     bam: &mut IndexedReader,
     tid: i32,
     pos0: i64,
-) -> Result<Vec<Record>, PileError> {
+) -> Result<(Vec<Record>, bool), PileError> {
     bam.fetch((tid, pos0, pos0 + 1))
         .map_err(|source| PileError::Fetch {
             tid,
@@ -452,13 +461,16 @@ fn collect_site_records(
             source,
         })?;
     let mut records = Vec::new();
+    let mut has_collapsed = false;
     for rec in bam.records() {
         let rec = rec?;
         if !is_collapsed(&rec) {
             records.push(rec);
+        } else {
+            has_collapsed = true;
         }
     }
-    Ok(records)
+    Ok((records, has_collapsed))
 }
 
 /// Record abstraction for the pileup engine: implemented by htslib
@@ -579,24 +591,32 @@ impl PileRecord for BalnPileRecord {
 }
 
 /// Run the pileup engine over one site's record sequence and extract features.
-fn run_site<R: PileRecord>(pos0: i64, records: impl IntoIterator<Item = R>) -> [f32; N_FEATURES] {
+fn run_site<R: PileRecord>(
+    pos0: i64,
+    records: impl IntoIterator<Item = R>,
+    has_collapsed: bool,
+) -> [f32; N_FEATURES] {
     let mut plp: Plp<R> = Plp::new();
     let mut it = records.into_iter();
     loop {
         match plp.next() {
             Some(col) => {
                 if col.pos == pos0 {
-                    return features_from_column(&plp, &col);
+                    return features_from_column(&plp, &col, has_collapsed);
                 }
                 // Columns are emitted at strictly increasing positions;
                 // passing the target means it had no coverage.
                 if col.pos > pos0 {
-                    return [0.0; N_FEATURES];
+                    let mut f = [0.0; N_FEATURES];
+                    f[8] = if has_collapsed { 1.0 } else { 0.0 };
+                    return f;
                 }
             }
             None => {
                 if plp.is_eof && plp.order.is_empty() {
-                    return [0.0; N_FEATURES];
+                    let mut f = [0.0; N_FEATURES];
+                    f[8] = if has_collapsed { 1.0 } else { 0.0 };
+                    return f;
                 }
                 match it.next() {
                     Some(r) => plp.push(r),
@@ -755,7 +775,7 @@ impl<R: PileRecord> EventPlp<R> {
 
     /// Build the feature vector at one site column (live set already
     /// retired to `end > pos0`).
-    fn features_at(&mut self, pos0: i64) -> [f32; N_FEATURES] {
+    fn features_at(&mut self, pos0: i64, has_collapsed: bool) -> [f32; N_FEATURES] {
         let mut depth: u64 = 0;
         let mut base_counts: [u64; 4] = [0; 4];
         let mut qual_sum: u64 = 0;
@@ -806,7 +826,9 @@ impl<R: PileRecord> EventPlp<R> {
             }
         }
         if depth == 0 {
-            return [0.0; N_FEATURES];
+            let mut feats = [0.0; N_FEATURES];
+            feats[8] = if has_collapsed { 1.0 } else { 0.0 };
+            return feats;
         }
         let n = depth as f32;
         [
@@ -818,12 +840,13 @@ impl<R: PileRecord> EventPlp<R> {
             qual_sum as f32 / n,
             forward as f32 / n,
             mapq_sum as f32 / n,
+            if has_collapsed { 1.0 } else { 0.0 },
         ]
     }
 }
 
 /// Compute the 8 features from one emitted column (entries in push order).
-fn features_from_column<R: PileRecord>(plp: &Plp<R>, col: &Column) -> [f32; N_FEATURES] {
+fn features_from_column<R: PileRecord>(plp: &Plp<R>, col: &Column, has_collapsed: bool) -> [f32; N_FEATURES] {
     let mut depth: u64 = 0;
     let mut base_counts: [u64; 4] = [0; 4];
     let mut qual_sum: u64 = 0;
@@ -884,7 +907,9 @@ fn features_from_column<R: PileRecord>(plp: &Plp<R>, col: &Column) -> [f32; N_FE
     }
 
     if depth == 0 {
-        return [0.0; N_FEATURES];
+        let mut feats = [0.0; N_FEATURES];
+        feats[8] = if has_collapsed { 1.0 } else { 0.0 };
+        return feats;
     }
 
     // Reference arithmetic: means are f32 divisions of the integer sums
@@ -900,6 +925,7 @@ fn features_from_column<R: PileRecord>(plp: &Plp<R>, col: &Column) -> [f32; N_FE
         qual_sum as f32 / n,
         forward as f32 / n,
         mapq_sum as f32 / n,
+        if has_collapsed { 1.0 } else { 0.0 },
     ]
 }
 

@@ -5,13 +5,13 @@ BAM + sites → RE_PROB TSV (chrom pos prob; row order = input sites row order).
 ## bundle (v1.4.1-501_40ep, zero-config resolution)
 
 - Layout: bundle root (encoder/model.safetensors + config.json) + `rust/` (heads/fold_{0..4}.safetensors, norm.json, gate_heads/, gate_norm.json, feature_spec.json).
-- `load_bundle(rust_dir)`: 5-fold FoldHead + per-fold NormStats (8-dim mean/std); `half_window` read from feature_spec.sequence.half_window (v1.4.1 = 250 → 501 bp window; looked up in both dir and dir.parent, missing = 500 for compatibility); `cache_id` = hash of the full feature_spec text + half_window.
+- `load_bundle(rust_dir)`: 5-fold FoldHead + per-fold NormStats (9-dim mean/std); `half_window` read from feature_spec.sequence.half_window (v1.4.1 = 250 → 501 bp window; looked up in both dir and dir.parent, missing = 500 for compatibility); `cache_id` = hash of the full feature_spec text + half_window.
 - Encoder resolution: when `--caduceus` is omitted, probe bundle/encoder then the bundle parent's encoder (model.safetensors required), in that order.
 - Veto-gate trio (gate_heads/ + gate_norm.json + feature_spec.gate.threshold=0.004817): all missing = None; partially missing = hard error for a corrupt bundle. The score pipeline requires them to be present.
 
 ## Feature flow (per site)
 
-1. **pileup 8-dim** (esperanto-pile batch interface; rtol=0 contract, see pile spec): `[depth, A,C,G,T count, mean_bq, strand_bias, mean_mapq]`.
+1. **pileup 9-dim** (esperanto-pile batch interface; rtol=0 contract, see pile spec): `[depth, A,C,G,T count, mean_bq, strand_bias, mean_mapq, hyperedited]`.
 2. **Veto gate**: gate RE_PROB = 5-fold zero-embedding ensemble (same head form, emb all zeros); `< threshold` → final probability = gate probability, **encoder skipped**; otherwise the site is kept.
 3. **Sequence window**: center = pos (1-based), ±half_window; N-pad at contig edges; uppercase; if the fasta lacks the contig → all-N window (no error).
 4. **tokenizer**: A7 C8 G9 T10 N11, others → 6 [UNK], trailing SEP=1, no BOS (total length 2·half+2 = 502).

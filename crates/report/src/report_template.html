@@ -161,6 +161,7 @@
     margin-top: 2px;
   }
   .resc-legend { color: #dc2626; margin-left: 12px; font-weight: 600; }
+  .hyper-mark { color: #dc2626; font-weight: 700; margin-left: 6px; cursor: help; }
   .heat-cell {
     height: 100%;
     cursor: pointer;
@@ -704,7 +705,7 @@
           const color = interpolateRed(Math.log1p(v), maxResc);
           const startMb = i * 5;
           const tip = `${c.chrom}: ${startMb}-${startMb + 5} Mb | rescued (hyperedited) reads: ${v}`;
-          return `<rect x="${i * cellWidth}%" y="0" width="${cellWidth}%" height="100%" fill="${color}" style="stroke:#ffffff;stroke-width:1;vector-effect:non-scaling-stroke" onmouseenter="showTooltip(event, '${tip}')" onmouseleave="hideTooltip()" onmousemove="showTooltip(event, '${tip}')" />`;
+          return `<rect x="${i * cellWidth}%" y="0" width="${cellWidth}%" height="100%" fill="${color}" class="heat-cell" style="stroke:#ffffff;stroke-width:1;vector-effect:non-scaling-stroke" onclick="window.location.hash = '#/${c.chrom}'" onmouseenter="showTooltip(event, '${tip}')" onmouseleave="hideTooltip()" onmousemove="showTooltip(event, '${tip}')" />`;
         }).join('') : '';
         const rescTrack = hasResc ? `
             <div class="resc-track" title="rescued (hyperedited) reads per 5 Mb">
@@ -810,7 +811,7 @@
             <tbody>
               ${genesInChrom.map(g => `
                 <tr class="clickable" onclick="selectGeneByName('${g.gene}')">
-                  <td>${g.gene}</td>
+                  <td>${g.gene}${g.has_hyper ? '<span class="hyper-mark" title="overlaps a hyperedited region">◆</span>' : ''}</td>
                   <td>${g.n}</td>
                   <td>${g.pass}</td>
                   <td>${g.maxprob.toFixed(3)}</td>
@@ -860,7 +861,7 @@
             const tip = `${chrom}: ${i}-${i+1} Mb — rescued (hyperedited) reads: ${v}`;
             const xPct = ((i - xMin) / mbSpan) * 100;
             const wPct = (1 / mbSpan) * 100;
-            return `<rect x="${xPct}%" y="0" width="${wPct}%" height="100%" fill="${color}" style="stroke:#ffffff;stroke-width:1;vector-effect:non-scaling-stroke" onmouseenter="showTooltip(event, '${tip}')" onmouseleave="hideTooltip()" onmousemove="showTooltip(event, '${tip}')" />`;
+            return `<rect x="${xPct}%" y="0" width="${wPct}%" height="100%" fill="${color}" class="heat-cell" style="stroke:#ffffff;stroke-width:1;vector-effect:non-scaling-stroke" onclick="window.location.hash = '#/${chrom}/${i}'" onmouseenter="showTooltip(event, '${tip}')" onmouseleave="hideTooltip()" onmousemove="showTooltip(event, '${tip}')" />`;
           }).join('');
           rtrack.innerHTML = `<svg width="100%" height="100%" preserveAspectRatio="none">${rcells}</svg>`;
         }
@@ -1035,7 +1036,7 @@
                   ${sites.map(s => `
                     <tr ${highlightPos === s[0] ? 'style="background: var(--accent-muted);"' : ''}>
                       <td>${formatNumber(s[0])}</td>
-                      <td>${s[5] || '-'}</td>
+                      <td>${s[5] || '-'}${s[6] ? '<span class="hyper-mark" title="overlaps a hyperedited region">◆</span>' : ''}</td>
                       <td>${s[1] == null ? 'NA' : s[1].toFixed(3)}</td>
                       <td>${s[2].toFixed(3)}</td>
                       <td>${s[3]}</td>
@@ -1089,12 +1090,13 @@
         const depth = s[3];
         const pass = s[4];
         const gene = s[5];
+        const hyper = s[6];
         
         const cx = padding + ((pos - xMin) / xSpan) * (width - padding * 2);
         const cy = height - padBottom - (vaf * (height - padding - padBottom));
         const r = 3 + (depth / maxDepth) * 5;
-        const fill = pass ? 'var(--accent)' : '#d1d5db';
-        const tip = `Pos: ${formatNumber(pos)} | Gene: ${gene || 'Intergenic'} | Prob: ${prob == null ? 'NA' : prob.toFixed(3)} | VAF: ${vaf.toFixed(3)} | Depth: ${depth}`;
+        const fill = pass ? (hyper ? '#dc2626' : 'var(--accent)') : '#d1d5db';
+        const tip = `Pos: ${formatNumber(pos)} | Gene: ${gene || 'Intergenic'} | Prob: ${prob == null ? 'NA' : prob.toFixed(3)} | VAF: ${vaf.toFixed(3)} | Depth: ${depth}${hyper ? ' | hyperedited' : ''}`;
         
         let highlight = '';
         if (highlightPos && pos === highlightPos) {
@@ -1281,7 +1283,7 @@
       document.getElementById('gene-empty').style.display = 'none';
       document.getElementById('gene-view').style.display = 'block';
 
-      document.getElementById('gene-name').textContent = gene.gene;
+      document.getElementById('gene-name').innerHTML = gene.gene + (gene.has_hyper ? '<span class="hyper-mark" title="overlaps a hyperedited region">◆</span>' : '');
       document.getElementById('gene-summary').textContent = `${gene.n} sites (${gene.pass} confident) • Max prob: ${gene.maxprob.toFixed(3)}`;
       
       let dominantMb = 0;
@@ -1519,7 +1521,7 @@
         const mb = Math.floor(r.pos / 1000000);
         return `
           <tr class="clickable" onclick="window.location.hash = '#/${r.chrom}/${mb}/${r.pos}'; document.getElementById('explorer-panel').scrollIntoView({ behavior: 'smooth' });">
-            <td style="font-weight: 500;">${r.gene}</td>
+            <td style="font-weight: 500;">${r.gene}${r.has_hyper ? '<span class="hyper-mark" title="overlaps a hyperedited region">◆</span>' : ''}</td>
             <td><span class="chip" style="margin: 0;">${r.change}</span></td>
             <td>${r.chrom}:${formatNumber(r.pos)}</td>
             <td>${r.prob.toFixed(3)}</td>
