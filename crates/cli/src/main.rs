@@ -8,10 +8,12 @@ mod index;
 mod map;
 mod pile;
 mod qc;
+mod report;
 mod resolve;
 mod run;
 mod scan;
 mod score;
+mod setup;
 
 use clap::{Parser, Subcommand};
 
@@ -39,6 +41,11 @@ Index(index::IndexArgs),
     Score(score::ScoreArgs),
     /// Full pipeline: qc → map → sort → scan → score → vcf.
     Run(run::RunArgs),
+    /// Regenerate the standalone HTML report for a finished run directory.
+    Report(report::ReportArgs),
+    /// One-step reference environment: detect or download reference files
+    /// in the refs directory, then build the index in place.
+    Setup(setup::SetupArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -51,5 +58,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Scan(a) => scan::run(a),
         Cmd::Score(a) => score::run(a),
         Cmd::Run(a) => run::run(a),
+        Cmd::Report(a) => report::run(a),
+        Cmd::Setup(a) => setup::run(a),
     }
 }

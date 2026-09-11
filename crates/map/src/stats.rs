@@ -4,11 +4,11 @@
 //! from byte-level parity.
 
 use crate::pair::InsertStats;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Final statistics document (serialized pretty with a trailing newline by
 /// the pipeline).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AlignStats {
     /// Crate version (`CARGO_PKG_VERSION`).
     pub esperanto_map_version: String,
@@ -36,6 +36,11 @@ pub struct AlignStats {
     pub rescued_total: u64,
     /// Failed rescue attempts.
     pub rescue_fail_total: u64,
+    /// Reads placed by the collapsed-alphabet rescue (flow patches this
+    /// key into align_qc.json after the rescue stage; `null`-absent before,
+    /// so legacy files without it remain valid).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rescued_collapsed: Option<u64>,
     /// Wall-clock seconds (parity-exempt).
     pub elapsed_seconds: f64,
 }
@@ -131,7 +136,51 @@ impl StatsAcc {
             junctions_total: self.junctions,
             rescued_total: self.rescued,
             rescue_fail_total: self.rescue_fail,
+            rescued_collapsed: None,
             elapsed_seconds,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rescued_collapsed_round_trip_and_back_compat() {
+        // Fresh stats never carry the key (byte-identical legacy output).
+        let mut acc = StatsAcc::new();
+        acc.push_read(true, 60);
+        let stats = acc.finalize("rna-se", false, 0.0);
+        let fresh = serde_json::to_string(&stats).unwrap();
+        assert!(!fresh.contains("rescued_collapsed"));
+
+        // Legacy align_qc.json without the key deserializes as None.
+        let legacy = serde_json::json!({
+            "esperanto_map_version": "1.0.0",
+            "mode": "rna-se",
+            "total_reads": 10,
+            "mapped_reads": 9,
+            "unmapped_reads": 1,
+            "mapping_rate": 0.9,
+            "proper_pairs": null,
+            "insert_mean": null,
+            "insert_stdev": null,
+            "mapq_hist": [9],
+            "junctions_total": 0,
+            "rescued_total": 0,
+            "rescue_fail_total": 0,
+            "elapsed_seconds": 1.0,
+        })
+        .to_string();
+        let mut parsed: AlignStats = serde_json::from_str(&legacy).unwrap();
+        assert!(parsed.rescued_collapsed.is_none());
+
+        // Patched stats serialize the key back.
+        parsed.rescued_collapsed = Some(7);
+        let patched = serde_json::to_string(&parsed).unwrap();
+        assert!(patched.contains("\"rescued_collapsed\":7"));
+        let back: AlignStats = serde_json::from_str(&patched).unwrap();
+        assert_eq!(back.rescued_collapsed, Some(7));
     }
 }

@@ -12,10 +12,11 @@ Conventions: `--threads` 0 = all cores (converted to the actual core count befor
 |---|---|---|---|
 | `--fasta` | PathBuf | **required** | reference FASTA |
 | `--out` | PathBuf | **required** | output paidx index path |
+| `--gtf` | PathBuf | optional | transcript annotation; also builds the L1 bundle (`<out stem>.bndl` + `<out stem>.tidx`) |
 | `--k` | u32 | 15 | k-mer length (must match alignment time) |
 | `--w` | u32 | 5 | window size (number of k-mers) |
 
-The produced paidx connects directly to `run`/`map`'s `--index`; `rna_default`'s seed parameters are exactly k=15/w=5.
+The produced paidx connects directly to `run`/`map`'s `--index`; `rna_default`'s seed parameters are exactly k=15/w=5. Every build also writes `<out stem>.cpaidx` (collapsed-alphabet index, k=31/w=10) — the map-stage rescue index.
 
 ### qc — FASTQ quality control (→ `qc::run`)
 
