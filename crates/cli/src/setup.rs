@@ -23,12 +23,8 @@ pub struct SetupArgs {
     force: bool,
 }
 
-/// The fixed setup folder: `ESPERANTO_REFS` when set, else the user data
-/// dir (`~/.local/share/esperanto/refs`). Created when missing.
+/// The fixed setup folder (`ESPERANTO_REFS` honored): shared resolver.
 fn refs_dir() -> PathBuf {
-    if let Ok(v) = std::env::var("ESPERANTO_REFS") {
-        return PathBuf::from(v);
-    }
     crate::resolve::home_refs_dir()
 }
 

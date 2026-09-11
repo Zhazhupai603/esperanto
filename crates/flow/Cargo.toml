@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 anyhow.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 rust-htslib.workspace = true
 rayon.workspace = true

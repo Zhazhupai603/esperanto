@@ -3,6 +3,40 @@
 All notable changes to ESPERANTO are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows [SemVer](https://semver.org/).
 
+## [1.0.2] - 2026-08-27
+
+### Added
+
+- `--device auto|cpu|gpu` on `score` and `run`: a CUDA channel for the score
+  encoder (cargo feature `gpu`). On `auto`, a detected GPU triggers a one-time
+  interactive ask; `cpu` forces the CPU path; `gpu` errors clearly when the
+  build lacks GPU support or no CUDA device initializes. On a 4-core box the
+  GPU channel measured ~1.9× faster than CPU scoring; numerics match the CPU
+  path within 3e-4 per site.
+- `delete` and `update` subcommands (interactive confirm for both).
+- `resume` subcommand: continues an interrupted `run` from the first broken
+  stage. `run` now writes into a sample-scoped directory `<out>/<sample>/`
+  (`--sample`, default derived from the input file name) and freezes inputs
+  and resolved parameters into `run.json`; `resume` re-validates every stage
+  artifact (BGZF EOF for BAM, full-stream integrity for gzip, parse checks
+  for JSON/BED/TSV/VCF), refuses on changed inputs, and re-executes only
+  from the first invalid stage. An intact alignment is never re-run: with a
+  valid `raw.bam` + `align_qc.json`, at most the collapsed rescue repeats.
+
+### Changed
+
+- `run --out` now takes an output root: artifacts land in `<out>/<sample>/`
+  instead of directly in `<out>/` (breaking layout change).
+
+### Fixed
+
+- PE `unmapped.fq.gz` was malformed (name line glued to the sequence),
+  crashing the rescue stage with a seq/qual length mismatch.
+- The pipeline no longer runs the coordinate sort and the collapsed rescue
+  twice per run (both were executed redundantly after the map stage).
+- The Phred+64 rejection message now names the actual threshold (lowest
+  quality byte >= 64 in the first 10000 reads).
+
 ## [1.0.1] - 2026-08-27
 
 ### Added

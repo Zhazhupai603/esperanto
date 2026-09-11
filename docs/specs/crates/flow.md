@@ -37,6 +37,21 @@ Before `run_pipeline` starts any stage: read `<fasta>.fai`; **if a `chr1` line e
 
 bed→sites bridge: column 1 of candidates.bed = chrom, column 3 (pos0+1) = 1-based pos; the `--sites` file is parsed as `chrom\tpos` (1-based). Empty candidates = empty scores.tsv + header-only vcf; no error.
 
+## Resume (run.json + stage walk)
+
+Every `run` lands in a sample-scoped directory `<out>/<sample>/` (`--sample` or derived from the R1/BAM file name: strip `.gz/.fastq/.fq/.bam`, then a trailing `_R1/_R2/_1/_2`). Before qc starts, flow atomically writes `<out>/<sample>/run.json` (tmp + rename):
+
+- `version` (schema, currently 1), `esperanto` (binary version), `sample`, `entry` (`fastq-se|fastq-pe|bam|bam-sites`);
+- `inputs`: per input file `{role, path, size, mtime}` (mtime in unix seconds);
+- `params`: fully resolved `index/fasta/gtf/gnomad/bundle/caduceus/l1_bundle/lib/threads/batch/device`.
+
+`run` refuses a directory that already holds `run.json` (points at `resume`). `esperanto resume <sample-dir>` needs no flags: it reads run.json, refuses on a changed input (size or mtime mismatch, naming the file) or a missing parameter path, notes an esperanto version mismatch on stderr and proceeds (determinism guarantee), then validates stage artifacts in pipeline order and re-executes from the first invalid stage, wiping that stage's artifacts first (later stages cascade; earlier stages are never touched).
+
+Artifact validators (integrity, not presence): BAM = trailing BGZF EOF marker; plain-gzip streams (qc clean reads, `unmapped.fq.gz`) = full multi-member decompression succeeds; JSON = parses; `candidates.bed` = parses through the bed→sites bridge; `scores.tsv` = every data line is `chrom\tpos\tprob` with parseable numbers (empty is legal); `sites.vcf` = starts with `##fileformat=VCF`; `report.html` = non-empty (skipped entirely when no GTF). Stage artifacts validated per stage: qc = `qc.json` + `qc.html` + exactly one clean file per mate; map = `raw.bam` + `align_qc.json` + `unmapped.fq.gz` + `align.baln`; sort = `sorted.bam` + non-empty `sorted.bam.bai`; scan/score/vcf/report as above.
+
+Map seal: intact `raw.bam` + `align_qc.json` means the alignment completed; when a `.cpaidx` exists and `align_qc.json` lacks the `rescued_collapsed` key while `unmapped.fq.gz` is non-empty, resume re-runs only the collapsed rescue (never the alignment). An empty `unmapped.fq.gz` counts as rescue-done (the rescue is a no-op there by definition).
+
+Concurrency: `<sample>/.lock` is created exclusively before any artifact is read or written (run and resume both); a held lock fails fast with the lock path; the lock is removed on exit. A stale lock from a killed process is removed by hand (the error says so).
 ## Output VCF (1.0.0 minimal contract)
 
 VCF v4.2; `##reference=<fasta file name>`; CHROM=chrom, POS=1-based, ID=`.`, REF=reference base at that position from fasta (uppercase, `N` if not found), ALT=symbolic allele `<RE>` (precise ALT allele inference deferred to 1.1, BACKLOG), QUAL=`.`; FILTER: `RE_PROB ≥ 0.5` → `PASS`, otherwise `LOW_SCORE`; INFO: `RE_PROB` (score probability, Display), `VAF`/`DEPTH`/`STRAND`/`EVID` (passed through from candidates.bed). Row order = candidates.bed order (already sorted by (chrom,pos)). Contigs without candidates emit no rows.
