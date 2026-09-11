@@ -5,3 +5,4 @@ target/
 worknotes/
 .playwright-mcp/
 *.png
+papers/

@@ -344,7 +344,7 @@ trailing sha256(body)[32]
 
 - `evidence_tag(aln) -> String`, fixed field order:
   `seeds={n_seeds};chain={chain_score};sub={second_chain_score};dq={max(chain−second,0)};splice={junctions[0].signal.label() or -};mm={mm_count};ea={ea_count};mapq_src={second>0 ? chain_margin : unique}`
-- `AlignStats` (align_qc.json contract; consumers ignore unknown keys): esperanto_map_version, mode, total_reads, mapped_reads, unmapped_reads, mapping_rate, proper_pairs (PE only, otherwise null), insert_mean/insert_stdev (same), mapq_hist[61], junctions_total, rescued_total, rescue_fail_total, elapsed_seconds.
+- `AlignStats` (align_qc.json contract; consumers ignore unknown keys): esperanto_map_version, mode, total_reads, mapped_reads, unmapped_reads, mapping_rate, proper_pairs (PE only, otherwise null), insert_mean/insert_stdev (same), mapq_hist[61], junctions_total, rescued_total, rescue_fail_total, elapsed_seconds. The flow stage additionally patches `rescued_collapsed`, `rescue_rejected_collapsed`, and `rescue_prefiltered_collapsed` (u64; absent before the rescue pass — legacy files stay valid).
 - `StatsAcc`: push_read(mapped, mapq) integer accumulation; finalize(mode, pe, elapsed) emits the table once; `CARGO_PKG_VERSION` goes into the version field.
 - `AlignError` (thiserror): FastaIo{path,source} / FastaFormat{line,msg} / IndexIo / IndexFormat{msg} / IndexVersion{file,supported} / IndexReferenceMismatch{msg} / FastqFormat{line,msg} / FastqIo. User-supplied paths **never panic**.
 

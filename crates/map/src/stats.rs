@@ -41,6 +41,14 @@ pub struct AlignStats {
     /// so legacy files without it remain valid).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rescued_collapsed: Option<u64>,
+    /// Collapsed-rescue placements rejected by the hyperediting
+    /// verification (flow patches this key after the rescue stage).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rescue_rejected_collapsed: Option<u64>,
+    /// Reads screened out of the collapsed realignment by the artifact
+    /// pre-filters (flow patches this key after the rescue stage).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rescue_prefiltered_collapsed: Option<u64>,
     /// Wall-clock seconds (parity-exempt).
     pub elapsed_seconds: f64,
 }
@@ -137,6 +145,8 @@ impl StatsAcc {
             rescued_total: self.rescued,
             rescue_fail_total: self.rescue_fail,
             rescued_collapsed: None,
+            rescue_rejected_collapsed: None,
+            rescue_prefiltered_collapsed: None,
             elapsed_seconds,
         }
     }

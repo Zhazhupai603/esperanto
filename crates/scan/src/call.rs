@@ -235,8 +235,8 @@ fn emit_chunk(
             score,
             depth,
             var_freq: var_reads as f64 / depth as f64,
-            fwd_freq: var_fwd as f64 / fwd_d.max(1) as f64,
-            rev_freq: var_rev as f64 / rev_d.max(1) as f64,
+            fwd_freq: fwd_ai,
+            rev_freq: rev_ai,
         });
     }
     Ok(())

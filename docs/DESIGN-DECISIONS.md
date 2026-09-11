@@ -58,6 +58,71 @@ exact so the model's input distribution does not shift:
   pathological 0-length `M` op; the new pile follows pysam exactly (the model's
   training semantics), so the legacy behavior is intentionally not reproduced.
 
+## Collapsed-rescue verification (frozen 2026-08-30)
+
+Hyperedited-read rescue follows Porath, Carmi & Levanon, Nat Commun
+5:4726 (2014): unmapped reads are realigned in a collapsed alphabet
+(A==G, T==C), and **every placement is verified against the true
+four-letter reference before it is accepted**. A placement survives only
+when it looks like a hyperedited read:
+
+- at most 2 non-editing-class mismatches (the collapsed-space analog of
+  the paper's ungapped edit distance 2);
+- editing-class mismatches (A-to-G / T-to-C, strand-agnostic) dominate:
+  >60% of all mismatches (>80% for reads <=60 bp), each at Phred >=30;
+- editing density >=5% of read length;
+- cluster geometry: first-to-last editing span >=10% of read length,
+  not contained in the outer 20% of the read, single-nucleotide share
+  inside the cluster <=60%;
+- ungapped CIGAR; paired runs additionally require an already-mapped
+  mate within 500 kbp on the same contig in the opposite orientation.
+
+Read-level artifact screens (composition bounds, ambiguous-base
+fraction, homopolymer/dinucleotide repeats, trimmed mean Phred >=25) run
+before the realignment. Rejected placements stay unmapped; the mapping
+rate in `align_qc.json` always reflects the primary alignment.
+
+Known deviations from the paper: multi-mapping tie-breaking by
+A-to-G-share margin is not implemented (the best chain is kept at MAPQ 0;
+verified reads never vote on variants, only depth and the
+hyperedited-region track). Motivation: without verification, the
+collapsed realignment accepts near-random placements in two-letter space
+and inflates both the mapping rate and downstream candidate counts
+(measured on a mismatched-species sample: 70% of reads falsely
+"rescued").
+
+## Candidate direction gate (frozen 2026-08-30)
+
+The scan->score candidate filter gates the recall arm on the
+editing-consistent direction instead of the any-mismatch frequency.
+`candidates.bed` now carries the per-strand editing frequency (forward
+A>G, reverse T>C) in place of the per-strand any-mismatch frequency, and
+the recall arm keeps a site only when that editing signal is >=5% *and*
+at least 2 mutation reads support it. Motivation: the scoring model is a
+frozen A-to-I (RE vs germline-mutation) classifier trained on A>G/T>C
+candidates; the previous any-mismatch recall arm fed REF=C/G sites (which
+cannot be A-to-I edited) and single-read noise into it, and the model
+scored those out-of-distribution sites as if they were edits (measured on
+a human sample: 51% of passing candidates were REF=C/G). The direction
+gate restores the A-to-I candidate distribution the model was trained
+on. After the VAF-balanced retrain the model itself rejects REF=C/G
+sites (2.9% false-positive rate, matching the 3.4% on REF=A/T), so the
+gate is now a performance optimization — it halves the candidate set —
+rather than a correctness requirement.
+
+## Hyperedited signal (frozen 2026-08-31)
+
+The scoring model takes a ninth pileup feature marking whether a site is
+covered by a collapsed-rescue (hyperedited) read. Motivation: hyperedited
+reads are excluded from the pileup vote (their bases are
+alphabet-ambiguous), so their editing sites show a pure-reference pileup
+and were rejected by both scan (var_reads == 0) and score. The ninth
+feature lets the model recognize these sites directly; retraining on
+19,463 hyperedited sites as RE positives raised their recall from 2.2% to
+100% without degrading AUROC (0.9959 protocol A). The veto gate is not
+retrained — its threshold is low enough that hyperedited sites pass
+through, so its 8-dim weights are zero-padded to 9 dims.
+
 ## Pending decisions
 
 Deferred until wet-lab / further data is available:

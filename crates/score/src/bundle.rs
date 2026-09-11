@@ -8,7 +8,7 @@ use std::path::Path;
 use thiserror::Error;
 
 pub const N_FOLDS: usize = 5;
-pub const PILEUP_DIM: usize = 8;
+pub const PILEUP_DIM: usize = 9;
 
 #[derive(Debug, Error)]
 pub enum ScoreError {
@@ -141,10 +141,10 @@ let norm_doc: HashMap<String, NormFold> =
                 .ok_or_else(|| ScoreError::Missing(format!("gate norm fold_{fold}")))?;
             g_norms.push(NormStats {
                 mean: nf.mean.clone().try_into().map_err(|_| ScoreError::Shape {
-                    name: "gate_norm.mean".into(), got: vec![nf.mean.len()], want: vec![8],
+                    name: "gate_norm.mean".into(), got: vec![nf.mean.len()], want: vec![9],
                 })?,
                 std: nf.std.clone().try_into().map_err(|_| ScoreError::Shape {
-                    name: "gate_norm.std".into(), got: vec![nf.std.len()], want: vec![8],
+                    name: "gate_norm.std".into(), got: vec![nf.std.len()], want: vec![9],
                 })?,
             });
         }
@@ -168,10 +168,10 @@ let norm_doc: HashMap<String, NormFold> =
             .ok_or_else(|| ScoreError::Missing(format!("norm fold_{fold}")))?;
         norms.push(NormStats {
             mean: nf.mean.clone().try_into().map_err(|_| ScoreError::Shape {
-                name: "norm.mean".into(), got: vec![nf.mean.len()], want: vec![8],
+                name: "norm.mean".into(), got: vec![nf.mean.len()], want: vec![9],
             })?,
             std: nf.std.clone().try_into().map_err(|_| ScoreError::Shape {
-                name: "norm.std".into(), got: vec![nf.std.len()], want: vec![8],
+                name: "norm.std".into(), got: vec![nf.std.len()], want: vec![9],
             })?,
         });
     }
