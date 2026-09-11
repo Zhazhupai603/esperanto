@@ -1,0 +1,11 @@
+[package]
+name = "esperanto-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+esperanto-tidx = { path = "../tidx" }
+esperanto-txmap = { path = "../txmap" }
+flate2.workspace = true

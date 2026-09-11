@@ -1,0 +1,20 @@
+[package]
+name = "esperanto-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "esperanto"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+rust-htslib.workspace = true
+esperanto-map = { path = "../map" }
+esperanto-qc = { path = "../qc" }
+esperanto-pile = { path = "../pile" }
+esperanto-scan = { path = "../scan" }
+esperanto-score = { path = "../score" }
+esperanto-flow = { path = "../flow" }
