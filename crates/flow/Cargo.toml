@@ -1,0 +1,17 @@
+[package]
+name = "esperanto-flow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+rust-htslib.workspace = true
+esperanto-qc = { path = "../qc" }
+esperanto-map = { path = "../map" }
+esperanto-scan = { path = "../scan" }
+esperanto-score = { path = "../score" }
+esperanto-bamio = { path = "../bamio" }
+esperanto-engine = { path = "../engine" }

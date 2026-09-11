@@ -1,0 +1,20 @@
+[package]
+name = "esperanto-map"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ESPERANTO splice-aware genomic aligner (minimap2 school: minimizer seed + chain + banded extend; Track 1 + Track 2)"
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rayon.workspace = true
+flate2.workspace = true
+sha2.workspace = true
+memmap2.workspace = true
+bytemuck.workspace = true
+noodles.workspace = true
+noodles-bgzf.workspace = true
+esperanto-bamio = { path = "../bamio" }
+esperanto-engine = { path = "../engine" }
