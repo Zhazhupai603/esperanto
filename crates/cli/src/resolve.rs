@@ -8,6 +8,8 @@ use anyhow::{anyhow, bail};
 
 /// Bundle location relative to a layout root (v1.4.1 contract name).
 const BUNDLE_REL: &str = "bundle/human/esperanto-model-v1.4.1-501_40ep/rust";
+/// Mouse model bundle location relative to a layout root.
+const MOUSE_BUNDLE_REL: &str = "bundle/mouse/esperanto-model-v0.9-mouse/rust";
 /// Preferred FASTA name inside a refs directory.
 const PREFERRED_FASTA: &str = "hg38.fa";
 
@@ -95,6 +97,38 @@ pub fn bundle(explicit: &Option<PathBuf>) -> anyhow::Result<PathBuf> {
             .collect::<Vec<_>>()
             .join("\n  ")
     )
+}
+
+/// Resolve the mouse model bundle: explicit env var wins, then the same
+/// 4-level layout discovery as the human bundle. Ok(None) when absent
+/// (hybrid runs fall back to UNSCORED mouse sites).
+pub fn mouse_bundle() -> Option<PathBuf> {
+    if let Ok(v) = std::env::var("ESPERANTO_MOUSE_BUNDLE") {
+        let p = PathBuf::from(v);
+        if valid_bundle(&p) {
+            return Some(p);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let mut cands = vec![dir.join(MOUSE_BUNDLE_REL)];
+            if let Some(up) = dir.parent() {
+                cands.push(up.join(MOUSE_BUNDLE_REL));
+            }
+            for c in cands {
+                if valid_bundle(&c) {
+                    return Some(c);
+                }
+            }
+        }
+    }
+    if let Some(home) = home_data_dir() {
+        let p = home.join(MOUSE_BUNDLE_REL);
+        if valid_bundle(&p) {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// Resolved files inside a refs directory.
@@ -238,3 +272,42 @@ pub fn l1_bundle(explicit: &Option<PathBuf>, index: &Path) -> Option<PathBuf> {
     );
     None
 }
+
+/// Species tag from a file name; None when unrecognizable.
+pub fn species_of(name: &str) -> Option<&'static str> {
+    let n = name.to_ascii_lowercase();
+    let is_mouse = n.contains("grcm")
+        || n.contains("mm10")
+        || n.contains("mm39")
+        || n.contains("mouse")
+        || {
+            // GENCODE mouse annotation names (gencode.vM36...)
+            let b = n.as_bytes();
+            n.len() >= 3 && b.windows(3).any(|w| w[0] == b'v' && w[1] == b'm' && w[2].is_ascii_digit())
+        };
+    if is_mouse {
+        Some("mouse")
+    } else if n.contains("grch") || n.contains("hg38") || n.contains("hg19") || n.contains("human") {
+        Some("human")
+    } else {
+        None
+    }
+}
+
+/// All files in `dir` matching one of `exts` (sorted).
+pub fn find_all(dir: &Path, exts: &[&str]) -> anyhow::Result<Vec<PathBuf>> {
+    let mut hits: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && exts.iter().any(|x| {
+                    p.file_name()
+                        .is_some_and(|n| n.to_string_lossy().ends_with(x))
+                })
+        })
+        .collect();
+    hits.sort();
+    Ok(hits)
+}
+

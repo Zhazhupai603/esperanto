@@ -140,8 +140,19 @@ pub fn run(a: UpdateArgs) -> anyhow::Result<()> {
         .proxy(ureq::Proxy::try_from_env())
         .build()
         .new_agent();
-    let mut resp = agent.get(&url).call()?;
-    let bytes = resp.body_mut().read_to_vec()?;
+    // Stream to a temp file (the release tarball exceeds the convenience
+    // read_to_vec default body limit).
+    let resp = agent.get(&url).call()?;
+    let mut reader = resp.into_body().into_reader();
+    let tmp = std::env::temp_dir().join(format!("esperanto-update-{tag}.tar.gz"));
+    {
+        use std::io::Write as _;
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        std::io::copy(&mut reader, &mut out)?;
+        out.flush()?;
+    }
+    let bytes = std::fs::read(&tmp)?;
+    let _ = std::fs::remove_file(&tmp);
     install_tarball(&bytes, &tag)?;
     eprintln!("[update] esperanto is now {latest_v}");
     Ok(())

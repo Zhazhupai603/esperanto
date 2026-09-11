@@ -4,6 +4,7 @@
 //! parse args → zero-config resolution → crate entry points. No scientific
 //! semantics live here.
 
+mod hybrid;
 mod index;
 mod map;
 mod pile;
@@ -12,6 +13,7 @@ mod report;
 mod resolve;
 mod resume;
 mod confirm;
+mod fetch;
 mod delete;
 mod run;
 mod scan;

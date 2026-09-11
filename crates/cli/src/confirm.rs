@@ -104,3 +104,85 @@ pub fn ask_use_gpu() -> bool {
         .unwrap_or(false)
     })
 }
+
+/// Interactive multi-select over `items` (e.g. gene symbols): type to filter,
+/// Up/Down (j/k) to move, Space to toggle, Enter confirms (needs ≥ 1 pick),
+/// Esc/Ctrl-C aborts. Returns the picked items (sorted), or None on abort.
+/// Never raw-modes a non-TTY.
+pub fn multi_pick(prompt: &str, items: &[String]) -> anyhow::Result<Option<Vec<String>>> {
+    use std::io::IsTerminal as _;
+    if !std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    enable_raw_mode()?;
+    let mut out = std::io::stdout();
+    use std::io::Write as _;
+    let mut filter = String::new();
+    let mut cursor = 0usize;
+    let mut picked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let result = (|| -> anyhow::Result<Option<Vec<String>>> {
+        loop {
+            let view: Vec<&String> = items
+                .iter()
+                .filter(|i| i.to_lowercase().contains(&filter.to_lowercase()))
+                .take(12)
+                .collect();
+            cursor = cursor.min(view.len().saturating_sub(1));
+            let mut frame = format!("{prompt}\n  filter: {filter}\n");
+            for (i, it) in view.iter().enumerate() {
+                let mark = if picked.contains(*it) { "[x]" } else { "[ ]" };
+                let cur = if i == cursor { ">" } else { " " };
+                frame.push_str(&format!(" {cur} {mark} {it}\n"));
+            }
+            frame.push_str(&format!("  ({} selected)\n", picked.len()));
+            write!(out, "{frame}")?;
+            out.flush()?;
+            let ev = crossterm::event::read()?;
+            let redraw_lines = frame.matches('\n').count();
+            match ev {
+                Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
+                    KeyCode::Up | KeyCode::Char('k') => cursor = cursor.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if !view.is_empty() {
+                            cursor = (cursor + 1).min(view.len() - 1)
+                        }
+                    }
+                    KeyCode::Char(' ') => {
+                        if let Some(it) = view.get(cursor) {
+                            if !picked.remove(*it) {
+                                picked.insert((*it).clone());
+                            }
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        filter.push(c);
+                        cursor = 0;
+                    }
+                    KeyCode::Backspace => {
+                        filter.pop();
+                        cursor = 0;
+                    }
+                    KeyCode::Enter => {
+                        writeln!(out)?;
+                        out.flush()?;
+                        if picked.is_empty() {
+                            continue;
+                        }
+                        return Ok(Some(picked.into_iter().collect()));
+                    }
+                    KeyCode::Esc => {
+                        writeln!(out)?;
+                        out.flush()?;
+                        return Ok(None);
+                    }
+                    _ => {}
+                }
+                _ => {}
+            }
+            write!(out, "\x1b[{redraw_lines}A\x1b[0J")?;
+            out.flush()?;
+        }
+    })();
+    disable_raw_mode()?;
+    result
+}

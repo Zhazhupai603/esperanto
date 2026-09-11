@@ -17,6 +17,11 @@ Extracts 8-dimensional pileup features at given sites from a BAM. Semantics = an
 
 `MIN_BASE_QUALITY = 13`, `MAXCNT = 8000`, `MERGE_GAP = 2000` (batch mode).
 
+Records tagged `RE:Z:collapsed` (collapsed-rescue placements) are excluded
+from feature extraction in both modes: their bases are alphabet-ambiguous
+(A==G, T==C), consistent with the scan evidence rule. On rescue-heavy
+samples the depth features differ from pre-rule output by design.
+
 ## CIGAR Column State
 
 For each read, compute the state at pos0 (0-based): M/=/X → Match(qpos) (consumes query+ref); D/N → DelOrRefskip (consumes ref only); I/S consumes query only; H/P consumes nothing. Reference length rlen = sum of M+D+N+=+X.
@@ -55,7 +60,7 @@ The implementation may use heap optimizations (retirement heap on min-end, lazy 
 
 ## Batch Interface
 
-`extract_pileup_features_batch(bam, sites) -> Vec<[f32;8]>`: sort and group by (chrom, pos), merge groups with adjacent spacing ≤2000 into one fetch; scanline implementation (records stream in by coordinate with `pos <= pos0`, expired records with `end <= pos0` are evicted); the record set for each site = `{pos <= pos0 && end > pos0}` (file order), bit-identical to per-site fetch results. Output order = input sites order.
+`extract_pileup_features_batch(bam, sites) -> Vec<[f32;8]>`: sort and group by (chrom, pos), merge groups with adjacent spacing ≤2000 into one fetch; an event-driven engine streams each group once (records in (tid,pos) order, nodes retire through an end-keyed heap, columns are built only at site positions). The record set for each site = `{pos <= pos0 && end > pos0}`, bit-identical to per-site fetch results; a MAXCNT-saturated group (any buffer-full push, a superset of the exact drop rule) is redone with the exact per-site sweep. Output order = input sites order.
 
 ## Single-Site Interface
 
