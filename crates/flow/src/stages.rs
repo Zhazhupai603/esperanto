@@ -15,6 +15,7 @@ use esperanto_qc::{OutFormat, QcParams};
 use esperanto_scan::CallParams;
 use rust_htslib::bam::Read as _;
 use esperanto_score::pipeline as score_pipeline;
+use esperanto_score::load_cmc_thresholds;
 
 use crate::params::{Entry, RunParams};
 use crate::{guard, vcf, FlowError};
@@ -181,17 +182,17 @@ pub fn run_from(
     };
 
     if start <= Stage::Vcf {
-        let probs = if start <= Stage::Score {
-            let probs = stage_score(params, &current_bam, &sites)?;
+        let (probs, hyper_probs, thresholds) = if start <= Stage::Score {
+            let out = stage_score(params, &current_bam, &sites)?;
             if stop_at == Some(Stage::Score) {
                 eprintln!("[run] stop-after score");
                 return Ok(());
             }
-            probs
+            (out.probs, out.hyper_probs, out.thresholds)
         } else {
-            load_scores(&params.out_dir.join("score").join("scores.tsv"))?
+            load_score_state(params, &sites)?
         };
-        vcf::write_vcf(params, entry, &sites, &probs)?;
+        vcf::write_vcf(params, entry, &sites, &probs, &hyper_probs, &thresholds)?;
     }
     if stop_at == Some(Stage::Vcf) {
         eprintln!("[run] stop-after vcf");
@@ -1937,59 +1938,59 @@ fn read_sites_file(path: &Path) -> Result<Vec<(String, i64)>, FlowError> {
     Ok(sites)
 }
 
+/// Score stage outcome: per-site probabilities (input order), Tier-2-only
+/// rescue-site probabilities (hyper row order) and the frozen thresholds.
+struct ScoreOutcome {
+    probs: Vec<Option<f64>>,
+    hyper_probs: Vec<Option<f64>>,
+    thresholds: vcf::ScoreThresholds,
+}
+
 fn stage_score(
     params: &RunParams,
     bam: &Path,
     sites: &[(String, i64)],
-) -> Result<Vec<Option<f64>>, FlowError> {
+) -> Result<ScoreOutcome, FlowError> {
     let dir = params.out_dir.join("score");
     fs::create_dir_all(&dir)?;
+    let (pass, hyper) = load_cmc_thresholds(&params.bundle)
+        .map_err(|e| anyhow_stage_err("score")(anyhow::anyhow!("{e}")))?;
+    let thresholds = vcf::ScoreThresholds {
+        pass,
+        hyper: Some(hyper),
+    };
     if sites.is_empty() {
         // Empty candidates: empty scores.tsv + header-only VCF, exit 0.
         fs::write(dir.join("scores.tsv"), "")?;
-        return Ok(Vec::new());
+        return Ok(ScoreOutcome {
+            probs: Vec::new(),
+            hyper_probs: Vec::new(),
+            thresholds,
+        });
     }
     eprintln!("[score] running");
-    // Hybrid runs: human-locus sites score with the bundle; mouse-contig
-    // sites are never scored with the human model (scientific contract) —
-    // they reach the VCF marked UNSCORED with VAF/DEPTH kept.
+    // Hybrid runs: only human-locus sites are scored (scientific contract —
+    // there is no mouse model); mouse-contig sites reach the VCF marked
+    // UNSCORED with VAF/DEPTH kept.
     let manifest = crate::manifest::SpeciesManifest::read(&params.out_dir);
     let hybrid = manifest.as_ref().is_some_and(|m| m.kind == "hybrid");
-    let caduceus = match &params.caduceus {
-        Some(c) => c.clone(),
-        None => score_pipeline::resolve_encoder_from_bundle(&params.bundle)
-            .map_err(anyhow_stage_err("score"))?,
-    };
-    let ask: Option<&(dyn Fn() -> bool + Send + Sync)> = params
-        .device_ask
-        .as_ref()
-        .map(|a| a.fn_ref());
-    let scored: Vec<f64> = if hybrid {
+    let scored: Vec<Option<f64>> = if hybrid {
         let m = manifest.as_ref().expect("hybrid checked");
         let human_sites: Vec<(String, i64)> = sites
             .iter()
             .filter(|(c, _)| m.owner_of(c) == Some("human"))
             .cloned()
             .collect();
-        let mouse_sites: Vec<(String, i64)> = sites
-            .iter()
-            .filter(|(c, _)| m.owner_of(c) == Some("mouse"))
-            .cloned()
-            .collect();
+        let mouse_n = sites.len() - human_sites.len();
         let mut by_site: std::collections::HashMap<(String, i64), f64> =
             std::collections::HashMap::with_capacity(sites.len());
         if !human_sites.is_empty() {
             let probs = score_pipeline::score_sites_batched(
                 bam,
                 &params.fasta,
-                &caduceus,
                 &params.bundle,
                 &human_sites,
                 params.threads,
-                params.batch.max(1),
-                None,
-                params.device,
-                ask,
                 score_pipeline::ReferenceCheck::TrustedHybrid,
             )
             .map_err(anyhow_stage_err("score"))?;
@@ -1997,82 +1998,31 @@ fn stage_score(
                 by_site.insert(s.clone(), p);
             }
         }
-        if !mouse_sites.is_empty() {
-            // Mouse-contig sites score with the mouse bundle (manifest
-            // frozen at build time); without one they stay UNSCORED.
-            let mouse_bundle: Option<std::path::PathBuf> = m.bundles.get("mouse").cloned();
-            match mouse_bundle {
-                Some(mb) => {
-                    let m_caduceus = match &params.caduceus {
-                        // the encoder is shared (same frozen backbone)
-                        Some(c) => c.clone(),
-                        None => score_pipeline::resolve_encoder_from_bundle(&mb)
-                            .map_err(anyhow_stage_err("score"))?,
-                    };
-                    let probs = score_pipeline::score_sites_batched(
-                        bam,
-                        &params.fasta,
-                        &m_caduceus,
-                        &mb,
-                        &mouse_sites,
-                        params.threads,
-                        params.batch.max(1),
-                        None,
-                        params.device,
-                        ask,
-                        score_pipeline::ReferenceCheck::TrustedHybrid,
-                    )
-                    .map_err(anyhow_stage_err("score"))?;
-                    for (s, p) in mouse_sites.iter().zip(probs) {
-                        by_site.insert(s.clone(), p);
-                    }
-                    eprintln!(
-                        "[score] hybrid: {} human + {} mouse sites scored (mouse model)",
-                        human_sites.len(),
-                        mouse_sites.len()
-                    );
-                }
-                None => {
-                    eprintln!(
-                        "[score] hybrid: {} mouse-contig sites marked UNSCORED (no mouse model installed)",
-                        mouse_sites.len()
-                    );
-                }
-            }
+        if mouse_n > 0 {
+            eprintln!(
+                "[score] hybrid: {mouse_n} mouse-contig sites marked UNSCORED (no mouse model installed)"
+            );
         }
         sites
             .iter()
-            .map(|s| by_site.get(s).copied().unwrap_or(f64::NAN))
-            .collect::<Vec<f64>>()
+            .map(|s| by_site.get(s).copied())
+            .collect::<Vec<Option<f64>>>()
     } else {
         score_pipeline::score_sites_batched(
             bam,
             &params.fasta,
-            &caduceus,
             &params.bundle,
             sites,
             params.threads,
-            params.batch.max(1),
-            None,
-            params.device,
-            ask,
             score_pipeline::ReferenceCheck::Guardrail,
         )
         .map_err(anyhow_stage_err("score"))?
+        .into_iter()
+        .map(Some)
+        .collect()
     };
 
-    // Reassemble in site order (None = unscored rows: mouse-contig sites
-    // without a mouse model surface as NAN in the hybrid branch).
-    let mut probs: Vec<Option<f64>> = Vec::with_capacity(sites.len());
-    if hybrid {
-        for v in scored {
-            probs.push(if v.is_nan() { None } else { Some(v) });
-        }
-    } else {
-        for v in scored {
-            probs.push(Some(v));
-        }
-    }
+    let probs = scored;
     let mut text = String::new();
     for ((chrom, pos), prob) in sites.iter().zip(&probs) {
         use std::fmt::Write as _;
@@ -2087,7 +2037,116 @@ fn stage_score(
     }
     fs::write(dir.join("scores.tsv"), text)?;
     eprintln!("[score] {} sites", probs.len());
-    Ok(probs)
+
+    // Tier-2-only rescue sites: scored with the rescue model, never on mouse
+    // contigs (hybrid runs keep those unscored).
+    let (_, hyper_rows) = vcf::hyper_rows(params, sites);
+    let mut hyper_probs: Vec<Option<f64>> = vec![None; hyper_rows.len()];
+    if !hyper_rows.is_empty() {
+        let human_idx: Vec<usize> = (0..hyper_rows.len())
+            .filter(|&i| {
+                !manifest
+                    .as_ref()
+                    .is_some_and(|m| m.kind == "hybrid" && m.owner_of(&hyper_rows[i].key.0) == Some("mouse"))
+            })
+            .collect();
+        if !human_idx.is_empty() {
+            let site_list: Vec<(String, i64)> = human_idx
+                .iter()
+                .map(|&i| hyper_rows[i].key.clone())
+                .collect();
+            let check = if hybrid {
+                score_pipeline::ReferenceCheck::TrustedHybrid
+            } else {
+                score_pipeline::ReferenceCheck::Guardrail
+            };
+            let scored_h = score_pipeline::score_hyper_sites_batched(
+                bam,
+                &params.fasta,
+                &params.bundle,
+                &site_list,
+                params.threads,
+                check,
+            )
+            .map_err(anyhow_stage_err("score"))?;
+            for (k, &i) in human_idx.iter().enumerate() {
+                hyper_probs[i] = Some(scored_h[k]);
+            }
+            eprintln!(
+                "[score] {} tier-2-only rescue sites scored (rescue model)",
+                scored_h.len()
+            );
+        }
+    }
+    if !hyper_rows.is_empty() {
+        use std::fmt::Write as _;
+        let mut htext = String::new();
+        for (row, prob) in hyper_rows.iter().zip(&hyper_probs) {
+            match prob {
+                Some(p) => {
+                    let _ = writeln!(htext, "{}\t{}\t{p}", row.key.0, row.key.1);
+                }
+                None => {
+                    let _ = writeln!(htext, "{}\t{}\tNA", row.key.0, row.key.1);
+                }
+            }
+        }
+        fs::write(dir.join("hyper_scores.tsv"), htext)?;
+    }
+    Ok(ScoreOutcome {
+        probs,
+        hyper_probs,
+        thresholds,
+    })
+}
+
+/// Persisted score-stage state for resumes that skip the stage.
+type ScoreState = (
+    Vec<Option<f64>>,
+    Vec<Option<f64>>,
+    vcf::ScoreThresholds,
+);
+
+/// scores.tsv + hyper_scores.tsv -> probs bridge for resumes that skip the
+/// score stage. `NA` marks unscored rows (hybrid runs: mouse-contig sites).
+fn load_score_state(
+    params: &RunParams,
+    sites: &[(String, i64)],
+) -> Result<ScoreState, FlowError> {
+    let probs = load_scores(&params.out_dir.join("score").join("scores.tsv"))?;
+    let (pass, hyper) = load_cmc_thresholds(&params.bundle)
+        .map_err(|e| anyhow_stage_err("score")(anyhow::anyhow!("{e}")))?;
+    let thresholds = vcf::ScoreThresholds {
+        pass,
+        hyper: Some(hyper),
+    };
+    let mut hyper_probs: Vec<Option<f64>> = Vec::new();
+    if let Ok(text) = fs::read_to_string(params.out_dir.join("score").join("hyper_scores.tsv")) {
+        let mut by_key: std::collections::HashMap<(String, i64), Option<f64>> =
+            std::collections::HashMap::new();
+        for line in text.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() < 3 {
+                continue;
+            }
+            let Ok(pos) = f[1].parse::<i64>() else { continue };
+            let value = if f[2] == "NA" {
+                None
+            } else {
+                f[2].parse::<f64>().ok()
+            };
+            by_key.insert((f[0].to_string(), pos), value);
+        }
+        let (_, rows) = vcf::hyper_rows(params, sites);
+        hyper_probs = rows
+            .iter()
+            .map(|r| by_key.get(&r.key).copied().flatten())
+            .collect();
+    }
+    Ok((probs, hyper_probs, thresholds))
 }
 
 

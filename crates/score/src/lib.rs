@@ -1,12 +1,8 @@
-//! esperanto-score — native Caduceus encoder + 5-fold ensemble head (feature_spec.json v1).
-pub mod bf16gemm;
+//! esperanto-score — CMC feature extraction + frozen CNN/Transformer scoring
+//! (model bundle v1.7 contract).
 pub mod bundle;
-pub mod caduceus;
-pub mod encoder;
-pub mod head;
-pub mod mamba;
+pub mod cmc;
+pub mod cmcnet;
 pub mod pipeline;
-pub mod simdexp;
 
-pub use bundle::{load_bundle, Bundle, EmbCache, NormStats, ScoreError};
-pub use head::{re_prob_ensemble, re_prob_fold};
+pub use bundle::{is_cmc_bundle, load_cmc_bundle, load_cmc_thresholds, CmcBundle, ScoreError};

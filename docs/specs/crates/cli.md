@@ -87,10 +87,8 @@ Single-site and batch are mutually exclusive; giving both is an error. Output co
 | `--sites` | PathBuf | **required** | `chrom\tpos` 1-based (pos ≥ 1, validated at library level) |
 | `--fasta` | PathBuf | refs probing by default | reference (needs .fai) |
 | `--bundle` | PathBuf | zero-config 5-level | model bundle root |
-| `--caduceus` | PathBuf | resolved within bundle | encoder directory |
 | `--out` | PathBuf | **required** | TSV `chrom\tpos\tprob` |
 | `--threads` | usize | 0 | threads |
-| `--batch` | usize | 256 | batch size |
 
 ### run — full-pipeline orchestration (→ `flow::run_pipeline`)
 
@@ -104,7 +102,6 @@ Single-site and batch are mutually exclusive; giving both is an error. Output co
 | `--gtf` | PathBuf | None (refs probing by default) | annotation |
 | `--snp` | PathBuf | None (refs probing by default) | known-SNP VCF (candidate exclusion) |
 | `--bundle` | PathBuf | zero-config 5-level | model bundle |
-| `--caduceus` | PathBuf | resolved within bundle | encoder |
 | `--l1-bundle` | PathBuf | None | L1 engine |
 | `--out` | PathBuf | **required** | output root |
 | `--threads` | usize | 0 | threads |
@@ -120,12 +117,12 @@ Everything follows "explicit flag first; probing only fills blanks". The first l
 ### bundle (5 levels, used by run / score)
 
 1. `ESPERANTO_BUNDLE` environment variable;
-2. `CARGO_MANIFEST_DIR/../../../bundle/human/esperanto-model-v1.4.1-501_40ep/rust` (source tree);
-3. `<exe>/bundle/human/esperanto-model-v1.4.1-501_40ep/rust` and `<exe>/../bundle/human/esperanto-model-v1.4.1-501_40ep/rust` (release package);
-4. `~/.local/share/esperanto/bundle/bundle/human/esperanto-model-v1.4.1-501_40ep/rust`;
+2. `CARGO_MANIFEST_DIR/../../../bundle/human/esperanto-model-v1.7.0/rust` (source tree);
+3. `<exe>/bundle/human/esperanto-model-v1.7.0/rust` and `<exe>/../bundle/human/esperanto-model-v1.7.0/rust` (release package);
+4. `~/.local/share/esperanto/bundle/bundle/human/esperanto-model-v1.7.0/rust`;
 5. No hit → error.
 
-Validity at each level: the directory contains `norm.json`.
+Validity at each level: the directory contains `net_main.safetensors`.
 
 ### refs (4 levels, used by run's fasta/gtf/snp/index, scan's fasta/snp and score's fasta)
 
@@ -133,9 +130,6 @@ Validity at each level: the directory contains `norm.json`.
 
 Directory validity: contains a `*.fa` with a same-named `.fai`. File location: fasta = `hg38.fa` preferred, otherwise the first `*.fa` in lexicographic order; gtf = first `*.gtf`; snp = the first `*.vcf`/`*.vcf.gz` whose name contains `snp`; index = first `*.paidx`. **Only fills blanks; never overrides explicit values.**
 
-### caduceus
-
-When `--caduceus` is omitted → `score::pipeline::resolve_encoder_from_bundle(bundle)` (`bundle/encoder` → `bundle/../encoder`, requires `model.safetensors`).
 
 ## Exit codes and errors
 

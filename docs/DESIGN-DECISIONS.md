@@ -123,6 +123,25 @@ feature lets the model recognize these sites directly; retraining on
 retrained — its threshold is low enough that hyperedited sites pass
 through, so its 8-dim weights are zero-padded to 9 dims.
 
+## Scoring model v1.7.0 (frozen 2026-09-14)
+
+Scoring is replaced by two donor-disjoint trained networks (identical
+architecture, 847k parameters) over 16x50 flank-center joint base-frequency
+features extracted straight from the BAM (`cmc-cigar-window-1`; MAPQ >= 20,
+base quality >= 13, flags 3844 excluded, per-template best-quality base
+consensus, collapsed-rescue reads included with their original query
+bases). The model reads no reference sequence. Labeling: DNA-mutation
+negatives require the exact reference>alternate allele in the donor's
+high-coverage WGS genotype; RNA-editing labels are weak candidate labels
+(WGS noncalls do not establish callable reference genotypes). The main
+network (DNA mutation vs ordinary editing) reaches AUROC 0.9996 on the
+held-out 20-donor test set; the hyper network (ordinary editing vs
+rescue-supported editing candidate) scores Tier-2-only sites. Decision
+thresholds are validation-donor calibrated (main: DM FPR <= 1%, 0.2854;
+hyper: ordinary-editing FPR <= 5%, 0.3624) and ship inside the bundle.
+The previous encoder + fusion-head path (and its GPU channel, embedding
+cache and mouse bundle) is removed.
+
 ## Candidate convention (2026-09-04)
 
 Candidate discovery follows the REDItools counting convention: reads with

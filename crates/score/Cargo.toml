@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 esperanto-bamio = { path = "../bamio" }
 ndarray.workspace = true
-half.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 safetensors.workspace = true
@@ -15,18 +14,10 @@ rust-htslib.workspace = true
 rayon.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
-faer.workspace = true
-esperanto-pile = { path = "../pile" }
-
-candle-core = { workspace = true, optional = true }
-
-[features]
-gpu = ["dep:candle-core", "candle-core/cuda"]
+libm.workspace = true
 
 [[example]]
-name = "gpu_parity"
-required-features = ["gpu"]
+name = "cmc_parity"
 
 [[example]]
-name = "gpu_smoke"
-required-features = ["gpu"]
+name = "cmc_extract_parity"
