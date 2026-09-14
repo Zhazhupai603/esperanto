@@ -3,6 +3,41 @@
 All notable changes to ESPERANTO are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning follows [SemVer](https://semver.org/).
 
+## [1.0.6] - 2026-09-14
+
+### Changed
+
+- Site scoring is replaced by a new frozen model bundle (v1.7.0): a
+donor-disjoint trained CNN + Transformer over 16x50 flank-center joint base
+frequency features computed directly from the alignment (schema
+`cmc-cigar-window-1`; reads with MAPQ >= 20, base quality >= 13, no
+secondary/supplementary/duplicate records; per-template best-quality base
+consensus). The model reads no reference sequence — the FASTA is only used
+for the species guardrail. On the held-out 20-donor test set the classifier
+reaches AUROC 0.9996 (input-matched DEMINING controls: 0.917); the frozen
+decision threshold (DM false-positive rate <= 1% on validation donors)
+ships inside the bundle and the VCF FILTER criteria follow it
+(PASS = RE_PROB >= threshold, printed in the header) instead of the fixed
+0.5.
+- Tier-2-only sites (hyperedited-region calls from rescued reads) are now
+model-scored instead of reported unscored: the bundle carries a second
+rescue-trained network whose frozen threshold (5% ordinary-editing
+false-positive rate on validation donors) decides PASS; sites below it (or
+without a score) keep FILTER=HYPER. HYPER_READS/HYPER_REGION annotations
+are unchanged.
+- The score stage runs on the CPU — the previous Caduceus-Mamba encoder and
+  its fusion heads, the embedding cache, the CUDA/GPU channel and the
+  `--device`/`--caduceus` options are removed entirely. The new network is
+  small enough that no accelerator is needed (16k sites score in ~10 s on 16
+  threads).
+- Hybrid knock-in runs: the previous mouse bundle was an encoder-based model
+  and is gone with the encoder path; mouse-contig sites are now always
+  reported UNSCORED with VAF/depth kept. Human-locus sites score with the
+  new model as before.
+- `score/hyper_scores.tsv` persists the rescue-site probabilities so
+  resumed runs reproduce the VCF verbatim.
+
+
 ## [1.0.5] - 2026-09-11
 
 ### Changed

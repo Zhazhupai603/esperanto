@@ -3,9 +3,7 @@
 use std::path::PathBuf;
 
 use clap::Args;
-use esperanto_flow::DeviceAsk;
 
-use crate::confirm::DeviceArg;
 
 #[derive(Args)]
 pub struct RunArgs {
@@ -44,9 +42,6 @@ pub struct RunArgs {
     /// Model bundle root (default: zero-config 5-level fallback).
     #[arg(long)]
     bundle: Option<PathBuf>,
-    /// Caduceus encoder dir (default: resolved inside the bundle).
-    #[arg(long)]
-    caduceus: Option<PathBuf>,
     /// Optional L1 engine bundle.
     #[arg(long)]
     l1_bundle: Option<PathBuf>,
@@ -66,9 +61,6 @@ pub struct RunArgs {
     /// score batch size.
     #[arg(long, default_value_t = 256)]
     batch: usize,
-    /// Encoder device: auto (ask when a CUDA GPU is detected), cpu, or gpu.
-    #[arg(long, value_enum, default_value_t = DeviceArg::Auto)]
-    device: DeviceArg,
 }
 
 pub fn run(a: RunArgs) -> anyhow::Result<()> {
@@ -126,13 +118,10 @@ let bundle = crate::resolve::bundle(&a.bundle)?;
         gtf,
         snp,
         bundle,
-        caduceus: a.caduceus,
         l1_bundle,
         out_dir: out_dir.clone(),
         threads: crate::resolve::threads(a.threads),
         batch: a.batch,
-        device: a.device.resolve(),
-        device_ask: Some(DeviceAsk::new(crate::confirm::ask_use_gpu)),
         rescue_control: a.rescue_control,
         stop_after: a.stop_after,
     };
@@ -189,7 +178,6 @@ mod tests {
             gtf: None,
             snp: None,
             bundle: None,
-            caduceus: None,
             l1_bundle: None,
             out: "out".into(),
             sample: None,
@@ -198,7 +186,6 @@ mod tests {
             batch: 64,
             rescue_control: false,
             stop_after: None,
-            device: crate::confirm::DeviceArg::Auto,
         }
     }
 

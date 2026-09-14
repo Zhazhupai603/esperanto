@@ -2,7 +2,7 @@
 
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Language: Rust](https://img.shields.io/badge/language-Rust-orange.svg)
-![Version](https://img.shields.io/badge/version-1.0.5-green.svg)
+![Version](https://img.shields.io/badge/version-1.0.6-green.svg)
 
 ESPERANTO is a command-line toolkit for detecting RNA editing (A-to-I) sites from RNA-seq data. It runs quality control, splice-aware alignment, candidate calling, and deep-model scoring as a single deterministic pipeline, and reports editing sites in VCF format with calibrated probabilities. The whole pipeline ships as one self-contained binary with no runtime dependencies beyond a reference FASTA and its index.
 
@@ -16,9 +16,9 @@ ESPERANTO is a command-line toolkit for detecting RNA editing (A-to-I) sites fro
   - *Tier 1* aligns strictly, with no editing exemption, so an ordinarily-edited read is placed on its own four-letter evidence.
   - *Tier 2* takes the reads Tier 1 refused (unmapped, or placed with most of the read soft-clipped) and realigns them against collapsed-alphabet indexes (A==G, T==C) in the four passes the method requires. Each placement is re-verified against the true four-letter reference, and a read that verifies under both directions is ambiguous and dropped. Verified reads are written back with an `RE:Z:collapsed` tag, capped at MAPQ 20.
 - **Candidate-vote re-alignment (`verify` stage):** Every candidate's supporting reads are re-aligned across the whole reference in exhaustive mode; a read's vote is kept only when the site-supporting placement is unambiguously best.
-- **Hyperedited-region calling (`hyper` stage):** Collapsed-rescue reads are clustered into regions (dir-stranded), reported as a region track in the HTML report, and sites supported only by Tier-2 (collapsed) evidence are marked `FILTER=HYPER` in the VCF.
+- **Hyperedited-region calling (`hyper` stage):** Collapsed-rescue reads are clustered into regions (dir-stranded), reported as a region track in the HTML report, and sites supported only by Tier-2 (collapsed) evidence are scored by a rescue-trained model — they PASS above the bundle's frozen rescue threshold and keep `FILTER=HYPER` below it.
 - **Standardized candidate calling:** Uses the standard REDItools counting convention (MAPQ >= 20, base quality >= 30, coverage >= 10, >= 2 editing-consistent reads, frequency >= 1%). On the same BAM, the candidate table is identical to REDItools; known SNPs (dbSNP common) are removed when a SNP VCF is present.
-- **Deep-model scoring:** Site scoring with a frozen Caduceus-Mamba model (5-fold ensemble) over the same read set the candidate scan counted.
+- **Deep-model scoring:** Site scoring with a frozen CNN + Transformer over 16x50 flank-center joint base-frequency features extracted straight from the alignment (donor-disjoint training with WGS-confirmed DNA-mutation negatives; held-out test AUROC 0.9996). The calibrated decision threshold ships inside the model bundle and drives the VCF FILTER criteria.
 - **Interactive HTML report:** Every run ends with a self-contained HTML report (`<out>/<sample>/<sample>.report.html`, opens in any browser) featuring sample metrics, a drill-down genome explorer, gene search, and a recoded-protein table.
 - **Performance:** The `map` stage processes a full 38.6M-pair 151 bp PE RNA-seq sample in about 35 minutes on 32 threads (deterministic output).
 - **Deterministic:** Identical input produces byte-identical output at any thread count.
@@ -44,29 +44,10 @@ is available, so the download never lands on a machine it cannot run on.
 
 Re-run the same command to upgrade.
 
-### Pre-built binary (Linux x86_64)
-
-```sh
-curl -fsSL https://github.com/Zhazhupai603/esperanto/releases/latest/download/install.sh | sh
-```
-
-The installer places:
-- the `esperanto` binary — `~/.local/bin/`
-- the model bundle — `~/.local/share/esperanto/bundle/`
-
-Re-run the same command to upgrade.
-
-### GPU acceleration
-
-The installer detects a working NVIDIA driver and picks the GPU-enabled build automatically (CPU-only machines get the CPU build). At runtime, the score stage detects a CUDA GPU and asks once whether to use it; without a GPU nothing is asked and the CPU path runs (measured ~1.9× over a 4-core CPU at 20k sites; numerics match the CPU path within 3e-4 per site):
-
-- `--device auto` (default): ask once when a GPU is detected, CPU otherwise
-- `--device cpu`: force the CPU path (never asks)
-- `--device gpu`: require a CUDA GPU (clear error when none initializes)
 
 ### Build from source
 
-Release builds target x86-64-v3 (AVX2, essentially all x86 servers since 2013) by default; a runtime fallback keeps the packed DP kernels scalar when AVX2 is unavailable (`ESP_NO_SIMD=1` forces scalar), but the default build profile assumes an AVX2-capable CPU. Include the CUDA channel with `cargo build --release --features gpu` (needs the CUDA toolkit at build time and an NVIDIA driver at run time).
+Release builds target x86-64-v3 (AVX2, essentially all x86 servers since 2013) by default; a runtime fallback keeps the packed DP kernels scalar when AVX2 is unavailable (`ESP_NO_SIMD=1` forces scalar), but the default build profile assumes an AVX2-capable CPU.
 
 ```sh
 git clone https://github.com/Zhazhupai603/esperanto.git
@@ -125,7 +106,7 @@ Each run lands in a sample-scoped directory `<out>/<sample>/` (override the samp
 
 ### Knock-in mouse models (e.g. APOE knock-in)
 
-Setup stages the human reference (the mouse reference is fetched automatically on the first hybrid run, with parallel resumable downloads), and `run --hybrid GENE[,GENE...]` splices the selected human gene loci onto the mouse baseline — building the hybrid index on first use and reusing it on later runs. Scoring routes per contig: human-locus sites use the human model, mouse-contig sites use the mouse model (installed bundles only; without a mouse bundle, mouse-contig sites are reported UNSCORED with VAF/depth):
+Setup stages the human reference (the mouse reference is fetched automatically on the first hybrid run, with parallel resumable downloads), and `run --hybrid GENE[,GENE...]` splices the selected human gene loci onto the mouse baseline — building the hybrid index on first use and reusing it on later runs. Human-locus sites are scored with the bundled human model; mouse-contig sites are reported UNSCORED with VAF/depth kept (the model bundle targets human RNA editing):
 
 ```sh
 esperanto run --r1 reads_R1.fq.gz --r2 reads_R2.fq.gz --out runs/ --hybrid APOE
@@ -156,7 +137,7 @@ esperanto <COMMAND> [OPTIONS]
 | `pile` | 9-dim pileup features for a single site or a site list |
 | `scan` | A-to-I candidate site discovery (REDItools counting convention, SNP exclusion) |
 | `verify` | Re-align candidate-supporting reads; withdraw ambiguous votes |
-| `score` | RE_PROB scoring: encoder + 5-fold ensemble |
+| `score` | RE_PROB scoring with the installed model bundle |
 | `run` | Full pipeline: qc → map → sort → scan → verify → hyper → score → vcf + HTML report |
 | `report` | Regenerate the HTML report for an existing run directory |
 | `resume` | Continue an interrupted run from the first broken stage |
@@ -175,7 +156,6 @@ Each subcommand supports `--help`.
 | `--bundle PATH` | `score`, `run` | override the auto-detected model bundle |
 | `--l1-bundle PATH` | `map`, `run` | override the auto-detected L1 engine bundle |
 | `--batch N` | `score`, `run` | score batch size (default 256) |
-| `--device auto\|cpu\|gpu` | `score`, `run` | score device; `auto` uses a detected CUDA GPU, CPU otherwise |
 | `--sample NAME` | `run` | sample directory name under `--out` (default: derived from the R1/BAM file name) |
 | `--hybrid [GENES]` | `run` | knock-in mouse: splice these human gene loci onto the mouse reference (bare flag opens the interactive gene picker) |
 | `--stop-after <STAGE>` | `run` | stop after the named stage (`qc\|map\|sort\|scan\|verify\|hyper\|score\|vcf`) (inspection switch; not recorded for resume) |
@@ -204,8 +184,8 @@ When an option is omitted, inputs are resolved automatically (first hit wins):
 | File | Content |
 |---|---|
 | `<out>/<sample>/scan/candidates.bed` | candidate sites: `chrom pos0 pos1 ref depth A C G T edit_freq` |
-| `<out>/<sample>/score/scores.tsv` | `chrom`, `pos`, `RE_PROB` for every scored site |
-| `<out>/<sample>/sites.vcf` | final calls. `FILTER` is `PASS` / `LOW_SCORE` / `UNSCORED` only when no analysis tag blocks the site; otherwise `FILTER` lists the blocking tags (`SPLICE_ADJ`, `HOMOPOLYMER`, `SIMPLE_REPEAT`, `RETROCOPY`, `REALIGN`). `HYPER` marks Tier-2-only sites. `INFO` carries `RE_PROB`, `VAF`, `DEPTH`, `AC` per-base counts, strand annotations, `TAGS` (filter annotations that never remove rows), and `HYPER_READS`/`HYPER_REGION` where applicable. |
+| `<out>/<sample>/score/scores.tsv` | `chrom`, `pos`, `RE_PROB` for every scored site (`score/hyper_scores.tsv` carries the rescue-site probabilities) |
+| `<out>/<sample>/sites.vcf` | final calls. `FILTER` is `PASS` / `LOW_SCORE` / `UNSCORED` only when no analysis tag blocks the site; otherwise `FILTER` lists the blocking tags (`SPLICE_ADJ`, `HOMOPOLYMER`, `SIMPLE_REPEAT`, `RETROCOPY`, `REALIGN`). `PASS` follows the model bundle's frozen threshold (printed in the header). `HYPER` marks Tier-2-only sites below the rescue-model threshold. `INFO` carries `RE_PROB`, `VAF`, `DEPTH`, `AC` per-base counts, strand annotations, `TAGS` (filter annotations that never remove rows), and `HYPER_READS`/`HYPER_REGION` where applicable. |
 | `<out>/<sample>/<sample>.report.html` | self-contained interactive report (metrics, genome explorer with a red hyperedited-region track, gene search, recoded proteins) |
 
 ## Guarantees
@@ -222,8 +202,7 @@ When an option is omitted, inputs are resolved automatically (first hit wins):
 
 ## References
 
-- Schiff et al. Caduceus: bi-directional equivariant long-range DNA sequence modeling. 2024.
-- Gu and Dao. Mamba: linear-time sequence modeling with selective state spaces. 2023.
+- Zhang et al. DeepDDR: a deep learning method for predicting RNA A-to-I editing sites from DNA sequence characteristics. Front Genet, 2022.
 
 ## License
 

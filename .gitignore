@@ -6,3 +6,4 @@ worknotes/
 .playwright-mcp/
 *.png
 papers/
+/target-x86-64-baseline/

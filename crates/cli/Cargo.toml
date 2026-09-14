@@ -26,6 +26,3 @@ flate2.workspace = true
 tar.workspace = true
 crossterm.workspace = true
 ureq.workspace = true
-
-[features]
-gpu = ["esperanto-score/gpu"]

@@ -1,42 +1,32 @@
-# score — RE_PROB model forward pass (Caduceus-Mamba encoder + 5-fold fusion head)
+# score — RE_PROB model forward pass (CMC CNN + Transformer, bundle v1.7)
 
-BAM + sites → RE_PROB TSV (chrom pos prob; row order = input sites row order). Semantic source: a wholesale port of the legacy esperanto-score scoring pipeline; model and scoring semantics frozen; the gold-standard metrics (AUROC/AUPRC) must not regress.
+BAM + sites -> RE_PROB (chrom pos prob; row order = input sites row order). Model and scoring semantics are frozen; the gold-standard metrics (AUROC/AUPRC) must not regress.
 
 ## bundle (zero-config resolution)
 
-- Layout: bundle root (encoder/model.safetensors + config.json) + `rust/` (heads/fold_{0..4}.safetensors, norm.json, feature_spec.json). Extra files (for example an older bundle's gate heads) are ignored.
-- `load_bundle(rust_dir)`: 5-fold FoldHead + per-fold NormStats (9-dim mean/std); `half_window` read from feature_spec.sequence.half_window (v1.4.1 = 250 → 501 bp window; looked up in both dir and dir.parent, missing = 500 for compatibility); `cache_id` = hash of the full feature_spec text + half_window.
-- Encoder resolution: when `--caduceus` is omitted, probe bundle/encoder then the bundle parent's encoder (model.safetensors required), in that order.
+- Layout: bundle root (`feature_spec.json`, `model_card.json`, `manifest.sha256`) + `rust/` (`net_main.safetensors`, `net_hyper.safetensors`, `threshold.json`). A directory with `rust/net_main.safetensors` is a CMC bundle (`is_cmc_bundle`).
+- `load_cmc_bundle(rust_dir)`: both networks (shape-validated safetensors loads; every tensor is checked against the frozen architecture) + the frozen thresholds. `load_cmc_thresholds` reads the calibration without loading weights.
+- `threshold.json`: `{"main": {"threshold": T_main}, "hyper": {"threshold": T_hyper}}` — validation-donor calibrated (main: DM false-positive rate <= 1%; hyper: ordinary-editing false-positive rate <= 5%); the VCF FILTER criteria follow these numbers.
 
 ## Feature flow (per site)
 
-1. **pileup 9-dim** (esperanto-pile batch interface over reads with MAPQ >= `pile::MIN_MAPQ` = 20; rtol=0 contract, see pile spec): `[depth, A,C,G,T count, mean_bq, strand_bias, mean_mapq, hyperedited]`.
-2. **Sequence window**: center = pos (1-based), ±half_window; N-pad at contig edges; uppercase; if the fasta lacks the contig → all-N window (no error).
-3. **tokenizer**: A7 C8 G9 T10 N11, others → 6 [UNK], trailing SEP=1, no BOS (total length 2·half+2 = 502).
-4. **encoder**: CaduceusEncoder (Mamba 4L d118, BiMamba RC-equiv, faer GEMM single-threaded Par::Seq; numerical determinism guarded by sub-batch slice comparison), mean-pool → f16[118].
-5. **head**: per-fold z-score (pileup) → MLP (8→32→32, ReLU) → concat(emb118, 32)=150 → MLP (150→128→2) → softmax[1] (fp64 accumulation); ensemble = mean over 5 folds.
+1. **CMC 16x50 tensor** (`cmc.rs`, schema `cmc-cigar-window-1`): window = `[center-25, center+26)` (0-based, half-open), `center = pos-1`; reads with `flag & 3844 == 0` and `MAPQ >= 20`; per-position base quality `>= 13`, base in `ACTG` (a 0xFF quality byte counts as 0); CIGAR walk (M/=/X consume both tracks, I/S the query, D/N the reference, H/P neither, stop once the reference cursor passes the window end); template names strip a trailing `/1`//`/2`; within a template the highest-quality base at each reference position wins, equal-quality disagreements store `N`; a read tagged `RE:Z:collapsed` that yields the center base marks its template (QC only).
+2. Tensor row = `4*flank_index + center_index` over `ACTG` order; column `c` = offset `-25..-1,+1..+25` (center column excluded); a covered column sums to one (integer counts divided in f32 — bit-identical to the reference extractor), an uncovered column is all zeros.
+3. **network** (`cmcnet.rs`): conv1d(16->64,k5,same) -> batchnorm -> gelu -> conv1d(64->128,k3,same) -> batchnorm -> gelu -> transpose to (50,128) -> token embedding (learned cls + position, d=128) -> transformer encoder x4 (8 heads, ff 512, pre-norm, final LayerNorm) -> cls pooling -> linear(128) -> gelu -> linear(2) -> softmax[1] (f64 accumulation). GELU uses the exact erf form evaluated in f64; all storage is f32. 847,042 parameters, identical architecture for both networks.
+4. Output: `RE_PROB` = p(positive class). Main network classes: 0 = DNA mutation (WGS-confirmed exact allele carrier), 1 = RNA editing candidate. Hyper network classes: 0 = ordinary editing candidate, 1 = rescue-supported editing candidate.
 
 ## Pipeline (determinism contract)
 
-- Reference preload: contigs involved in sites are loaded into memory once (uppercase). Pileup features come from the BAM only. **Species guardrail**: chr1 length in .fai must be == 248956422 (hg38) or < 10 Mb (synthetic/test reference), otherwise the run is refused. `ReferenceCheck::TrustedHybrid` (flow only, after the species.json manifest verified the hybrid reference) skips the chr1 heuristic.
-- Sites are sorted by (chrom, pos); pileup features for all sites come from one region-sweep pass (MERGE_GAP groups, one IndexedReader per worker), then sites are cut into batches (default 256), batch-level rayon (0 = all cores); within a batch: sites embedded in EMBED_SLICE=128 sub-batches → fused head; results written back by original index — **thread count and batch size do not change values**.
+- **Species guardrail**: the FASTA index's chr1 length must be 248956422 (hg38) or < 10 Mb (synthetic/test), otherwise refused; `ReferenceCheck::TrustedHybrid` (flow only, after the species.json manifest verified the hybrid reference) skips the chr1 heuristic. The model reads no reference sequence — the FASTA is used for this check only.
+- Sites are sorted by (chrom, pos); CMC extraction runs as region sweeps (one fetch per run of sites within `CMC_MERGE_GAP` = 2000, group cap 16k, one IndexedReader per rayon worker); the network forward runs across sites on the same pool. Results are written back by original index — **thread count does not change values** (every site is scored independently).
+- `score_sites_batched` (main network, ordinary candidates) and `score_hyper_sites_batched` (hyper network, Tier-2-only sites) share the sweep + forward path.
 - Output: TSV `chrom\tpos\tprob` (f64 Display); row order = input order.
 
-## Embedding cache (optional optimization)
+## Parity contracts
 
-ESPEMBC2 format (magic + cache_id + half_window + append records); incompatible → warn and reopen as an empty table; a hit returns the fp16 bit pattern (bit-identical to online embed); flush rewrites atomically (tmp+rename). Pure optimization, no semantics.
-
-## Out of scope (1.0.0)
-
-- corrected_sites.tsv feature source (the EM closed loop depends on the realign crate): not ported; registered in BACKLOG.
-- report stage: deferred to 1.1 (design finalized).
+- Rust CMC extraction is bit-identical to the reference Python extractor on the same BAM (integer counts + single f32 division).
+- The Rust forward matches the exported PyTorch reference on golden vectors (fixed inputs -> reference probabilities) within 5e-4 absolute; measured worst-case on release builds: 4.7e-7. The `cmc_parity` example checks the installed bundle against the golden file; `cmc_extract_parity` dumps raw tensors for extractor comparisons.
 
 ## Dependencies
 
-New workspace-level: ndarray 0.16, half 2.4, safetensors 0.4, faer 0.24.4; existing: rust-htslib, rayon, thiserror, serde/serde_json, anyhow, esperanto-pile (path).
-
-## Self-checks
-
-- z-score/softmax/ensemble match the torch reference with pointwise tolerance at the 1e-6 level (gold-standard probes).
-- Same input twice, threads 1 vs 8, batch 64 vs 1024: output TSV byte-identical.
-- Cold vs warm cache runs: output TSV byte-identical.
+Workspace-level: ndarray 0.16, libm 0.2, safetensors 0.4; existing: rust-htslib, rayon, thiserror, serde/serde_json, anyhow.

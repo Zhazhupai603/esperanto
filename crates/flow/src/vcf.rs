@@ -108,35 +108,27 @@ fn filter_column(base: &str, blocking: &[&str]) -> String {
     }
 }
 
-/// Write `<out>/sites.vcf` (VCF v4.2).
-pub fn write_vcf(
+/// One Tier-2-only (rescued) site row from `hyper/sites.tsv`.
+#[derive(Clone)]
+pub(crate) struct HyperRow {
+    pub key: (String, i64),
+    /// Editing direction, `AG` or `TC`.
+    pub dir: String,
+    pub region: String,
+    pub n: u32,
+}
+
+/// Split `hyper/sites.tsv` into (a) INFO annotations for sites already in the
+/// candidate table and (b) Tier-2-only rows, sorted by coordinate.
+#[allow(clippy::type_complexity)]
+pub(crate) fn hyper_rows(
     params: &RunParams,
-    entry: Entry,
     sites: &[(String, i64)],
-    probs: &[Option<f64>],
-) -> Result<(), FlowError> {
-    let bed_rows: Option<Vec<BedInfo>> = match entry {
-        Entry::BamSites => None,
-        _ => Some(parse_bed_info(
-            &params.out_dir.join("scan").join("candidates.bed"),
-        )?),
-    };
-    // Verified-vote counts (verify stage): sites whose re-aligned support
-    // fell below the floor carry FILTER=REALIGN alongside the score filter.
-    let verified: Option<Vec<u32>> = match entry {
-        Entry::BamSites => None,
-        _ => std::fs::read_to_string(params.out_dir.join("scan").join("candidates.verified.bed"))
-            .ok()
-            .map(|text| parse_alt_verified(&text)),
-    };
-    // Hyperedited-region sites (Stage::Hyper): rescued-read edit positions.
-    // Sites already in candidates annotate INFO; the rest append as
-    // FILTER=HYPER rows (never scored).
-    #[allow(clippy::type_complexity)]
-    let (hyper_info, hyper_extra): (
-        std::collections::BTreeMap<(String, i64), (u32, String)>,
-        Vec<((String, i64), String, String, u32, String)>,
-    ) = match std::fs::read_to_string(params.out_dir.join("hyper").join("sites.tsv")) {
+) -> (
+    std::collections::BTreeMap<(String, i64), (u32, String)>,
+    Vec<HyperRow>,
+) {
+    match std::fs::read_to_string(params.out_dir.join("hyper").join("sites.tsv")) {
         Ok(text) => {
             let known: std::collections::HashSet<(String, i64)> =
                 sites.iter().map(|(c, p)| (c.clone(), *p)).collect();
@@ -155,16 +147,102 @@ pub fn write_vcf(
                 let key = (f[0].to_string(), pos0 + 1);
                 info.insert(key.clone(), (n, f[3].to_string()));
                 if !known.contains(&key) {
-                    extra.push((key, f[4].to_string(), f[3].to_string(), n, String::new()));
+                    extra.push(HyperRow {
+                        key,
+                        dir: f[4].to_string(),
+                        region: f[3].to_string(),
+                        n,
+                    });
                 }
             }
-            extra.sort_by(|a, b| a.0.cmp(&b.0));
+            extra.sort_by(|a, b| a.key.cmp(&b.key));
             (info, extra)
         }
         Err(_) => (std::collections::BTreeMap::new(), Vec::new()),
-    };
+    }
+}
 
-    if let (Some(v), Some(rows)) = (&verified, &bed_rows) {
+/// Decision thresholds the score stage hands to the VCF writer.
+pub struct ScoreThresholds {
+    /// PASS threshold for human-model RE_PROB (0.5 on legacy fusion bundles).
+    pub pass: f64,
+    /// Frozen rescue-model threshold for Tier-2-only rows (CMC bundles only).
+    pub hyper: Option<f64>,
+}
+
+
+/// One Tier-2-only row: PASS above the frozen rescue threshold, FILTER=HYPER
+/// below it or when unscored; HYPER_READS/HYPER_REGION always carried.
+fn write_hyper_row(
+    out: &mut String,
+    row: &HyperRow,
+    prob: Option<f64>,
+    thresholds: &ScoreThresholds,
+) {
+    let (refb, alt) = (
+        row.dir.chars().next().unwrap_or('N'),
+        row.dir.chars().nth(1).unwrap_or('N'),
+    );
+    let pass = prob
+        .zip(thresholds.hyper)
+        .is_some_and(|(p, t)| p >= t);
+    let (filter, mut info) = match prob {
+        Some(p) => (if pass { "PASS" } else { "HYPER" }, format!("RE_PROB={p}")),
+        None => ("HYPER", String::new()),
+    };
+    let sep = if info.is_empty() { "" } else { ";" };
+    let _ = write!(
+        info,
+        "{sep}HYPER_READS={};HYPER_REGION={}",
+        row.n, row.region
+    );
+    let _ = writeln!(
+        out,
+        "{}\t{}\t.\t{}\t{}\t.\t{filter}\t{info}",
+        row.key.0, row.key.1, refb, alt
+    );
+}
+
+/// Write `<out>/sites.vcf` (VCF v4.2).
+pub fn write_vcf(
+    params: &RunParams,
+    entry: Entry,
+    sites: &[(String, i64)],
+    probs: &[Option<f64>],
+    hyper_probs: &[Option<f64>],
+    thresholds: &ScoreThresholds,
+) -> Result<(), FlowError> {
+    let bed_rows: Option<Vec<BedInfo>> = match entry {
+        Entry::BamSites => None,
+        _ => Some(parse_bed_info(
+            &params.out_dir.join("scan").join("candidates.bed"),
+        )?),
+    };
+    // Verified-vote counts (verify stage): sites whose re-aligned support
+    // fell below the floor carry FILTER=REALIGN alongside the score filter.
+    let verified: Option<Vec<u32>> = match entry {
+        Entry::BamSites => None,
+        _ => std::fs::read_to_string(params.out_dir.join("scan").join("candidates.verified.bed"))
+            .ok()
+            .map(|text| parse_alt_verified(&text)),
+    };
+    // Hyperedited-region sites (Stage::Hyper): rescued-read edit positions.
+    // Sites already in candidates annotate INFO; the rest append as Tier-2-only
+    // rows, scored by the rescue model on CMC bundles.
+    let (hyper_info, hyper_extra) = hyper_rows(params, sites);
+    // Hybrid runs: mouse-contig sites keep the legacy mouse-model threshold.
+    let manifest = crate::manifest::SpeciesManifest::read(&params.out_dir);
+    let row_threshold = |chrom: &str| -> f64 {
+        if manifest
+            .as_ref()
+            .is_some_and(|m| m.kind == "hybrid" && m.owner_of(chrom) == Some("mouse"))
+        {
+            0.5
+        } else {
+            thresholds.pass
+        }
+    };
+if let (Some(v), Some(rows)) = (&verified, &bed_rows) {
         if v.len() != rows.len() {
             return Err(FlowError::BedParse {
                 line: 0,
@@ -214,11 +292,22 @@ pub fn write_vcf(
     out.push_str(
         "##INFO=<ID=STRAND,Number=1,Type=String,Description=\"Transcript strand implied by the reference base\">\n",
     );
-    out.push_str("##FILTER=<ID=PASS,Description=\"RE_PROB >= 0.5\">\n");
-    out.push_str("##FILTER=<ID=LOW_SCORE,Description=\"RE_PROB < 0.5\">\n");
+    let pass_desc = if thresholds.pass == 0.5 {
+        "0.5".to_string()
+    } else {
+        format!("{:.4}", thresholds.pass)
+    };
+    let _ = writeln!(
+        out,
+        "##FILTER=<ID=PASS,Description=\"RE_PROB >= {pass_desc}\">"
+    );
+    let _ = writeln!(
+        out,
+        "##FILTER=<ID=LOW_SCORE,Description=\"RE_PROB < {pass_desc}\">"
+    );
     out.push_str("##FILTER=<ID=UNSCORED,Description=\"site on a contig with no matching model (hybrid reference)\">\n");
     out.push_str("##FILTER=<ID=REALIGN,Description=\"fewer than 2 verified supporting reads after exhaustive re-alignment\">\n");
-    out.push_str("##FILTER=<ID=HYPER,Description=\"site in a hyperedited region called from rescued reads (not model-scored)\">\n");
+    out.push_str("##FILTER=<ID=HYPER,Description=\"tier-2-only site in a hyperedited region called from rescued reads, below the rescue model threshold (or unscored)\">\n");
     out.push_str("##INFO=<ID=HYPER_READS,Number=1,Type=Integer,Description=\"rescued reads carrying this edit in the cluster\">\n");
     out.push_str("##INFO=<ID=HYPER_REGION,Number=1,Type=String,Description=\"hyperedited region chrom:start-end\">\n");
     out.push_str("##FILTER=<ID=SIMPLE_REPEAT,Description=\"inside a RepeatMasker simple-repeat or low-complexity region\">\n");
@@ -228,9 +317,10 @@ pub fn write_vcf(
 
     let mut extras_i = 0usize;
     for (i, ((chrom, pos), prob)) in sites.iter().zip(probs).enumerate() {
+        let row_t = row_threshold(chrom);
         let (filter, mut info) = match prob {
             Some(p) => (
-                if *p >= 0.5 { "PASS" } else { "LOW_SCORE" },
+                if *p >= row_t { "PASS" } else { "LOW_SCORE" },
                 format!("RE_PROB={p}"),
             ),
             None => ("UNSCORED", String::new()),
@@ -297,24 +387,27 @@ pub fn write_vcf(
         // replaces the base verdict wholesale.
         let all = filter_column(filter, &blocking);
         // Flush sorted hyper-only rows that belong before this row.
-        while extras_i < hyper_extra.len() && hyper_extra[extras_i].0 < (chrom.clone(), *pos) {
-            let (key, dir, region, n, _) = &hyper_extra[extras_i];
-            let (refb, alt) = (dir.chars().next().unwrap_or('N'), dir.chars().nth(1).unwrap_or('N'));
-            let _ = writeln!(
-                out,
-                "{}\t{}\t.\t{}\t{}\t.\tHYPER\tHYPER_READS={};HYPER_REGION={}",
-                key.0, key.1, refb, alt, n, region
+        while extras_i < hyper_extra.len()
+            && hyper_extra[extras_i].key < (chrom.clone(), *pos)
+        {
+            let row = &hyper_extra[extras_i];
+            write_hyper_row(
+                &mut out,
+                row,
+                hyper_probs.get(extras_i).copied().flatten(),
+                thresholds,
             );
             extras_i += 1;
         }
         let _ = writeln!(out, "{chrom}\t{pos}\t.\t{refb}\t{alt}\t.\t{all}\t{info}");
     }
-    for (key, dir, region, n, _) in &hyper_extra[extras_i.min(hyper_extra.len())..] {
-        let (refb, alt) = (dir.chars().next().unwrap_or('N'), dir.chars().nth(1).unwrap_or('N'));
-        let _ = writeln!(
-            out,
-            "{}\t{}\t.\t{}\t{}\t.\tHYPER\tHYPER_READS={};HYPER_REGION={}",
-            key.0, key.1, refb, alt, n, region
+    let leftover = extras_i.min(hyper_extra.len());
+    for (i, row) in hyper_extra[leftover..].iter().enumerate() {
+        write_hyper_row(
+            &mut out,
+            row,
+            hyper_probs.get(leftover + i).copied().flatten(),
+            thresholds,
         );
     }
 
@@ -325,6 +418,37 @@ pub fn write_vcf(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hyper_rows_render_against_the_frozen_threshold() {
+        let row = HyperRow {
+            key: ("chr1".into(), 1000),
+            dir: "AG".into(),
+            region: "chr1:900-1100".into(),
+            n: 4,
+        };
+        let t = ScoreThresholds {
+            pass: 0.2854,
+            hyper: Some(0.3624),
+        };
+        let mut out = String::new();
+        write_hyper_row(&mut out, &row, Some(0.9), &t);
+        assert_eq!(
+            out,
+            "chr1\t1000\t.\tA\tG\t.\tPASS\tRE_PROB=0.9;HYPER_READS=4;HYPER_REGION=chr1:900-1100\n"
+        );
+        let mut out = String::new();
+        write_hyper_row(&mut out, &row, Some(0.1), &t);
+        assert!(out.contains("\tHYPER\t"));
+        assert!(out.contains("RE_PROB=0.1"));
+        // unscored: legacy rendering, no RE_PROB
+        let mut out = String::new();
+        write_hyper_row(&mut out, &row, None, &t);
+        assert_eq!(
+            out,
+            "chr1\t1000\t.\tA\tG\t.\tHYPER\tHYPER_READS=4;HYPER_REGION=chr1:900-1100\n"
+        );
+    }
 
     #[test]
     fn filter_column_never_mixes_pass_with_blockers() {

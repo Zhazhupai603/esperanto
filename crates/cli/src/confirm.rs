@@ -69,41 +69,6 @@ pub fn confirmed(prompt: &str, labels: (&str, &str), yes: bool) -> anyhow::Resul
     }
 }
 
-/// CLI `--device` values (clap ValueEnum) -> score-pipeline device choice.
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
-pub enum DeviceArg {
-    /// GPU when available and accepted interactively; otherwise CPU.
-    Auto,
-    /// Force CPU.
-    Cpu,
-    /// Force GPU (error if this build lacks GPU support or no CUDA device is found).
-    Gpu,
-}
-
-impl DeviceArg {
-    pub fn resolve(self) -> esperanto_score::pipeline::DeviceChoice {
-        match self {
-            DeviceArg::Auto => esperanto_score::pipeline::DeviceChoice::Auto,
-            DeviceArg::Cpu => esperanto_score::pipeline::DeviceChoice::Cpu,
-            DeviceArg::Gpu => esperanto_score::pipeline::DeviceChoice::Gpu,
-        }
-    }
-}
-
-/// The auto-mode GPU ask, at most ONCE per process (arrow-key selector; non-TTY or declined
-/// -> CPU silently). Invoked by the score stage only when the build has GPU support and a CUDA
-/// device actually initializes.
-pub fn ask_use_gpu() -> bool {
-    static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ANSWER.get_or_init(|| {
-        confirmed(
-            "A CUDA GPU was detected (use it for the score stage?)",
-            ("No, use CPU", "Yes, use GPU"),
-            false,
-        )
-        .unwrap_or(false)
-    })
-}
 
 /// Interactive multi-select over `items` (e.g. gene symbols): type to filter,
 /// Up/Down (j/k) to move, Space to toggle, Enter confirms (needs ≥ 1 pick),

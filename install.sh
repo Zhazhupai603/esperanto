@@ -9,37 +9,16 @@
 #   ESPERANTO_TARBALL local tarball path (skips download when set)
 set -eu
 
-VERSION="v1.0.5"
+VERSION="v1.0.6"
 ARCH="linux-x86_64"
-PKG_BASE="esperanto-1.0.5-${ARCH}"
+PKG_BASE="esperanto-1.0.6-${ARCH}"
 
 # CPU build selection: prefer the AVX2-optimized (-v3) build when the local
 # CPU supports it, fall back to the portable baseline build.
+CANDIDATES="''"
 if grep -qw avx2 /proc/cpuinfo 2>/dev/null; then
-    CPUV="v3"
-else
-    CPUV=""
+    CANDIDATES="v3 ''"
 fi
-
-# Machines with a working NVIDIA driver prefer the GPU-enabled variant of the
-# selected CPU build; each missing package falls back to the next candidate.
-GPUV=""
-if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
-    GPUV="-gpu"
-fi
-
-suffix_for() {
-    # $1 = cpu variant (v3|""), $2 = gpu variant (-gpu|"")
-    if [ "$1" = "v3" ] && [ "$2" = "-gpu" ]; then
-        echo "-v3-gpu"
-    elif [ "$1" = "v3" ]; then
-        echo "-v3"
-    else
-        echo "$2"
-    fi
-}
-
-CANDIDATES="$(suffix_for "$CPUV" "$GPUV") $(suffix_for "$CPUV" "") $(suffix_for "" "$GPUV") $(suffix_for "" "")"
 
 BASE_URL="https://github.com/Zhazhupai603/esperanto/releases/download/${VERSION}"
 PREFIX="${ESPERANTO_PREFIX:-$HOME/.local}"

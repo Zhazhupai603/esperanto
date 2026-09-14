@@ -7,9 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail};
 
 /// Bundle location relative to a layout root (v1.6.0 contract name).
-const BUNDLE_REL: &str = "bundle/human/esperanto-model-v1.6.0/rust";
-/// Mouse model bundle location relative to a layout root.
-const MOUSE_BUNDLE_REL: &str = "bundle/mouse/esperanto-model-v0.9-mouse/rust";
+const BUNDLE_REL: &str = "bundle/human/esperanto-model-v1.7.0/rust";
 /// Preferred FASTA name inside a refs directory.
 const PREFERRED_FASTA: &str = "hg38.fa";
 
@@ -56,7 +54,7 @@ fn home_data_dir() -> Option<PathBuf> {
 }
 
 fn valid_bundle(p: &Path) -> bool {
-    p.join("norm.json").is_file()
+    p.join("norm.json").is_file() || p.join("net_main.safetensors").is_file()
 }
 
 /// Resolve the model bundle: explicit flag wins, else 5-level fallback.
@@ -97,38 +95,6 @@ pub fn bundle(explicit: &Option<PathBuf>) -> anyhow::Result<PathBuf> {
             .collect::<Vec<_>>()
             .join("\n  ")
     )
-}
-
-/// Resolve the mouse model bundle: explicit env var wins, then the same
-/// 4-level layout discovery as the human bundle. Ok(None) when absent
-/// (hybrid runs fall back to UNSCORED mouse sites).
-pub fn mouse_bundle() -> Option<PathBuf> {
-    if let Ok(v) = std::env::var("ESPERANTO_MOUSE_BUNDLE") {
-        let p = PathBuf::from(v);
-        if valid_bundle(&p) {
-            return Some(p);
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let mut cands = vec![dir.join(MOUSE_BUNDLE_REL)];
-            if let Some(up) = dir.parent() {
-                cands.push(up.join(MOUSE_BUNDLE_REL));
-            }
-            for c in cands {
-                if valid_bundle(&c) {
-                    return Some(c);
-                }
-            }
-        }
-    }
-    if let Some(home) = home_data_dir() {
-        let p = home.join(MOUSE_BUNDLE_REL);
-        if valid_bundle(&p) {
-            return Some(p);
-        }
-    }
-    None
 }
 
 /// Resolved files inside a refs directory.
