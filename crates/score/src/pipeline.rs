@@ -1,303 +1,25 @@
 //! score pipeline: BAM + sites -> RE_PROB (row order = input order).
 //!
-//! Reference preload + species guard + (chrom,pos) sorted batching + batch-level rayon;
-//! within a batch: pileup -> embed -> fusion head.
-//! Deterministic: thread count / batch size do not change the numerics.
-//! Semantics from flow::score_sites_batched (the corrected feature source is out of scope for 1.0.0).
+//! CMC feature extraction straight from the BAM (region-grouped sweep, one
+//! IndexedReader per worker) followed by the frozen network forward, parallel
+//! across sites. Deterministic: thread count does not change the numerics —
+//! every site is scored independently and written back by its original index.
 //!
-//! Device: `Cpu` = the rayon batch pool (unchanged production path); `Gpu` = a 1-deep overlap
-//! pipeline — a small pool of pileup workers (one IndexedReader each) computes the CPU half of
-//! upcoming batches while the main thread embeds the current batch on ONE shared
-//! `GpuCaduceusEncoder` and runs the same fusion head; results join by batch index.
-//! `Auto` = GPU only when the build has the feature, a CUDA
-//! device initializes AND the `device_ask` callback (the CLI's interactive selector) accepts.
-//! The pileup/gate/head/cache logic is shared verbatim between the modes — only the embed
-//! source differs.
+//! The FASTA is used for the species guardrail only; the model reads no
+//! reference sequence.
 
 use anyhow::{anyhow, Context, Result};
 use rayon::prelude::*;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 
-use crate::bundle::{load_bundle, Bundle, EmbCache};
-use crate::caduceus::{CaduceusEncoder, EmbedBatchBufs, D_MODEL};
-use crate::encoder::{fetch_window_mem_hw, tokenize};
-use crate::head::re_prob_ensemble;
-
-/// Batch-level worker: one per rayon thread (BAM reader + reused encoding buffers).
-/// Compute device for the encoder stage (CLI `--device`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum DeviceChoice {
-    /// GPU when the build supports it, a device initializes and the user accepts; else CPU.
+/// Species-guard mode for [`score_sites_batched`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReferenceCheck {
+    /// Default: the fasta's chr1 must match hg38 (or be a small synthetic reference).
     #[default]
-    Auto,
-    /// Force the CPU rayon path (production default).
-    Cpu,
-    /// Force the GPU path; hard error if unsupported.
-    Gpu,
-}
-
-/// True when this build has the `gpu` feature AND a CUDA device initializes.
-/// Feature-less builds answer false without touching any CUDA library.
-pub fn gpu_available() -> bool {
-    #[cfg(feature = "gpu")]
-    {
-        candle_core::Device::new_cuda(0).is_ok()
-    }
-    #[cfg(not(feature = "gpu"))]
-    {
-        false
-    }
-}
-
-/// The per-batch embed source: the CPU faer/AVX-512 path or the CUDA candle path.
-/// Both consume the same site-major token batches and emit the same fp16 embeddings.
-enum Embedder<'a> {
-    Cpu(&'a CaduceusEncoder),
-    #[cfg(feature = "gpu")]
-    Gpu(&'a crate::caduceus::gpu_encoder::GpuCaduceusEncoder),
-}
-
-impl Embedder<'_> {
-    /// tokens -> per-site fp16 embeddings, in EMBED_SLICE sub-batches (numerics are
-    /// per-site independent; slicing only changes GEMM shapes — identical to the
-    /// production CPU slicing).
-    fn embed(
-        &self,
-        toks: &[i64],
-        tok_len: usize,
-        bufs: &mut EmbedBatchBufs,
-    ) -> Result<Vec<[half::f16; D_MODEL]>, String> {
-        const EMBED_SLICE: usize = 128;
-        let n_miss = toks.len() / tok_len;
-        let mut embs: Vec<[half::f16; D_MODEL]> = Vec::with_capacity(n_miss);
-        for sub_toks in toks.chunks(EMBED_SLICE * tok_len) {
-            let n_sub = sub_toks.len() / tok_len;
-            let sub = match self {
-                Embedder::Cpu(enc) => enc.embed_batch(sub_toks, n_sub, tok_len, bufs),
-                #[cfg(feature = "gpu")]
-                Embedder::Gpu(g) => g.embed_batch(sub_toks, n_sub, tok_len),
-            }
-            .map_err(|e| format!("embed_batch slice: {e}"))?;
-            embs.extend(sub);
-        }
-        Ok(embs)
-    }
-}
-
-/// Shared per-chunk context (everything the batch body needs beyond the worker state).
-struct ChunkCtx<'a> {
-    bundle: &'a Bundle,
-    refmap: &'a std::collections::HashMap<String, Arc<Vec<u8>>>,
-    half_window: i64,
-    tok_len: usize,
-    emb_cache: Option<&'a Arc<Mutex<EmbCache>>>,
-}
-
-/// CPU-side half of a batch (the GPU pipeline's producer work): pileup ->
-/// cache split -> tokenize misses. Everything before the device-dependent embed; carried
-/// across the producer->consumer channel by the GPU overlap pipeline.
-struct ChunkCpuWork {
-    piles: Vec<[f32; esperanto_pile::N_FEATURES]>,
-    final_probs: Vec<Option<f64>>,
-    keep_idx: Vec<usize>,
-    kept_hit: Vec<Option<[u16; D_MODEL]>>,
-    toks: Vec<i64>,
-}
-
-/// Producer half of `process_chunk`: cache split + tokenize (no embed, no head).
-/// Pileup features arrive precomputed from the region-sweep pass (phase 1).
-fn process_chunk_cpu_half(
-    ctx: &ChunkCtx,
-    chunk: &[(String, i64)],
-    piles: Vec<[f32; esperanto_pile::N_FEATURES]>,
-) -> Result<ChunkCpuWork, String> {
-    let final_probs: Vec<Option<f64>> = vec![None; chunk.len()];
-    let keep_idx: Vec<usize> = (0..chunk.len()).collect();
-    // Cache split -- a hit yields the fp16 bit pattern (bit-identical to online
-    // embed); misses are collected into the toks batch (order preserved).
-    let mut kept_hit: Vec<Option<[u16; D_MODEL]>> = keep_idx.iter().map(|_| None).collect();
-    let mut toks: Vec<i64> = Vec::with_capacity(keep_idx.len() * ctx.tok_len);
-    {
-        let mut miss_ki: Vec<usize> = Vec::new();
-        if let Some(c) = ctx.emb_cache {
-            let guard = c.lock().unwrap();
-            for (ki, &bi2) in keep_idx.iter().enumerate() {
-                let (chrom, pos) = &chunk[bi2];
-                if let Some(bits) = guard.get(chrom, *pos as u32) {
-                    kept_hit[ki] = Some(bits);
-                } else {
-                    miss_ki.push(ki);
-                }
-            }
-        } else {
-            miss_ki.extend(0..keep_idx.len());
-        }
-        for ki in miss_ki {
-            let (chrom, pos) = &chunk[keep_idx[ki]];
-            let seq = ctx
-                .refmap
-                .get(chrom)
-                .ok_or_else(|| format!("fasta missing contig {chrom}"))?;
-            let window = fetch_window_mem_hw(seq, *pos, ctx.half_window);
-            toks.extend(tokenize(&window));
-        }
-    }
-    Ok(ChunkCpuWork {
-        piles,
-        final_probs,
-        keep_idx,
-        kept_hit,
-        toks,
-    })
-}
-
-/// Consumer half of `process_chunk`: embed (CPU faer or GPU candle) -> fusion head ->
-/// cache writeback. `work` comes from `process_chunk_cpu_half` (same or pipeline producer).
-fn process_chunk_rest(
-    ctx: &ChunkCtx,
-    work: ChunkCpuWork,
-    bufs: &mut EmbedBatchBufs,
-    embedder: &Embedder,
-    chunk: &[(String, i64)],
-) -> Result<Vec<f64>, String> {
-    let ChunkCpuWork {
-        piles,
-        mut final_probs,
-        keep_idx,
-        kept_hit,
-        toks,
-    } = work;
-    // Batched encoding (CPU or GPU — the only mode-dependent step).
-    let miss_embs = embedder.embed(&toks, ctx.tok_len, bufs)?;
-    // Kept sites: cache hit / freshly computed embedding -> fusion head; write back to cache (new computations only).
-    let mut miss_iter = miss_embs.into_iter();
-    // Batch cache writeback: collect this chunk's fresh embeddings and take the cache
-    // lock ONCE after the loop (was: one lock acquisition per missed site, contended
-    // across every rayon worker).
-    let mut wb: Vec<(String, u32, [u16; D_MODEL])> = Vec::new();
-    for (ki, &bi2) in keep_idx.iter().enumerate() {
-        let e: [half::f16; D_MODEL] = match kept_hit[ki] {
-            Some(bits) => {
-                let mut e = [half::f16::ZERO; D_MODEL];
-                for (k, b) in bits.iter().enumerate() {
-                    e[k] = half::f16::from_bits(*b);
-                }
-                e
-            }
-            None => {
-                let e = miss_iter.next().expect("miss count mismatch");
-                if ctx.emb_cache.is_some() {
-                    let bits: [u16; D_MODEL] = std::array::from_fn(|k| e[k].to_bits());
-                    let (chrom, pos) = &chunk[bi2];
-                    wb.push((chrom.clone(), *pos as u32, bits));
-                }
-                e
-            }
-        };
-        let emb32: Vec<f32> = e.iter().map(|v| v.to_f32()).collect();
-        let emb = ndarray::Array1::from_vec(emb32);
-        let p = re_prob_ensemble(ctx.bundle, &emb.view(), &piles[bi2])
-            .map_err(|e| format!("head: {e}"))?;
-        final_probs[bi2] = Some(p);
-    }
-    if !wb.is_empty() {
-        if let Some(c) = ctx.emb_cache {
-            c.lock().unwrap().put_batch(wb);
-        }
-    }
-    let out: Vec<f64> = final_probs
-        .into_iter()
-        .map(|p| p.expect("all sites scored"))
-        .collect();
-    Ok(out)
-}
-
-/// Process one (chrom,pos)-sorted batch chunk end to end (CPU mode: both halves in sequence).
-/// Shared verbatim by the CPU and GPU modes (only the `embedder` differs); output order
-/// follows `chunk`.
-/// Phase-1 pileup: features for every site via region groups (MERGE_GAP
-/// runs capped at 16k sites), parallel across workers with one
-/// IndexedReader each. Results follow `sorted` order.
-fn pileup_all(
-    bam: &Path,
-    sorted: &[(String, i64)],
-    threads: usize,
-) -> Result<Vec<[f32; esperanto_pile::N_FEATURES]>> {
-    if sorted.is_empty() {
-        return Ok(Vec::new());
-    }
-    const GROUP_CAP: usize = 16_384;
-    let mut groups: Vec<(usize, usize)> = Vec::new();
-    let mut start = 0usize;
-    for i in 1..=sorted.len() {
-        let boundary = i == sorted.len()
-            || i - start >= GROUP_CAP
-            || sorted[i].0 != sorted[i - 1].0
-            || sorted[i].1 - sorted[i - 1].1 > esperanto_pile::MERGE_GAP;
-        if boundary {
-            groups.push((start, i));
-            start = i;
-        }
-    }
-    let pool = match threads {
-        0 => rayon::ThreadPoolBuilder::new().build(),
-        n => rayon::ThreadPoolBuilder::new().num_threads(n).build(),
-    }
-    .context("build pileup thread pool")?;
-    let per_group: Vec<Result<Vec<[f32; esperanto_pile::N_FEATURES]>, String>> = pool.install(|| {
-        groups
-            .par_iter()
-            .map_init(
-                || -> Result<rust_htslib::bam::IndexedReader, String> {
-                    rust_htslib::bam::IndexedReader::from_path(bam).map_err(|e| format!("open bam: {e}"))
-                },
-                |r, &(lo, hi)| {
-                    let r = match r.as_mut() {
-                        Ok(r) => r,
-                        Err(e) => return Err(e.clone()),
-                    };
-                    let refs: Vec<(&str, i64)> = sorted[lo..hi]
-                        .iter()
-                        .map(|(c, p)| (c.as_str(), *p))
-                        .collect();
-                    esperanto_pile::extract_pileup_features_batch(r, &refs, esperanto_pile::MIN_MAPQ)
-                        .map_err(|e| format!("pileup group: {e}"))
-                },
-            )
-            .collect()
-    });
-    let mut out = Vec::with_capacity(sorted.len());
-    for (gi, g) in per_group.into_iter().enumerate() {
-        let g = g.map_err(|e| anyhow!("pileup group {gi}: {e}"))?;
-        out.extend_from_slice(&g);
-    }
-    Ok(out)
-}
-
-fn process_chunk(
-    ctx: &ChunkCtx,
-    piles: Vec<[f32; esperanto_pile::N_FEATURES]>,
-    bufs: &mut EmbedBatchBufs,
-    embedder: &Embedder,
-    chunk: &[(String, i64)],
-) -> Result<Vec<f64>, String> {
-    let work = process_chunk_cpu_half(ctx, chunk, piles)?;
-    process_chunk_rest(ctx, work, bufs, embedder, chunk)
-}
-
-/// Encoder resolution: `bundle/encoder` or the bundle parent's `encoder` (must contain model.safetensors).
-pub fn resolve_encoder_from_bundle(bundle: &Path) -> Result<std::path::PathBuf> {
-    let parent = bundle
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| bundle.to_path_buf());
-    let cands = [bundle.join("encoder"), parent.join("encoder")];
-    cands
-        .iter()
-        .find(|c| c.join("model.safetensors").exists())
-        .cloned()
-        .ok_or_else(|| anyhow!("encoder not found in bundle (need encoder/model.safetensors)"))
+    Guardrail,
+    /// Hybrid reference verified upstream against its species.json manifest.
+    TrustedHybrid,
 }
 
 /// sites TSV parsing: chrom<TAB>pos (1-based, >=1); empty lines skipped.
@@ -322,120 +44,57 @@ pub fn parse_sites(text: &str) -> Result<Vec<(String, i64)>> {
     Ok(out)
 }
 
-/// Species-guard mode for [`score_sites_batched`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ReferenceCheck {
-    /// Default: the fasta's chr1 must match hg38 (or be a small synthetic reference).
-    #[default]
-    Guardrail,
-    /// Hybrid reference verified upstream against its species.json manifest.
-    TrustedHybrid,
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn score_sites_batched(
-    bam: &Path,
-    fasta: &Path,
-    caduceus: &Path,
-    bundle: &Path,
-    sites: &[(String, i64)],
-    threads: usize,
-    batch: usize,
-    emb_cache: Option<&Arc<Mutex<EmbCache>>>,
-    device: DeviceChoice,
-    // Invoked at most once per call, only for `Auto` when a GPU is actually available
-    // (the CLI's interactive once-per-process selector; `None` = never ask -> CPU).
-    device_ask: Option<&(dyn Fn() -> bool + Send + Sync)>,
-    // Species-guard mode (Guardrail for all standalone callers).
-    reference_check: ReferenceCheck,
-) -> Result<Vec<f64>> {
-    let bundle = load_bundle(bundle).context("load bundle")?;
-    let enc = Arc::new(CaduceusEncoder::load(caduceus).context("load caduceus")?);
-    let batch = batch.max(1);
-    // Window token length is decided by the bundle (v1.4.1: 2x250+2 = 502).
-    let tok_len = (2 * bundle.half_window + 2) as usize;
-
-    // Device resolution (once, before the first batch):
-    //   cpu  -> CPU rayon pool;
-    //   gpu  -> GPU, hard error on feature-less build / no device;
-    //   auto -> GPU only on feature + device + the ask callback accepting.
-    let use_gpu = match device {
-        DeviceChoice::Cpu => false,
-        DeviceChoice::Gpu => {
-            #[cfg(feature = "gpu")]
-            {
-                candle_core::Device::new_cuda(0)
-                    .map_err(|e| anyhow!("--device gpu: no CUDA GPU found ({e})"))?;
-                true
-            }
-            #[cfg(not(feature = "gpu"))]
-            {
-                return Err(anyhow!(
-                    "--device gpu: this build has no GPU support (rebuild with `--features gpu`)"
-                ));
-            }
-        }
-        DeviceChoice::Auto => gpu_available() && device_ask.is_some_and(|ask| ask()),
-    };
-
-    // Reference preload (only the contigs involved in sites).
-    let mut need: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    for (c, _) in sites {
-        need.insert(c.as_str());
+/// Species guardrail on the FASTA index text: the model is a human hg38
+/// model; a real-size reference whose chr1 does not match is refused, small
+/// (<10 Mb) references are treated as synthetic/test and pass.
+fn species_guardrail(fai_text: &str, reference_check: ReferenceCheck) -> Result<()> {
+    if reference_check == ReferenceCheck::TrustedHybrid {
+        return Ok(());
     }
-    let mut refmap: std::collections::HashMap<String, Arc<Vec<u8>>> =
-        std::collections::HashMap::new();
-    {
-        // Validate names against .fai first (htslib aborts on a missing contig), then load into memory in one pass.
-        let fai_text = std::fs::read_to_string(format!("{}.fai", fasta.display()))
-            .with_context(|| format!("read {}.fai", fasta.display()))?;
-        // Species guard: the bundle is a human hg38 model; if a real-size reference's chr1 length
-        // does not match, refuse to run (hg38 chr1 = 248,956,422); small (<10Mb) is treated as a
-        // synthetic/test reference and the check is skipped. TrustedHybrid skips the chr1 check:
-        // the caller verified the hybrid reference against its species.json manifest.
-        if reference_check == ReferenceCheck::TrustedHybrid {
-            // verified upstream; skip the chr1 heuristic
-        } else if let Some(l) = fai_text.lines().find(|l| l.starts_with("chr1\t")) {
-            let len: u64 = l
-                .split('\t')
-                .nth(1)
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            anyhow::ensure!(
-                len < 10_000_000 || len == 248_956_422,
-                "species/version mismatch: bundle is a human hg38 model, but reference chr1 length = {len} (hg38 should be 248956422). Use an hg38 reference, or a model bundle matching this reference."
-            );
-        }
-        let have: std::collections::HashSet<&str> = fai_text
-            .lines()
-            .filter_map(|l| l.split('\t').next())
-            .collect();
-        let fa = rust_htslib::faidx::Reader::from_path(fasta).context("open fasta")?;
-        let mut missing = 0usize;
-        for c in need {
-            if !have.contains(c) {
-                // fasta missing this contig -> empty seq; fetch_window_mem degrades to an all-N window; not fatal.
-                missing += 1;
-                refmap.insert(c.to_string(), Arc::new(Vec::new()));
-                continue;
-            }
-            let len = fa.fetch_seq_len(c) as usize;
-            let seq = fa
-                .fetch_seq(c, 0, len - 1)
-                .with_context(|| format!("fetch {c}"))?;
-            refmap.insert(
-                c.to_string(),
-                Arc::new(seq.iter().map(|b| b.to_ascii_uppercase()).collect()),
-            );
-        }
-        eprintln!(
-            "[score] reference preload: {} contigs ({} missing from fasta, degrading to N-pad windows)",
-            refmap.len(),
-            missing
+    if let Some(l) = fai_text.lines().find(|l| l.starts_with("chr1\t")) {
+        let len: u64 = l
+            .split('\t')
+            .nth(1)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        anyhow::ensure!(
+            len < 10_000_000 || len == 248_956_422,
+            "species/version mismatch: bundle is a human hg38 model, but reference chr1 length = {len} (hg38 should be 248956422). Use an hg38 reference, or a model bundle matching this reference."
         );
     }
+    Ok(())
+}
 
-    // Sorting permutation (contract: output follows input order; internally batched after (chrom,pos) sorting).
+/// Which network of the bundle scores the sites.
+#[derive(Clone, Copy)]
+enum CmcTask {
+    Main,
+    Hyper,
+}
+
+/// Score sites with the CMC bundle: region-sweep extraction (BAM only)
+/// followed by the network forward, parallel across sites. Output order
+/// follows the input `sites`.
+fn score_cmc_batched(
+    bam: &Path,
+    fasta: &Path,
+    bundle_dir: &Path,
+    sites: &[(String, i64)],
+    threads: usize,
+    reference_check: ReferenceCheck,
+    task: CmcTask,
+) -> Result<Vec<f64>> {
+    let bundle = crate::bundle::load_cmc_bundle(bundle_dir).context("load bundle")?;
+    let net = match task {
+        CmcTask::Main => &bundle.main,
+        CmcTask::Hyper => &bundle.hyper,
+    };
+    let fai_text = std::fs::read_to_string(format!("{}.fai", fasta.display()))
+        .with_context(|| format!("read {}.fai", fasta.display()))?;
+    species_guardrail(&fai_text, reference_check)?;
+    if sites.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut order: Vec<usize> = (0..sites.len()).collect();
     order.sort_by(|&a, &b| {
         sites[a]
@@ -445,150 +104,147 @@ pub fn score_sites_batched(
     });
     let sorted: Vec<(String, i64)> = order.iter().map(|&i| sites[i].clone()).collect();
 
-    let ctx = ChunkCtx {
-        bundle: &bundle,
-        refmap: &refmap,
-        half_window: bundle.half_window,
-        tok_len,
-        emb_cache,
-    };
-
-    // Phase 1: region-sweep pileup for every site. Grouping follows the
-    // pile crate's MERGE_GAP runs (each group = one fetch + sweep, same
-    // record set per site as the per-batch calls), so every BGZF region is
-    // decompressed once per worker instead of once per 64-site batch.
-    let tp = std::time::Instant::now();
-    let piles_all = pileup_all(bam, &sorted, threads)?;
+    let t = std::time::Instant::now();
+    let feats = cmc_extract_all(bam, &sorted, threads)?;
     eprintln!(
-        "[score] pileup: {} sites, {:.1}s",
+        "[score] cmc features: {} sites, {:.1}s",
         sorted.len(),
-        tp.elapsed().as_secs_f64()
+        t.elapsed().as_secs_f64()
     );
 
-    let nb = sorted.len().div_ceil(batch);
     let t0 = std::time::Instant::now();
-    let results: Vec<Result<Vec<f64>, String>> = if use_gpu {
-        #[cfg(feature = "gpu")]
-        {
-            // GPU overlap pipeline: ONE shared encoder + device on the main thread; a SMALL
-            // pool of pileup workers (one IndexedReader each, never shared) computes the CPU
-            // half (pileup+gate+tokenize) of upcoming batches while the main thread embeds the
-            // current batch on the GPU and runs the fusion head — per-batch wall goes from
-            // sum(pileup, embed) to max(pileup, embed). The bounded channel is both prefetch
-            // depth and backpressure; results land at their batch index (order-deterministic
-            // contract). Pool size: `threads` when the user pinned it, else min(8, cores) —
-            // deliberately small (the encoder lives on the GPU; this is not the CPU rayon pool).
-            let pileup_threads = if threads == 0 {
-                std::thread::available_parallelism().map_or(8, |n| n.get().min(8))
-            } else {
-                threads
-            };
-            let dev = candle_core::Device::new_cuda(0)
-                .map_err(|e| anyhow!("cuda device re-init: {e}"))?;
-            let gpu = crate::caduceus::gpu_encoder::GpuCaduceusEncoder::from_cpu(&enc, &dev)
-                .map_err(|e| anyhow!("upload encoder to gpu: {e}"))?;
-            let embedder = Embedder::Gpu(&gpu);
-            let mut bufs = EmbedBatchBufs::default(); // unused by the GPU embedder
-            let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Result<ChunkCpuWork, String>)>(
-                pileup_threads + 2,
-            );
-            let next_bi = std::sync::atomic::AtomicUsize::new(0);
-            let sorted_ref = &sorted;
-            let ctx_ref = &ctx;
-            let piles_ref = &piles_all;
-            std::thread::scope(|s| {
-                let workers: Vec<_> = (0..pileup_threads)
-                    .map(|_| {
-                        let tx = tx.clone();
-                        let next_bi = &next_bi;
-                        s.spawn(move || loop {
-                            let bi = next_bi.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if bi >= nb {
-                                break;
-                            }
-                            let lo = bi * batch;
-                            let hi = (lo + batch).min(sorted_ref.len());
-                            let work = process_chunk_cpu_half(ctx_ref, &sorted_ref[lo..hi], piles_ref[lo..hi].to_vec());
-                            if tx.send((bi, work)).is_err() {
-                                break; // receiver gone; stop cleanly
-                            }
-                        })
-                    })
-                    .collect();
-                drop(tx); // the receiver loop below only ends when every sender is gone
-                let mut results: Vec<Option<Result<Vec<f64>, String>>> =
-                    (0..nb).map(|_| None).collect();
-                for (bi, work) in rx.iter() {
-                    let lo = bi * batch;
-                    let hi = (lo + batch).min(sorted_ref.len());
-                    let r = work.and_then(|w| {
-                        process_chunk_rest(&ctx, w, &mut bufs, &embedder, &sorted_ref[lo..hi])
-                    });
-                    results[bi] = Some(r);
-                }
-                let mut panicked = false;
-                for w in workers {
-                    if w.join().is_err() {
-                        panicked = true;
-                    }
-                }
-                results
-                    .into_iter()
-                    .map(|slot| match slot {
-                        Some(r) => r,
-                        None => Err(if panicked {
-                            "a pileup worker panicked before finishing its batches".into()
-                        } else {
-                            "pileup producer ended early".into()
-                        }),
-                    })
-                    .collect()
-            })
-        }
-        #[cfg(not(feature = "gpu"))]
-        {
-            unreachable!("use_gpu is only set in gpu-enabled builds")
-        }
-    } else {
-        // CPU mode: batch-level rayon (unchanged production path).
-        let pool = match threads {
-            0 => rayon::ThreadPoolBuilder::new().build(),
-            n => rayon::ThreadPoolBuilder::new().num_threads(n).build(),
-        }
-        .context("build thread pool")?;
-        let embedder = Embedder::Cpu(&enc);
-        pool.install(|| {
-            (0..nb)
-                .into_par_iter()
-                .map_init(EmbedBatchBufs::default, |bufs, bi| {
-                    let lo = bi * batch;
-                    let hi = (lo + batch).min(sorted.len());
-                    process_chunk(
-                        &ctx,
-                        piles_all[lo..hi].to_vec(),
-                        bufs,
-                        &embedder,
-                        &sorted[lo..hi],
-                    )
-                })
-                .collect()
-        })
-    };
+    let pool = match threads {
+        0 => rayon::ThreadPoolBuilder::new().build(),
+        n => rayon::ThreadPoolBuilder::new().num_threads(n).build(),
+    }
+    .context("build thread pool")?;
+    let probs_sorted = pool.install(|| {
+        feats
+            .par_iter()
+            .map(|x| net.re_prob(x))
+            .collect::<Vec<f64>>()
+    });
     eprintln!(
-        "[score] batched: {} sites, batch={}, {} batches, device={}, {:.1}s",
+        "[score] cmc forward: {} sites, device=cpu, {:.1}s",
         sorted.len(),
-        batch,
-        nb,
-        if use_gpu { "gpu" } else { "cpu" },
         t0.elapsed().as_secs_f64()
     );
 
     let mut probs = vec![0.0f64; sites.len()];
-    for (bi, r) in results.into_iter().enumerate() {
-        let ps = r.map_err(|e| anyhow!("batch {bi}: {e}"))?;
-        for (j, p) in ps.into_iter().enumerate() {
-            probs[order[bi * batch + j]] = p;
-        }
+    for (i, p) in probs_sorted.into_iter().enumerate() {
+        probs[order[i]] = p;
     }
     Ok(probs)
+}
+
+/// Region-grouped CMC extraction (one fetch per run of sites within
+/// `CMC_MERGE_GAP`, capped group size, one IndexedReader per worker).
+fn cmc_extract_all(
+    bam: &Path,
+    sorted: &[(String, i64)],
+    threads: usize,
+) -> Result<Vec<crate::cmc::CmcFeatures>> {
+    if sorted.is_empty() {
+        return Ok(Vec::new());
+    }
+    const GROUP_CAP: usize = 16_384;
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    for i in 1..=sorted.len() {
+        let boundary = i == sorted.len()
+            || i - start >= GROUP_CAP
+            || sorted[i].0 != sorted[i - 1].0
+            || sorted[i].1 - sorted[i - 1].1 > crate::cmc::CMC_MERGE_GAP;
+        if boundary {
+            groups.push((start, i));
+            start = i;
+        }
+    }
+    let pool = match threads {
+        0 => rayon::ThreadPoolBuilder::new().build(),
+        n => rayon::ThreadPoolBuilder::new().num_threads(n).build(),
+    }
+    .context("build cmc thread pool")?;
+    let per_group: Vec<Result<Vec<crate::cmc::CmcFeatures>, String>> = pool.install(|| {
+        groups
+            .par_iter()
+            .map_init(
+                || -> Result<rust_htslib::bam::IndexedReader, String> {
+                    rust_htslib::bam::IndexedReader::from_path(bam)
+                        .map_err(|e| format!("open bam: {e}"))
+                },
+                |r, &(lo, hi)| {
+                    let r = match r.as_mut() {
+                        Ok(r) => r,
+                        Err(e) => return Err(e.clone()),
+                    };
+                    let refs: Vec<(&str, i64)> = sorted[lo..hi]
+                        .iter()
+                        .map(|(c, p)| (c.as_str(), *p))
+                        .collect();
+                    crate::cmc::extract_cmc_batch(r, &refs).map_err(|e| format!("cmc group: {e}"))
+                },
+            )
+            .collect()
+    });
+    let mut out = Vec::with_capacity(sorted.len());
+    for (gi, g) in per_group.into_iter().enumerate() {
+        let g = g.map_err(|e| anyhow!("cmc group {gi}: {e}"))?;
+        out.extend_from_slice(&g);
+    }
+    Ok(out)
+}
+
+/// Score candidate sites with the main (DM vs RE) network.
+#[allow(clippy::too_many_arguments)]
+pub fn score_sites_batched(
+    bam: &Path,
+    fasta: &Path,
+    bundle: &Path,
+    sites: &[(String, i64)],
+    threads: usize,
+    reference_check: ReferenceCheck,
+) -> Result<Vec<f64>> {
+    if !crate::bundle::is_cmc_bundle(bundle) {
+        anyhow::bail!(
+            "model bundle not found or unsupported (need rust/net_main.safetensors): {}",
+            bundle.display()
+        );
+    }
+    score_cmc_batched(
+        bam,
+        fasta,
+        bundle,
+        sites,
+        threads,
+        reference_check,
+        CmcTask::Main,
+    )
+}
+
+/// Score Tier-2-only (rescue) sites with the hyper network of the bundle.
+#[allow(clippy::too_many_arguments)]
+pub fn score_hyper_sites_batched(
+    bam: &Path,
+    fasta: &Path,
+    bundle: &Path,
+    sites: &[(String, i64)],
+    threads: usize,
+    reference_check: ReferenceCheck,
+) -> Result<Vec<f64>> {
+    if !crate::bundle::is_cmc_bundle(bundle) {
+        anyhow::bail!(
+            "model bundle not found or unsupported (need rust/net_main.safetensors): {}",
+            bundle.display()
+        );
+    }
+    score_cmc_batched(
+        bam,
+        fasta,
+        bundle,
+        sites,
+        threads,
+        reference_check,
+        CmcTask::Hyper,
+    )
 }

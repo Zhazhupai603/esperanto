@@ -5,8 +5,7 @@ use std::path::PathBuf;
 
 use clap::Args;
 use esperanto_flow::resume;
-use esperanto_flow::{DeviceAsk, RunParams};
-use esperanto_score::pipeline::DeviceChoice;
+use esperanto_flow::RunParams;
 
 #[derive(Args)]
 pub struct ResumeArgs {
@@ -43,17 +42,10 @@ pub fn run(a: ResumeArgs) -> anyhow::Result<()> {
         gtf: doc.params.gtf.clone(),
         snp: doc.params.snp.clone(),
         bundle: doc.params.bundle.clone(),
-        caduceus: doc.params.caduceus.clone(),
         l1_bundle: doc.params.l1_bundle.clone(),
         out_dir: a.dir.clone(),
         threads: doc.params.threads,
         batch: doc.params.batch,
-        device: match doc.params.device.as_str() {
-            "cpu" => DeviceChoice::Cpu,
-            "gpu" => DeviceChoice::Gpu,
-            _ => DeviceChoice::Auto,
-        },
-        device_ask: Some(DeviceAsk::new(crate::confirm::ask_use_gpu)),
         // Frozen runs predate the control pass; a resumed run completes the
         // pass set it started with.
         rescue_control: false,

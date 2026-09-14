@@ -46,16 +46,12 @@ pub struct ParamsJson {
     pub snp: Option<PathBuf>,
     /// score bundle root.
     pub bundle: PathBuf,
-    /// Optional caduceus encoder dir.
-    pub caduceus: Option<PathBuf>,
     /// Optional L1 engine bundle.
     pub l1_bundle: Option<PathBuf>,
     /// Worker threads.
     pub threads: usize,
     /// score batch size.
     pub batch: usize,
-    /// score device ("auto" | "cpu" | "gpu").
-    pub device: String,
 }
 
 /// run.json: everything `esperanto resume` needs to reconstruct a run.
@@ -140,15 +136,9 @@ pub fn write_run_json(dir: &Path, sample: &str, params: &RunParams) -> Result<()
             gtf: params.gtf.clone(),
             snp: params.snp.clone(),
             bundle: params.bundle.clone(),
-            caduceus: params.caduceus.clone(),
             l1_bundle: params.l1_bundle.clone(),
             threads: params.threads,
             batch: params.batch,
-            device: match params.device {
-                esperanto_score::pipeline::DeviceChoice::Auto => "auto".to_string(),
-                esperanto_score::pipeline::DeviceChoice::Cpu => "cpu".to_string(),
-                esperanto_score::pipeline::DeviceChoice::Gpu => "gpu".to_string(),
-            },
         },
     };
     let text = serde_json::to_string_pretty(&doc)
@@ -733,13 +723,10 @@ mod tests {
             gtf: None,
             snp: None,
             bundle: d.join("bundle"),
-            caduceus: None,
             l1_bundle: None,
             out_dir: d.clone(),
             threads: 4,
             batch: 64,
-            device: esperanto_score::pipeline::DeviceChoice::Auto,
-            device_ask: None,
                 rescue_control: false,
         stop_after: None,
     };

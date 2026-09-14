@@ -1,7 +1,6 @@
 //! Pipeline parameters and entry derivation (spec §entry derivation / §parameters).
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use crate::FlowError;
 
@@ -16,35 +15,6 @@ pub enum Entry {
     Bam,
     /// `--bam` + `--sites`: score → vcf.
     BamSites,
-}
-
-use esperanto_score::pipeline::DeviceChoice;
-
-/// Shared interactive device-ask callback: a boxed `Fn() -> bool` that the score stage
-/// invokes (at most once, right before its first batch) when `device == Auto` and a CUDA GPU
-/// is actually available. Wrapped in a named type so `RunParams` stays `Clone + Debug`.
-pub struct DeviceAsk(Arc<dyn Fn() -> bool + Send + Sync>);
-
-impl DeviceAsk {
-    pub fn new(f: impl Fn() -> bool + Send + Sync + 'static) -> Self {
-        Self(Arc::new(f))
-    }
-
-    pub fn fn_ref(&self) -> &(dyn Fn() -> bool + Send + Sync) {
-        self.0.as_ref()
-    }
-}
-
-impl Clone for DeviceAsk {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
-
-impl std::fmt::Debug for DeviceAsk {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DeviceAsk").finish()
-    }
 }
 
 /// Full parameter set for one pipeline run.
@@ -68,8 +38,6 @@ pub struct RunParams {
     pub snp: Option<PathBuf>,
     /// score bundle root.
     pub bundle: PathBuf,
-    /// Optional caduceus encoder path; defaults to bundle resolution.
-    pub caduceus: Option<PathBuf>,
     /// Optional L1 engine bundle (`engine::L1Index::open`).
     pub l1_bundle: Option<PathBuf>,
     /// Output root; stages write under `<out_dir>/<stage>/`.
@@ -78,11 +46,6 @@ pub struct RunParams {
     pub threads: usize,
     /// score batch size (default 64).
     pub batch: usize,
-    /// score-stage compute device (CLI `--device`; see `DeviceChoice`).
-    pub device: DeviceChoice,
-    /// Interactive auto-mode device ask (arrow-key selector at the CLI; invoked at most once,
-    /// right before the first score batch; `None` = never ask -> CPU). Headless callers pass None.
-    pub device_ask: Option<DeviceAsk>,
     /// Also run the negative-control (A>C / T>G) collapsed-alphabet rescue
     /// passes, count-only (`align_qc.json: rescue_control_verified`).
     pub rescue_control: bool,

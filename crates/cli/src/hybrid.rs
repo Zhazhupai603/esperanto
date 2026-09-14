@@ -301,9 +301,6 @@ fn build(
         .canonicalize()
         .unwrap_or(human_bundle);
     manifest.bundles.insert("human".to_string(), human_bundle);
-    if let Some(mb) = crate::resolve::mouse_bundle() {
-        manifest.bundles.insert("mouse".to_string(), mb);
-    }
     manifest.write(dir)?;
 
     // --- guardrail + full index set ---
