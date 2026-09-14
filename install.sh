@@ -15,10 +15,17 @@ PKG_BASE="esperanto-1.0.6-${ARCH}"
 
 # CPU build selection: prefer the AVX2-optimized (-v3) build when the local
 # CPU supports it, fall back to the portable baseline build.
-CANDIDATES="''"
-if grep -qw avx2 /proc/cpuinfo 2>/dev/null; then
-    CANDIDATES="v3 ''"
-fi
+try_build() {
+    # $1 = package suffix ("" or "-v3")
+    cand="${PKG_BASE}${1}"
+    echo "==> downloading $BASE_URL/${cand}.tar.gz"
+    if dl "$BASE_URL/${cand}.tar.gz" "$tmp/pkg.tar.gz"; then
+        PKG="$cand"
+        return 0
+    fi
+    echo "==> ${cand} unavailable; trying the next build"
+    return 1
+}
 
 BASE_URL="https://github.com/Zhazhupai603/esperanto/releases/download/${VERSION}"
 PREFIX="${ESPERANTO_PREFIX:-$HOME/.local}"
@@ -49,15 +56,12 @@ if [ -n "${ESPERANTO_TARBALL:-}" ]; then
     PKG="$(tar -tzf "$tmp/pkg.tar.gz" | head -1 | cut -d/ -f1)"
 else
     PKG=""
-    for suf in $CANDIDATES; do
-        cand="${PKG_BASE}${suf}"
-        echo "==> downloading $BASE_URL/${cand}.tar.gz"
-        if dl "$BASE_URL/${cand}.tar.gz" "$tmp/pkg.tar.gz"; then
-            PKG="$cand"
-            break
-        fi
-        echo "==> ${cand} unavailable; trying the next build"
-    done
+    if grep -qw avx2 /proc/cpuinfo 2>/dev/null; then
+        try_build "-v3" || true
+    fi
+    if [ -z "$PKG" ]; then
+        try_build "" || true
+    fi
     if [ -z "$PKG" ]; then
         echo "error: no downloadable build found for $VERSION" >&2
         exit 1
