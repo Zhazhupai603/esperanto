@@ -1,14 +1,18 @@
 # ESPERANTO
 
 [![Version](https://img.shields.io/badge/version-1.0.6-green.svg)](https://github.com/Zhazhupai603/esperanto/releases)
+![Language: Rust](https://img.shields.io/badge/language-Rust-orange.svg)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ESPERANTO detects candidate A-to-I RNA editing sites from human RNA-seq data.
+It accepts single-end or paired-end FASTQ, or an existing BAM, and writes VCF results.
 
-- Accepts single-end or paired-end FASTQ, or an existing BAM.
-- Runs read filtering, alignment, candidate detection and site scoring.
-- Recovers heavily edited reads and reports hyperedited regions.
-- Writes VCF results and an HTML report with a genome browser and gene search.
+## Features
+
+- **Hyperediting rescue:** Recovers heavily edited reads missed during initial alignment and reports the editing sites and regions they support.
+- **Alignment verification:** Re-aligns candidate-supporting reads to check for alternative placements before accepting their support.
+- **RNA editing scores:** Scores ordinary candidates for RNA editing versus DNA variation, directly from the read alignments.
+- **Interactive results:** Browse editing sites and hyperedited regions, search by gene, and inspect predicted amino acid changes in an HTML report.
 
 ## Installation
 
