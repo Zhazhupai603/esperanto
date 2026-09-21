@@ -1174,7 +1174,17 @@ fn rescue_collapsed(
                     }
                 })
                 .collect();
-            rec.set(qname, Some(&rust_htslib::bam::record::CigarString(cigar)), &s2, &q2);
+            // The second set() must carry offset-free Phred like the first
+            // one (rust-htslib Record::set documents qual as "Phred-scaled
+            // quality values, without any offset"); passing the ASCII bytes
+            // here overwrote the converted values and stored every rescued
+            // read's quality inflated by +33.
+            rec.set(
+                qname,
+                Some(&rust_htslib::bam::record::CigarString(cigar)),
+                &s2,
+                &esperanto_map::bam::phred_from_ascii(&q2),
+            );
             rec.push_aux(b"RE", rust_htslib::bam::record::Aux::String("collapsed"))
                 .map_err(stage_err("map"))?;
             w.write(&rec).map_err(stage_err("map"))?;

@@ -35,10 +35,9 @@ pub struct RunArgs {
     /// Optional GTF (default: refs discovery).
     #[arg(long)]
     gtf: Option<PathBuf>,
-    /// Known-SNP VCF; listed positions are removed from the candidates
-    /// (default: refs discovery).
-    #[arg(long)]
-    snp: Option<PathBuf>,
+    // Known-SNP exclusion is an internal channel, not exposed (C1): the
+    // precision story is the in-caller scoring; silent refs-discovery dbSNP
+    // filtering contaminated benchmark protocols.
     /// Model bundle root (default: zero-config 5-level fallback).
     #[arg(long)]
     bundle: Option<PathBuf>,
@@ -69,7 +68,6 @@ let bundle = crate::resolve::bundle(&a.bundle)?;
     let mut index = a.index;
     let mut fasta = a.fasta;
     let mut gtf = a.gtf;
-    let mut snp = a.snp;
     let mut run_manifest: Option<esperanto_flow::manifest::SpeciesManifest> = None;
     if let Some(h) = &a.hybrid {
         let genes = if h.is_empty() {
@@ -84,12 +82,12 @@ let bundle = crate::resolve::bundle(&a.bundle)?;
         gtf = g.is_file().then_some(g);
         run_manifest = esperanto_flow::manifest::SpeciesManifest::read(&dir);
     }
-    if index.is_none() || fasta.is_none() || gtf.is_none() || snp.is_none() {
+    let snp: Option<PathBuf> = None;
+    if index.is_none() || fasta.is_none() || gtf.is_none() {
         if let Some(refs) = crate::resolve::refs() {
             refs.fill_index(&mut index);
             refs.fill_fasta(&mut fasta);
             refs.fill_gtf(&mut gtf);
-            refs.fill_snp(&mut snp);
         }
     }
     let l1_bundle = index
@@ -176,7 +174,6 @@ mod tests {
             index: None,
             fasta: None,
             gtf: None,
-            snp: None,
             bundle: None,
             l1_bundle: None,
             out: "out".into(),

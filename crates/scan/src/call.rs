@@ -233,9 +233,17 @@ pub fn run_call(params: &CallParams) -> Result<CallStats, CallError> {
     } else {
         0.0
     };
+    // f64::INFINITY formats as `inf`, which is not valid JSON and crashed
+    // the downstream verify/score parse whenever a control channel was
+    // empty. Emit null for the unbounded case instead.
+    let snr_json = if snr.is_finite() {
+        format!("{snr:.4}")
+    } else {
+        "null".to_string()
+    };
     let channels_doc = format!(
-        "{{\n  \"editing\": {{\"sites\": {}, \"alt_reads\": {}}},\n  \"control_1\": {{\"sites\": {}, \"alt_reads\": {}}},\n  \"control_2\": {{\"sites\": {}, \"alt_reads\": {}}},\n  \"snr\": {:.4},\n  \"implied_fdr\": {:.6}\n}}\n",
-        e.sites, e.alt_reads, c1.sites, c1.alt_reads, c2.sites, c2.alt_reads, snr, implied_fdr
+        "{{\n  \"editing\": {{\"sites\": {}, \"alt_reads\": {}}},\n  \"control_1\": {{\"sites\": {}, \"alt_reads\": {}}},\n  \"control_2\": {{\"sites\": {}, \"alt_reads\": {}}},\n  \"snr\": {},\n  \"implied_fdr\": {:.6}\n}}\n",
+        e.sites, e.alt_reads, c1.sites, c1.alt_reads, c2.sites, c2.alt_reads, snr_json, implied_fdr
     );
     let channels_path = parent.join("channels.json");
     if let Err(e2) = std::fs::write(&channels_path, channels_doc) {

@@ -68,11 +68,30 @@ struct Cluster {
 pub fn run(map_dir: &Path, out_dir: &Path, fasta: &Path) -> Result<(usize, usize), IoError> {
     let fai = rust_htslib::faidx::Reader::from_path(fasta).ok();
     let rows = read_rescued_tsv(&map_dir.join("rescued.tsv"))?;
+    // Genomic polarity of a rescued read is fixed by (dir, strand): the
+    // verifier complements the expectation pair on minus placements, so an
+    // AG-pass minus read and a TC-pass plus read over the same locus carry
+    // the SAME genomic event. Grouping by the raw pass label split mate
+    // pairs of one fragment into two groups (double-counted read-end
+    // support, half of the rows written with the wrong REF/ALT polarity).
+    // Normalize each read to its genomic polarity before grouping; the
+    // sidecar keeps the raw pass label as the audit trail.
+    let polarity_mismatch = std::cell::Cell::new(0usize);
+    let canonical_dir = |dir: &str, strand: char| -> Result<String, IoError> {
+        match (dir, strand) {
+            ("AG", '+') | ("TC", '-') => Ok("AG".to_string()),
+            ("TC", '+') | ("AG", '-') => Ok("TC".to_string()),
+            (other, _) => Err(IoError::other(format!(
+                "unknown rescue direction '{other}' (expected AG|TC)"
+            ))),
+        }
+    };
     let mut by_group: std::collections::BTreeMap<(String, String), Vec<usize>> =
         std::collections::BTreeMap::new();
     for (i, r) in rows.iter().enumerate() {
+        let canonical = canonical_dir(&r.dir, r.strand)?;
         by_group
-            .entry((r.chrom.clone(), r.dir.clone()))
+            .entry((r.chrom.clone(), canonical))
             .or_default()
             .push(i);
     }
@@ -162,6 +181,17 @@ pub fn run(map_dir: &Path, out_dir: &Path, fasta: &Path) -> Result<(usize, usize
             ));
             for &p in &kept {
                 n_sites += 1;
+                // Tripwire: with canonical grouping the reference base at a
+                // kept position must be the group's source base. The verifier
+                // contract makes a mismatch impossible unless upstream
+                // semantics drift; count and report rather than fail the run.
+                if let Some(f) = &fai {
+                    if let Ok(base) = f.fetch_seq(&chrom, p as usize, p as usize) {
+                        if !base.first().is_some_and(|b| b.eq_ignore_ascii_case(&src)) {
+                            polarity_mismatch.set(polarity_mismatch.get() + 1);
+                        }
+                    }
+                }
                 sites.push(format!(
                     "{}\t{}\t{}\t{}\t{}\n",
                     chrom, p, pos_count[&p], region_id, dir
@@ -175,4 +205,78 @@ pub fn run(map_dir: &Path, out_dir: &Path, fasta: &Path) -> Result<(usize, usize
     std::fs::write(dir.join("regions.bed"), regions.concat())?;
     std::fs::write(dir.join("sites.tsv"), sites.concat())?;
     Ok((n_regions, n_sites))
+}
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Mates of one fragment rescued by opposite passes (TC/+ and AG/-)
+    /// over the same genomic T->C event must group into ONE canonical
+    /// polarity group with merged per-position support (C2-② regression).
+    #[test]
+    fn opposite_pass_mates_merge_into_one_canonical_group() {
+        let tmp = std::env::temp_dir().join(format!("hyper_canon_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let map = tmp.join("map");
+        std::fs::create_dir_all(&map).unwrap();
+        // 4 fragments x 2 mates over the same 3 edit positions; /1 mates
+        // rescued by the TC pass on plus, /2 mates by the AG pass on minus.
+        let mut tsv = String::from("qname\tchrom\tpos0\tstrand\tdir\tn_edits\tedit_pos0\tmapq\n");
+        for i in 0..4 {
+            tsv.push_str(&format!(
+                "frag{i}/1\tctg1\t100\t+\tTC\t3\t200,210,220\t15\n"
+            ));
+            tsv.push_str(&format!(
+                "frag{i}/2\tctg1\t100\t-\tAG\t3\t200,210,220\t15\n"
+            ));
+        }
+        std::fs::write(map.join("rescued.tsv"), tsv).unwrap();
+        // fasta without .fai: grouping still runs (fai only feeds edit-index)
+        let fa = tmp.join("ref.fa");
+        let mut f = std::fs::File::create(&fa).unwrap();
+        writeln!(f, ">ctg1").unwrap();
+        writeln!(f, "{}", "A".repeat(300)).unwrap();
+
+        let (n_regions, n_sites) = run(&map, &tmp, &fa).unwrap();
+        let sites = std::fs::read_to_string(tmp.join("hyper").join("sites.tsv")).unwrap();
+        let mut lines = sites.lines();
+        // one canonical group (TC: genome T->C polarity), 3 positions,
+        // 8 read-ends of support each, single dir per position
+        let mut pos_dir = std::collections::BTreeMap::new();
+        for l in lines {
+            let f: Vec<&str> = l.split('\t').collect();
+            assert_eq!(f.len(), 5);
+            assert_eq!(f[4], "TC", "canonical polarity must be TC for genomic T");
+            pos_dir.insert(f[1].to_string(), f[2].parse::<u32>().unwrap());
+        }
+        assert_eq!(pos_dir.len(), 3, "three edit positions, one row each");
+        assert_eq!(n_sites, 3);
+        assert_eq!(n_regions, 1);
+        assert!(pos_dir.values().all(|&n| n == 8), "8 read-ends per position");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A plus AG-pass read normalizes to AG (genome A->G polarity).
+    #[test]
+    fn plus_ag_read_keeps_ag_polarity() {
+        let tmp = std::env::temp_dir().join(format!("hyper_plus_{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("map")).unwrap();
+        let mut tsv = String::from("qname\tchrom\tpos0\tstrand\tdir\tn_edits\tedit_pos0\tmapq\n");
+        for i in 0..4 {
+            tsv.push_str(&format!("r{i}/1\tctg1\t100\t+\tAG\t3\t200,210,220\t15\n"));
+        }
+        std::fs::write(tmp.join("map").join("rescued.tsv"), tsv).unwrap();
+        let fa = tmp.join("ref.fa");
+        let mut f = std::fs::File::create(&fa).unwrap();
+        writeln!(f, ">ctg1").unwrap();
+        writeln!(f, "{}", "A".repeat(300)).unwrap();
+        run(&tmp.join("map"), &tmp, &fa).unwrap();
+        let sites = std::fs::read_to_string(tmp.join("hyper").join("sites.tsv")).unwrap();
+        assert!(sites.lines().all(|l| l.split('\t').nth(4) == Some("TC") || l.split('\t').nth(4) == Some("AG")));
+        // plus AG stays AG
+        assert!(sites.lines().all(|l| l.split('\t').nth(4) == Some("AG")));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
