@@ -57,10 +57,25 @@ impl SpeciesManifest {
         std::fs::rename(&tmp, dir.join("species.json"))
     }
 
-    /// Read `<dir>/species.json`; None when absent or unparsable.
-    pub fn read(dir: &Path) -> Option<Self> {
-        let text = std::fs::read_to_string(dir.join("species.json")).ok()?;
-        serde_json::from_str(&text).ok()
+    /// Read `<dir>/species.json`. Absent file = `Ok(None)` (legacy single-
+    /// species heuristic). A present-but-unreadable or unparsable file is a
+    /// hard error: silently falling back to the legacy heuristic would
+    /// misroute hybrid scoring, and a corrupt manifest must never pass as
+    /// "no manifest".
+    pub fn read(dir: &Path) -> std::io::Result<Option<Self>> {
+        match std::fs::read_to_string(dir.join("species.json")) {
+            Ok(text) => serde_json::from_str(&text).map(Some).map_err(|e| {
+                std::io::Error::other(format!(
+                    "species.json in {} does not parse: {e}",
+                    dir.display()
+                ))
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(std::io::Error::other(format!(
+                "cannot read species.json in {}: {e}",
+                dir.display()
+            ))),
+        }
     }
 }
 
@@ -77,11 +92,14 @@ mod tests {
         m.contig_owner.insert("hAPOE4".into(), "human".into());
         m.contig_owner.insert("chr1".into(), "mouse".into());
         m.write(&dir).unwrap();
-        let got = SpeciesManifest::read(&dir).unwrap();
+        let got = SpeciesManifest::read(&dir).unwrap().unwrap();
         assert_eq!(got.kind, "hybrid");
         assert_eq!(got.owner_of("hAPOE4"), Some("human"));
         assert_eq!(got.owner_of("chr1"), Some("mouse"));
-        assert!(SpeciesManifest::read(&dir.join("nonexistent")).is_none());
+        assert!(SpeciesManifest::read(&dir.join("nonexistent")).unwrap().is_none());
+        // Corrupt manifest: hard error, never a silent legacy fallback.
+        std::fs::write(dir.join("species.json"), "{not json").unwrap();
+        assert!(SpeciesManifest::read(&dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

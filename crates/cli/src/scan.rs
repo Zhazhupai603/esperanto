@@ -17,10 +17,10 @@ pub struct ScanArgs {
     /// Reference FASTA (default: refs discovery).
     #[arg(long)]
     fasta: Option<PathBuf>,
-    /// Known-SNP VCF; listed positions are removed (default: refs discovery;
-    /// `--snp none` disables).
-    #[arg(long)]
-    snp: Option<String>,
+    // Known-SNP exclusion is an internal channel, deliberately not exposed:
+    // the product's precision story is the in-caller RE-vs-variant scoring,
+    // and a silent dbSNP blacklist by refs discovery contaminated benchmark
+    // protocols (pending-software-changes C1).
     /// Reads below this MAPQ do not count.
     #[arg(long, default_value_t = 20)]
     min_mapq: u8,
@@ -43,18 +43,9 @@ pub struct ScanArgs {
 
 pub fn run(a: ScanArgs) -> anyhow::Result<()> {
     let mut fasta = a.fasta;
-    let mut snp: Option<PathBuf> = match a.snp.as_deref() {
-        Some("none") => None,
-        Some(p) => Some(PathBuf::from(p)),
-        None => None,
-    };
-    let resolve_snp = a.snp.is_none();
-    if fasta.is_none() || resolve_snp {
+    if fasta.is_none() {
         if let Some(refs) = crate::resolve::refs() {
             refs.fill_fasta(&mut fasta);
-            if resolve_snp {
-                refs.fill_snp(&mut snp);
-            }
         }
     }
     let fasta = crate::resolve::require_fasta(fasta)?;
@@ -62,7 +53,7 @@ pub fn run(a: ScanArgs) -> anyhow::Result<()> {
         bam: a.bam,
         out: a.out,
         fasta,
-        snp,
+        snp: None,
         min_mapq: a.min_mapq,
         min_bq: a.min_bq,
         min_depth: a.min_depth,

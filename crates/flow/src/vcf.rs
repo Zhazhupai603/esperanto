@@ -120,46 +120,95 @@ pub(crate) struct HyperRow {
 
 /// Split `hyper/sites.tsv` into (a) INFO annotations for sites already in the
 /// candidate table and (b) Tier-2-only rows, sorted by coordinate.
+///
+/// Strict on the two failure modes that would otherwise pass silently: a
+/// duplicated (chrom, pos) key (the key excludes the direction; both the
+/// candidate-annotation path and the tier-2 row path consume this table, and
+/// neither may overwrite or double-emit) and a direction other than AG/TC
+/// (the REF/ALT letters are taken from the direction, so a malformed value
+/// would masquerade as a base call). Malformed numeric fields are errors for
+/// the same reason. An absent file (no rescue output) is an empty table.
 #[allow(clippy::type_complexity)]
 pub(crate) fn hyper_rows(
     params: &RunParams,
     sites: &[(String, i64)],
-) -> (
-    std::collections::BTreeMap<(String, i64), (u32, String)>,
-    Vec<HyperRow>,
-) {
-    match std::fs::read_to_string(params.out_dir.join("hyper").join("sites.tsv")) {
-        Ok(text) => {
-            let known: std::collections::HashSet<(String, i64)> =
-                sites.iter().map(|(c, p)| (c.clone(), *p)).collect();
-            let mut info = std::collections::BTreeMap::new();
-            let mut extra = Vec::new();
-            for line in text.lines() {
-                if line.is_empty() {
-                    continue;
-                }
-                let f: Vec<&str> = line.split('\t').collect();
-                if f.len() < 5 {
-                    continue;
-                }
-                let Ok(pos0) = f[1].parse::<i64>() else { continue };
-                let (Ok(n),) = (f[2].parse::<u32>(),) else { continue };
-                let key = (f[0].to_string(), pos0 + 1);
-                info.insert(key.clone(), (n, f[3].to_string()));
-                if !known.contains(&key) {
-                    extra.push(HyperRow {
-                        key,
-                        dir: f[4].to_string(),
-                        region: f[3].to_string(),
-                        n,
-                    });
-                }
-            }
-            extra.sort_by(|a, b| a.key.cmp(&b.key));
-            (info, extra)
+) -> Result<
+    (
+        std::collections::BTreeMap<(String, i64), (u32, String)>,
+        Vec<HyperRow>,
+    ),
+    FlowError,
+> {
+    let path = params.out_dir.join("hyper").join("sites.tsv");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        // Absent file = no rescue output (legal empty table); any other read
+        // failure (permissions, I/O) is a hard error, never a fake empty set.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((std::collections::BTreeMap::new(), Vec::new()))
         }
-        Err(_) => (std::collections::BTreeMap::new(), Vec::new()),
+        Err(e) => {
+            return Err(FlowError::BedParse {
+                line: 0,
+                msg: format!("cannot read {}: {e}", path.display()),
+            })
+        }
+    };
+    let bad = |line: usize, msg: String| FlowError::BedParse {
+        line,
+        msg: format!("{}: {msg}", path.display()),
+    };
+    let known: std::collections::HashSet<(String, i64)> =
+        sites.iter().map(|(c, p)| (c.clone(), *p)).collect();
+    let mut info = std::collections::BTreeMap::new();
+    let mut extra = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let ln = i + 1;
+        if line.is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() != 5 {
+            return Err(bad(
+                ln,
+                format!("expected 5 tab-separated columns, got {}", f.len()),
+            ));
+        }
+        let pos0 = f[1]
+            .parse::<i64>()
+            .map_err(|_| bad(ln, format!("pos '{}' is not an integer", f[1])))?;
+        let n = f[2]
+            .parse::<u32>()
+            .map_err(|_| bad(ln, format!("support '{}' is not a non-negative integer", f[2])))?;
+        if f[4] != "AG" && f[4] != "TC" {
+            return Err(bad(
+                ln,
+                format!("direction '{}' (expected AG|TC)", f[4]),
+            ));
+        }
+        let key = (f[0].to_string(), pos0 + 1);
+        if let Some((prev_n, prev_region)) =
+            info.insert(key.clone(), (n, f[3].to_string()))
+        {
+            return Err(bad(
+                ln,
+                format!(
+                    "duplicate hyper site {}:{} ({} reads in {} vs {} reads in {}); refusing to overwrite, merge or drop rows",
+                    key.0, key.1, prev_n, prev_region, n, f[3]
+                ),
+            ));
+        }
+        if !known.contains(&key) {
+            extra.push(HyperRow {
+                key,
+                dir: f[4].to_string(),
+                region: f[3].to_string(),
+                n,
+            });
+        }
     }
+    extra.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok((info, extra))
 }
 
 /// Decision thresholds the score stage hands to the VCF writer.
@@ -220,18 +269,30 @@ pub fn write_vcf(
     };
     // Verified-vote counts (verify stage): sites whose re-aligned support
     // fell below the floor carry FILTER=REALIGN alongside the score filter.
+    // Absent file = legacy candidates.bed without the verified columns
+    // (legal); a present-but-unreadable file is a hard error.
     let verified: Option<Vec<u32>> = match entry {
         Entry::BamSites => None,
-        _ => std::fs::read_to_string(params.out_dir.join("scan").join("candidates.verified.bed"))
-            .ok()
-            .map(|text| parse_alt_verified(&text)),
+        _ => {
+            let vpath = params.out_dir.join("scan").join("candidates.verified.bed");
+            match std::fs::read_to_string(&vpath) {
+                Ok(text) => Some(parse_alt_verified(&text)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    return Err(FlowError::BedParse {
+                        line: 0,
+                        msg: format!("cannot read {}: {e}", vpath.display()),
+                    })
+                }
+            }
+        }
     };
     // Hyperedited-region sites (Stage::Hyper): rescued-read edit positions.
     // Sites already in candidates annotate INFO; the rest append as Tier-2-only
     // rows, scored by the rescue model on CMC bundles.
-    let (hyper_info, hyper_extra) = hyper_rows(params, sites);
+    let (hyper_info, hyper_extra) = hyper_rows(params, sites)?;
     // Hybrid runs: mouse-contig sites keep the legacy mouse-model threshold.
-    let manifest = crate::manifest::SpeciesManifest::read(&params.out_dir);
+    let manifest = crate::manifest::SpeciesManifest::read(&params.out_dir)?;
     let row_threshold = |chrom: &str| -> f64 {
         if manifest
             .as_ref()
@@ -483,5 +544,143 @@ mod tests {
         // Legacy 10-column candidates + 2 appended (early fixtures).
         let text = "chr1\t100\t101\tA\t30\t20\t0\t10\t0\t0.3333\t5\t0\n";
         assert_eq!(parse_alt_verified(text), vec![5]);
+    }
+}
+
+#[cfg(test)]
+mod hyper_rows_strict_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn params_with_sites_tsv(tag: &str, body: &str) -> (PathBuf, RunParams) {
+        let d = std::env::temp_dir().join(format!("vcf_hr_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("hyper")).unwrap();
+        std::fs::write(d.join("hyper").join("sites.tsv"), body).unwrap();
+        let params = RunParams {
+            r1: Vec::new(),
+            r2: Vec::new(),
+            bam: None,
+            sites: None,
+            index: None,
+            fasta: PathBuf::from("ref.fa"),
+            gtf: None,
+            snp: None,
+            bundle: PathBuf::from("bundle"),
+            l1_bundle: None,
+            out_dir: d.clone(),
+            threads: 1,
+            batch: 64,
+            rescue_control: false,
+            stop_after: None,
+        };
+        (d, params)
+    }
+
+    #[test]
+    fn duplicate_key_is_a_hard_error_on_the_read_side() {
+        let (d, p) = params_with_sites_tsv(
+            "dup",
+            "chr1\t100\t3\tchr1:100-200\tTC\nchr1\t100\t7\tchr1:90-210\tTC\n",
+        );
+        let err = hyper_rows(&p, &[]).err().unwrap();
+        assert!(err.to_string().contains("duplicate hyper site chr1:101"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn unknown_direction_is_rejected_not_truncated_into_bases() {
+        let (d, p) = params_with_sites_tsv("dir", "chr1\t100\t3\tchr1:100-200\tAGx\n");
+        let err = hyper_rows(&p, &[]).err().unwrap();
+        assert!(err.to_string().contains("direction 'AGx'"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn malformed_numeric_fields_are_errors() {
+        let (d, p) = params_with_sites_tsv("num", "chr1\tx\t3\tchr1:100-200\tAG\n");
+        assert!(hyper_rows(&p, &[]).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+        let (d, p) = params_with_sites_tsv("num2", "chr1\t100\tx\tchr1:100-200\tAG\n");
+        assert!(hyper_rows(&p, &[]).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+        let (d, p) = params_with_sites_tsv("cols", "chr1\t100\t3\n");
+        assert!(hyper_rows(&p, &[]).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn extra_columns_are_rejected() {
+        let (d, p) = params_with_sites_tsv("extra", "chr1\t100\t3\tchr1:100-200\tTC\tsurplus\n");
+        let err = hyper_rows(&p, &[]).err().unwrap();
+        assert!(err.to_string().contains("expected 5 tab-separated columns, got 6"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn unreadable_sites_tsv_is_an_error_not_an_empty_table() {
+        let (d, p) = params_with_sites_tsv("unread", "chr1\t100\t3\tchr1:100-200\tTC\n");
+        let path = d.join("hyper").join("sites.tsv");
+        // chmod 000: present but unreadable (no-op when running as root).
+        std::process::Command::new("chmod").arg("000").arg(&path).status().unwrap();
+        match hyper_rows(&p, &[]) {
+            Err(e) => assert!(e.to_string().contains("cannot read"), "{e}"),
+            Ok(_) if nix_free_root() => {} // running as root: chmod 000 still readable
+            Ok(_) => panic!("unreadable sites.tsv must not parse as an empty table"),
+        }
+        std::process::Command::new("chmod").arg("644").arg(&path).status().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn absent_sites_tsv_is_a_legal_empty_table() {
+        let d = std::env::temp_dir().join(format!("vcf_hr_absent_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let mut params = RunParams {
+            r1: Vec::new(),
+            r2: Vec::new(),
+            bam: None,
+            sites: None,
+            index: None,
+            fasta: PathBuf::from("ref.fa"),
+            gtf: None,
+            snp: None,
+            bundle: PathBuf::from("bundle"),
+            l1_bundle: None,
+            out_dir: d.clone(),
+            threads: 1,
+            batch: 64,
+            rescue_control: false,
+            stop_after: None,
+        };
+        let (info, extra) = hyper_rows(&params, &[]).unwrap();
+        assert!(info.is_empty() && extra.is_empty());
+        params.out_dir = d.clone();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn nix_free_root() -> bool {
+        // true when euid != 0 (chmod 000 actually blocks reads)
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() != "0")
+            .unwrap_or(true)
+    }
+
+    #[test]
+    fn clean_table_splits_annotation_and_tier2() {
+        let (d, p) = params_with_sites_tsv(
+            "clean",
+            "chr1\t100\t3\tchr1:100-200\tTC\nchr1\t300\t4\tchr1:250-350\tAG\n",
+        );
+        let known = vec![("chr1".to_string(), 101i64)];
+        let (info, extra) = hyper_rows(&p, &known).unwrap();
+        assert_eq!(info.len(), 2);
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0].key, ("chr1".to_string(), 301));
+        assert_eq!(extra[0].dir, "AG");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

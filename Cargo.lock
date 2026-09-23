@@ -526,7 +526,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-bamio"
-version = "1.0.6"
+version = "1.0.8"
 dependencies = [
  "noodles",
  "noodles-bgzf",
@@ -536,7 +536,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-cli"
-version = "1.0.6"
+version = "1.0.8"
 dependencies = [
  "anyhow",
  "clap",
@@ -559,7 +559,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-engine"
-version = "1.0.6"
+version = "1.0.8"
 dependencies = [
  "esperanto-tidx",
  "esperanto-txmap",
@@ -569,7 +569,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-flow"
-version = "1.0.6"
+version = "1.0.8"
 dependencies = [
  "anyhow",
  "esperanto-bamio",
@@ -590,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-map"
-version = "1.0.6"
+version = "1.0.8"
 dependencies = [
  "bytemuck",
  "esperanto-bamio",
@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-pile"
-version = "1.0.6"
+version = "1.0.8"
 dependencies = [
  "esperanto-scan",
  "rust-htslib",
@@ -618,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-qc"
-version = "1.0.6"
+version = "1.0.8"
 dependencies = [
  "flate2",
  "rayon",
@@ -629,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-report"
-version = "1.0.6"
+version = "1.0.8"
 dependencies = [
  "anyhow",
  "serde",
@@ -638,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-scan"
-version = "1.0.6"
+version = "1.0.8"
 dependencies = [
  "flate2",
  "rayon",
@@ -648,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-score"
-version = "1.0.6"
+version = "1.0.8"
 dependencies = [
  "anyhow",
  "esperanto-bamio",
@@ -664,7 +664,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-tidx"
-version = "1.0.6"
+version = "1.0.8"
 dependencies = [
  "blake3",
  "rayon",
@@ -673,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-txmap"
-version = "1.0.6"
+version = "1.0.8"
 dependencies = [
  "blake3",
  "thiserror 2.0.20",
@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-verify"
-version = "1.0.6"
+version = "1.0.8"
 dependencies = [
  "esperanto-engine",
  "esperanto-map",

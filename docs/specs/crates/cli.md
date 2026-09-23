@@ -71,7 +71,6 @@ Single-site and batch are mutually exclusive; giving both is an error. Output co
 | `--bam` | PathBuf | **required** | input BAM (sorted, indexed) |
 | `--out` | PathBuf | **required** | candidates.bed |
 | `--fasta` | PathBuf | refs probing by default | reference (needs .fai) |
-| `--snp` | PathBuf or `none` | refs probing by default | known-SNP VCF; listed positions are removed; `none` disables |
 | `--min-mapq` | u8 | 20 | reads below this MAPQ do not count |
 | `--min-bq` | u8 | 30 | bases below this quality do not count |
 | `--min-depth` | u32 | 10 | minimum counted depth |
@@ -100,7 +99,6 @@ Single-site and batch are mutually exclusive; giving both is an error. Output co
 | `--index` | PathBuf | required for FASTQ entries | paidx |
 | `--fasta` | PathBuf | refs probing by default | reference (needs .fai) |
 | `--gtf` | PathBuf | None (refs probing by default) | annotation |
-| `--snp` | PathBuf | None (refs probing by default) | known-SNP VCF (candidate exclusion) |
 | `--bundle` | PathBuf | zero-config 5-level | model bundle |
 | `--l1-bundle` | PathBuf | None | L1 engine |
 | `--out` | PathBuf | **required** | output root |
@@ -124,11 +122,11 @@ Everything follows "explicit flag first; probing only fills blanks". The first l
 
 Validity at each level: the directory contains `net_main.safetensors`.
 
-### refs (4 levels, used by run's fasta/gtf/snp/index, scan's fasta/snp and score's fasta)
+### refs (4 levels, used by run's fasta/gtf/index, scan's fasta and score's fasta)
 
 1. `ESPERANTO_REFS`; 2. `<exe>/refs` and `<exe>/../refs`; 3. `~/.local/share/esperanto/refs`; 4. `./refs`.
 
-Directory validity: contains a `*.fa` with a same-named `.fai`. File location: fasta = `hg38.fa` preferred, otherwise the first `*.fa` in lexicographic order; gtf = first `*.gtf`; snp = the first `*.vcf`/`*.vcf.gz` whose name contains `snp`; index = first `*.paidx`. **Only fills blanks; never overrides explicit values.**
+Directory validity: contains a `*.fa` with a same-named `.fai`. File location: fasta = `hg38.fa` preferred, otherwise the first `*.fa` in lexicographic order; gtf = first `*.gtf`; index = first `*.paidx`. **Only fills blanks; never overrides explicit values.**
 
 
 ## Exit codes and errors

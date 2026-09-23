@@ -295,6 +295,32 @@ the site filter in place the hyper-edited yield (5,753) exceeds the
 unfiltered baseline (5,709), so the two changes together cost no
 hyper-editing sensitivity and cut FDR five-fold.
 
+## Known-SNP exclusion: internal channel, never exposed (2026-09-22)
+
+The `--snp` option is removed from `run` and `scan`, and `resume` ignores a
+known-SNP setting frozen by an older run.json (with a warning). The channel
+itself (`CallParams.snp`, the VCF set-intersection in `run_call`) stays in the
+code but is `None` on every entry point.
+
+Motivation, two converging reasons:
+
+- **Benchmark protocol contamination.** With refs discovery enabled, a bare
+  `esperanto run` silently picked up whatever dbSNP VCF happened to sit in the
+  refs directory and excluded those positions from the candidates. Two
+  evaluations of the same build on the same data could therefore produce
+  different candidate sets depending on local refs state — an undocumented
+  protocol change no benchmark can tolerate.
+- **Claim consistency.** The product's precision story is the in-caller
+  RE-vs-variant scoring, not a blacklist. Shipping a silent exclusion path
+  alongside that claim invites the reading that the numbers depend on the
+  blacklist; closing the channel keeps every reported number attributable to
+  the caller itself.
+
+Future work: variant-awareness may return as a designed, three-layer scheme
+(variant-aware alignment seeds, per-site variant scoring features, and an
+explicit opt-in exclusion list with provenance reporting). Until that design
+exists, the channel stays off rather than half-exposed.
+
 ## Pending decisions
 
 Deferred until wet-lab / further data is available:

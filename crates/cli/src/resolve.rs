@@ -103,8 +103,6 @@ pub struct Refs {
     pub fasta: Option<PathBuf>,
     /// First `*.gtf`.
     pub gtf: Option<PathBuf>,
-    /// First `*snp*.vcf[.gz]` (known-SNP exclusion list).
-    pub snp: Option<PathBuf>,
     /// First `*.paidx` alignment index.
     pub index: Option<PathBuf>,
 }
@@ -136,14 +134,9 @@ fn refs_in(dir: &Path) -> Option<Refs> {
         .iter()
         .find(|n| n.ends_with(".gtf"))
         .map(|n| dir.join(n));
-    let snp = names
-        .iter()
-        .find(|n| (n.ends_with(".vcf.gz") || n.ends_with(".vcf")) && n.to_ascii_lowercase().contains("snp"))
-        .map(|n| dir.join(n));
     Some(Refs {
         fasta: Some(fasta),
         gtf,
-        snp,
         index,
     })
 }
@@ -181,13 +174,6 @@ impl Refs {
     pub fn fill_gtf(&self, gtf: &mut Option<PathBuf>) {
         if gtf.is_none() {
             *gtf = self.gtf.clone();
-        }
-    }
-
-    /// Fill `snp` when unset.
-    pub fn fill_snp(&self, snp: &mut Option<PathBuf>) {
-        if snp.is_none() {
-            *snp = self.snp.clone();
         }
     }
 

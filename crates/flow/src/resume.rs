@@ -357,28 +357,73 @@ fn valid_vcf(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// align_qc.json carries the rescue bookkeeping key (rescue ran to the end).
-/// An empty unmapped set means the rescue was a no-op by definition (the
-/// key is only written when there is something to re-align).
+/// Whether the rescue stage's output is complete and internally consistent.
+/// The seal key in align_qc.json alone is not proof: a run killed with the
+/// key in place but the raw.bam merge pending (the seal order older builds
+/// used) leaves rescued.tsv, raw.bam and the key disagreeing, and resuming
+/// past that state lets every downstream stage read a short BAM as if it
+/// were whole. `true` here means the sealed count, the rescued.tsv data rows
+/// and the RE:Z:collapsed records in raw.bam all agree; any disagreement
+/// sends the walk back to the rescue stage, which re-runs to a consistent
+/// state instead of continuing over a half-merged map.
 fn rescue_recorded(map_dir: &Path) -> bool {
-    let keyed =
-fs::read_to_string(map_dir.join("align_qc.json"))
-.map(|t| {
-serde_json::from_str::<serde_json::Value>(&t)
-.map(|v| v["rescued_collapsed"].is_u64())
-.unwrap_or(false)
-})
-        .unwrap_or(false);
-    if keyed {
-        return true;
+    let sealed = fs::read_to_string(map_dir.join("align_qc.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v["rescued_collapsed"].as_u64());
+    match sealed {
+        Some(n) => rescue_seal_consistent(map_dir, n),
+        None => {
+            // rescued.tsv is written before the seal key, so the sidecar
+            // without the key means the rescue was interrupted mid-write and
+            // must rerun — even when unmapped.fq.gz already lost the reads.
+            if map_dir.join("rescued.tsv").is_file() {
+                return false;
+            }
+            // An empty unmapped set means the rescue was a no-op by
+            // definition (the key is only written when there is something to
+            // re-align).
+            let Ok(f) = fs::File::open(map_dir.join("unmapped.fq.gz")) else {
+                return false;
+            };
+            use std::io::Read as _;
+            let mut dec = flate2::read::GzDecoder::new(f);
+            let mut byte = [0u8; 1];
+            matches!(dec.read(&mut byte), Ok(0))
+        }
+    }
 }
-    let Ok(f) = fs::File::open(map_dir.join("unmapped.fq.gz")) else {
+
+/// The sealed rescued count must equal the rescued.tsv data rows and the
+/// RE:Z:collapsed records present in raw.bam. All three counters are checked
+/// even when the seal is zero: a pass killed between a partial merge and the
+/// seal write can leave RE records behind with no key at all, and only a
+/// clean triple zero — key, sidecar and BAM — counts as recorded.
+fn rescue_seal_consistent(map_dir: &Path, sealed: u64) -> bool {
+    let tsv_rows = match fs::read_to_string(map_dir.join("rescued.tsv")) {
+        Ok(t) => t.lines().filter(|l| !l.is_empty()).count().saturating_sub(1) as u64,
+        Err(_) => 0,
+    };
+    if tsv_rows != sealed {
+        return false;
+    }
+    let Ok(mut rdr) = rust_htslib::bam::Reader::from_path(map_dir.join("raw.bam")) else {
         return false;
     };
-    use std::io::Read as _;
-    let mut dec = flate2::read::GzDecoder::new(f);
-    let mut byte = [0u8; 1];
-    matches!(dec.read(&mut byte), Ok(0))
+    use rust_htslib::bam::Read as _;
+    let mut re = 0u64;
+    for r in rdr.records() {
+        let Ok(rec) = r else {
+            return false;
+        };
+        if matches!(
+            rec.aux(b"RE"),
+            Ok(rust_htslib::bam::record::Aux::String("collapsed"))
+        ) {
+            re += 1;
+        }
+    }
+    re == sealed
 }
 
 /// Map-stage three-state check: done / only the rescue is pending / rerun.
@@ -593,7 +638,9 @@ mod tests {
         gzip(&qc.join("r2.clean_R2.fq.gz"), "@a/2\nTGCA\n+\nIIII\n");
         let map = root.join("map");
         fs::create_dir_all(&map).unwrap();
-        bgzf(&map.join("raw.bam"));
+        // raw.bam must parse as BAM: the rescue seal check scans it for
+        // RE:Z:collapsed records even when the sealed count is zero.
+        bam_with_records(&map.join("raw.bam"), 0, 0);
         fs::write(map.join("align_qc.json"), "{\"rescued_collapsed\": 0}").unwrap();
         gzip(&map.join("unmapped.fq.gz"), "");
         fs::write(map.join("align.baln"), "").unwrap();
@@ -749,6 +796,153 @@ mod tests {
         assert!(RunLock::acquire(&d).is_err());
         drop(l1);
         assert!(RunLock::acquire(&d).is_ok());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A minimal valid BAM (BGZF EOF marker included) with `re` records
+    /// carrying RE:Z:collapsed and `plain` records without the tag.
+    fn bam_with_records(path: &Path, re: u64, plain: u64) {
+        let mut hdr = rust_htslib::bam::Header::new();
+        let mut sq = rust_htslib::bam::header::HeaderRecord::new(b"SQ");
+        sq.push_tag(b"SN", "chr1");
+        sq.push_tag(b"LN", 1000);
+        hdr.push_record(&sq);
+        let mut w = rust_htslib::bam::Writer::from_path(path, &hdr, rust_htslib::bam::Format::Bam)
+            .unwrap();
+        for i in 0..(re + plain) {
+            let mut rec = rust_htslib::bam::Record::new();
+            let qname = format!("r{i}");
+            rec.set(qname.as_bytes(), None, b"ACGT", &[30u8; 4]);
+            rec.set_tid(0);
+            rec.set_pos(i as i64);
+            if i < re {
+                rec.push_aux(b"RE", rust_htslib::bam::record::Aux::String("collapsed"))
+                    .unwrap();
+            }
+            w.write(&rec).unwrap();
+        }
+    }
+
+    fn rescued_tsv(path: &Path, rows: u64) {
+        let mut text = String::from("qname\tchrom\tpos0\tstrand\tdir\tn_edits\tedit_pos0\tmapq\n");
+        for i in 0..rows {
+            text.push_str(&format!("r{i}\tchr1\t{i}\t+\tAG\t2\t1,2\t20\n"));
+        }
+        fs::write(path, text).unwrap();
+    }
+
+    /// Seal key, rescued.tsv rows and raw.bam RE:Z:collapsed records agree:
+    /// the rescue output counts as recorded.
+    #[test]
+    fn rescue_recorded_accepts_consistent_seal() {
+        let d = tmp("rescue-consistent");
+        let map = d.join("map");
+        fs::create_dir_all(&map).unwrap();
+        fs::write(map.join("align_qc.json"), "{\"rescued_collapsed\": 2}").unwrap();
+        rescued_tsv(&map.join("rescued.tsv"), 2);
+        bam_with_records(&map.join("raw.bam"), 2, 3);
+        assert!(rescue_recorded(&map));
+        // A zero seal is accepted only as a clean triple zero: no sidecar
+        // rows and no RE records in raw.bam.
+        fs::write(map.join("align_qc.json"), "{\"rescued_collapsed\": 0}").unwrap();
+        fs::remove_file(map.join("rescued.tsv")).unwrap();
+        bam_with_records(&map.join("raw.bam"), 0, 3);
+        assert!(rescue_recorded(&map));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A zero seal with RE residue in raw.bam (partial merge before the seal
+    /// write, then killed) is inconsistent and must rerun the rescue.
+    #[test]
+    fn rescue_recorded_rejects_zero_seal_with_re_residue() {
+        let d = tmp("rescue-zero-residue");
+        let map = d.join("map");
+        fs::create_dir_all(&map).unwrap();
+        fs::write(map.join("align_qc.json"), "{\"rescued_collapsed\": 0}").unwrap();
+        bam_with_records(&map.join("raw.bam"), 1, 3);
+        assert!(!rescue_recorded(&map));
+        // Same with the sidecar left behind: still rejected (row count
+        // disagrees with the seal even before the BAM check).
+        rescued_tsv(&map.join("rescued.tsv"), 1);
+        assert!(!rescue_recorded(&map));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The defect window: seal key written, raw.bam never received the rescued
+    /// records. The key alone must not count as recorded.
+    #[test]
+    fn rescue_recorded_rejects_keyed_but_unmerged() {
+        let d = tmp("rescue-unmerged");
+        let map = d.join("map");
+        fs::create_dir_all(&map).unwrap();
+        fs::write(map.join("align_qc.json"), "{\"rescued_collapsed\": 2}").unwrap();
+        rescued_tsv(&map.join("rescued.tsv"), 2);
+        bam_with_records(&map.join("raw.bam"), 0, 5);
+        assert!(!rescue_recorded(&map));
+        // Key value disagreeing with the sidecar alone is also a mismatch.
+        fs::write(map.join("align_qc.json"), "{\"rescued_collapsed\": 5}").unwrap();
+        bam_with_records(&map.join("raw.bam"), 2, 5);
+        assert!(!rescue_recorded(&map));
+        // A zero seal with leftover sidecar rows is inconsistent.
+        fs::write(map.join("align_qc.json"), "{\"rescued_collapsed\": 0}").unwrap();
+        assert!(!rescue_recorded(&map));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// rescued.tsv without the seal key: the rescue was interrupted mid-write
+    /// and must rerun even when unmapped.fq.gz is already empty.
+    #[test]
+    fn rescue_recorded_rejects_interrupted_before_seal() {
+        let d = tmp("rescue-interrupted");
+        let map = d.join("map");
+        fs::create_dir_all(&map).unwrap();
+        fs::write(map.join("align_qc.json"), "{}").unwrap();
+        rescued_tsv(&map.join("rescued.tsv"), 2);
+        gzip(&map.join("unmapped.fq.gz"), "");
+        assert!(!rescue_recorded(&map));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// End-to-end at the resume decision: a run directory killed inside the
+    /// defect window (key written, raw.bam unmerged) walks back to the rescue
+    /// stage; once the rescue output is made consistent, the same directory
+    /// walks to done. A consistently sealed directory never revisits rescue.
+    #[test]
+    fn walk_resumes_rescue_on_window_state() {
+        let d = tmp("walk-window");
+        full_pe_dir(&d);
+        let map = d.join("map");
+        // Hand-built kill-in-window state: sealed 2, sidecar 2 rows, raw.bam
+        // holds no rescued record.
+        fs::write(map.join("align_qc.json"), "{\"rescued_collapsed\": 2}").unwrap();
+        rescued_tsv(&map.join("rescued.tsv"), 2);
+        bam_with_records(&map.join("raw.bam"), 0, 5);
+        assert_eq!(walk(&d, Entry::FastqPe, true, true), Stage::Rescue);
+        // After the rescue re-run completes, the three counters agree and the
+        // walk proceeds past the map stage again. The hyper stage consumes
+        // rescued.tsv, so its artifact has to exist for the walk to finish.
+        bam_with_records(&map.join("raw.bam"), 2, 5);
+        let hyper = d.join("hyper");
+        fs::create_dir_all(&hyper).unwrap();
+        fs::write(hyper.join("regions.bed"), "chr1\t0\t100\t+\tx\ty\t10\tz\n").unwrap();
+        assert_eq!(walk(&d, Entry::FastqPe, true, true), Stage::Report);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A directory sealed by a run whose rescue produced records and finished
+    /// is not sent back to the rescue stage.
+    #[test]
+    fn walk_leaves_consistent_rescued_dir_alone() {
+        let d = tmp("walk-rescued-intact");
+        full_pe_dir(&d);
+        let map = d.join("map");
+        fs::write(map.join("align_qc.json"), "{\"rescued_collapsed\": 2}").unwrap();
+        rescued_tsv(&map.join("rescued.tsv"), 2);
+        bam_with_records(&map.join("raw.bam"), 2, 5);
+        let hyper = d.join("hyper");
+        fs::create_dir_all(&hyper).unwrap();
+        fs::write(hyper.join("regions.bed"), "chr1\t0\t100\t+\tx\ty\t10\tz\n").unwrap();
+        assert_eq!(walk(&d, Entry::FastqPe, true, true), Stage::Report);
         let _ = fs::remove_dir_all(&d);
     }
 }

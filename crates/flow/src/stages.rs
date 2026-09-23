@@ -52,7 +52,7 @@ pub fn run(params: &RunParams) -> Result<(), FlowError> {
 pub fn preflight(params: &RunParams, entry: Entry) -> Result<(), FlowError> {
     // Reference manifest copied into the run dir at run start (hybrid refs);
     // absent → legacy hg38 heuristic.
-    let manifest = crate::manifest::SpeciesManifest::read(&params.out_dir);
+    let manifest = crate::manifest::SpeciesManifest::read(&params.out_dir)?;
     guard::check_species(&params.fasta, manifest.as_ref())?;
     match entry {
         Entry::FastqSe | Entry::FastqPe => {
@@ -690,22 +690,25 @@ fn rescue_collapsed(
         return Ok(0);
     }
 
-    // Read the unmapped set.
+    // Read the unmapped set with the strict FASTQ reader: a truncated or
+    // malformed record is a hard error (file, 1-based line, reason), never a
+    // silently shortened pool. Read names keep the writer's first-token
+    // contract, so `/1`/`/2` mate markers survive intact.
     let mut fq: Vec<RescueRead> = {
-        let f = File::open(&unm_path)?;
-        let mut dec = flate2::read::GzDecoder::new(f);
-        let mut text = String::new();
-        use std::io::Read as _;
-        dec.read_to_string(&mut text)?;
+        use esperanto_map::fastq::RecordSource as _;
+        let mut rdr =
+            esperanto_map::fastq::FastqReader::open(&unm_path).map_err(stage_err("map"))?;
         let mut out = Vec::new();
-        let mut lines = text.lines();
-        while let (Some(n), Some(q), Some(_), Some(qv)) =
-            (lines.next(), lines.next(), lines.next(), lines.next())
-        {
+        while let Some(rec) = rdr.next_record().map_err(|e| {
+            FlowError::Entry(format!(
+                "malformed unmapped FASTQ {}: {e}",
+                unm_path.display()
+            ))
+        })? {
             out.push((
-                n.trim_start_matches('@').to_string(),
-                q.as_bytes().to_vec(),
-                qv.as_bytes().to_vec(),
+                String::from_utf8_lossy(&rec.name).into_owned(),
+                rec.seq,
+                rec.qual,
             ));
         }
         out
@@ -718,6 +721,12 @@ fn rescue_collapsed(
     // direction verifies, so nothing is lost by trying.
     let n_unmapped = fq.len();
     fq.extend(collect_deferred(raw_bam)?);
+    let dropped = dedup_pool(&mut fq);
+    if dropped > 0 {
+        eprintln!(
+            "[rescue] pool: dropped {dropped} duplicate entrant(s) left by an interrupted earlier pass"
+        );
+    }
     let n_deferred = fq.len() - n_unmapped;
     if fq.is_empty() {
         return Ok(0);
@@ -954,7 +963,6 @@ fn rescue_collapsed(
         rescued_names.insert(name.as_str());
     }
     let rescued_n = rescued.len() as u64;
-    patch_stats(rescued_n, rejected)?;
     eprintln!(
         "[rescue] collapsed: {} verified ({} placed, {} rejected, {} screened) \
          of {} offered ({} unmapped + {} deferred)",
@@ -978,6 +986,9 @@ fn rescue_collapsed(
         eprintln!("[rescue] rejected by: {}", parts.join(" "));
     }
     if rescued.is_empty() {
+        // Nothing merged and nothing evicted: the seal key is the whole
+        // product of this pass.
+        patch_stats(0, rejected)?;
         return Ok(0);
     }
     // Whether the verified placements clear the pileup gate is a separate
@@ -1044,24 +1055,6 @@ fn rescue_collapsed(
         fs::write(map_dir.join("rescued.bed"), text)?;
     }
 
-    // Rewrite unmapped.fq.gz without the rescued reads.
-    {
-        let mut out = Vec::new();
-        for (name, seq, qual) in &fq[..n_unmapped] {
-            if !rescued_names.contains(name.as_str()) {
-                out.extend_from_slice(format!("@{name}\n").as_bytes());
-                out.extend_from_slice(seq);
-                out.extend_from_slice(b"\n+\n");
-                out.extend_from_slice(qual);
-                out.push(b'\n');
-            }
-        }
-        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(1));
-        use std::io::Write as _;
-        enc.write_all(&out)?;
-        fs::write(&unm_path, enc.finish()?)?;
-    }
-
     // Merge rescued records into raw.bam (same contig order: both indices
     // derive from the same FASTA) -> replace raw.bam before sort.
     let header = {
@@ -1083,9 +1076,11 @@ fn rescue_collapsed(
                 // Drop the rescued reads' original records — unmapped ones and
                 // clipped placements alike — so exactly one record per read
                 // survives. Keyed by mate slot, not by name: the mate keeps
-                // its own record.
-                let slot = usize::from(rec.is_paired() && !rec.is_first_in_template());
-                if rescued_slots.contains(&(rec.qname().to_vec(), slot)) {
+                // its own record. A stale RE:Z:collapsed record from an
+                // interrupted earlier pass whose read did not verify this
+                // time is dropped too, so raw.bam, rescued.tsv and the seal
+                // key always converge to the same rescued set.
+                if merge_drops_record(&rec, &rescued_slots) {
                     continue;
                 }
                 w.write(&rec).map_err(stage_err("map"))?;
@@ -1174,7 +1169,17 @@ fn rescue_collapsed(
                     }
                 })
                 .collect();
-            rec.set(qname, Some(&rust_htslib::bam::record::CigarString(cigar)), &s2, &q2);
+            // The second set() must carry offset-free Phred like the first
+            // one (rust-htslib Record::set documents qual as "Phred-scaled
+            // quality values, without any offset"); passing the ASCII bytes
+            // here overwrote the converted values and stored every rescued
+            // read's quality inflated by +33.
+            rec.set(
+                qname,
+                Some(&rust_htslib::bam::record::CigarString(cigar)),
+                &s2,
+                &esperanto_map::bam::phred_from_ascii(&q2),
+            );
             rec.push_aux(b"RE", rust_htslib::bam::record::Aux::String("collapsed"))
                 .map_err(stage_err("map"))?;
             w.write(&rec).map_err(stage_err("map"))?;
@@ -1211,7 +1216,56 @@ fn rescue_collapsed(
         w.flush()?;
     }
     fs::rename(&merged, raw_bam)?;
+
+    // Rewrite unmapped.fq.gz without the rescued reads. This eviction happens
+    // only after the merge is durable: until the rename above lands, the
+    // unmapped pool is the only place an unmapped-origin rescued read still
+    // exists, and an interrupted pass must leave the pool complete for the
+    // re-run that resume schedules.
+    {
+        let mut out = Vec::new();
+        for (name, seq, qual) in &fq[..n_unmapped] {
+            if !rescued_names.contains(name.as_str()) {
+                out.extend_from_slice(format!("@{name}\n").as_bytes());
+                out.extend_from_slice(seq);
+                out.extend_from_slice(b"\n+\n");
+                out.extend_from_slice(qual);
+                out.push(b'\n');
+            }
+        }
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(1));
+        use std::io::Write as _;
+        enc.write_all(&out)?;
+        fs::write(&unm_path, enc.finish()?)?;
+    }
+
+    // The seal key is written last. A key in align_qc.json must mean the
+    // merge, the sidecars and the pool eviction have all completed; writing
+    // it earlier let a killed run resume past a raw.bam that never received
+    // the rescued records, and every downstream stage then read the short
+    // BAM as if it were whole.
+    patch_stats(rescued_n, rejected)?;
     Ok(rescued_n)
+}
+
+/// Whether the rescue merge replaces a raw.bam record: the original record of
+/// a read (re-)verified this pass — keyed by mate slot, not by name, since the
+/// two mates share a qname and only one of them is being replaced — or a stale
+/// RE:Z:collapsed record left by an interrupted earlier pass whose read did
+/// not verify this time. raw.bam, rescued.tsv and the seal key always converge
+/// to the same rescued set.
+fn merge_drops_record(
+    rec: &rust_htslib::bam::Record,
+    rescued_slots: &std::collections::HashSet<(Vec<u8>, usize)>,
+) -> bool {
+    let slot = usize::from(rec.is_paired() && !rec.is_first_in_template());
+    if rescued_slots.contains(&(rec.qname().to_vec(), slot)) {
+        return true;
+    }
+    matches!(
+        rec.aux(b"RE"),
+        Ok(rust_htslib::bam::record::Aux::String("collapsed"))
+    )
 }
 
 /// Mapped-mate placement slot for the paired-end concordance check.
@@ -1312,6 +1366,18 @@ fn collect_deferred(raw_bam: &Path) -> Result<Vec<RescueRead>, FlowError> {
         if len == 0 {
             continue;
         }
+        // A record sealed by an earlier rescue pass carries RE:Z:collapsed.
+        // A first pass has none; on a rescue re-run after an interrupted
+        // merge these records are the only place the rescued reads still
+        // exist, so they re-enter the pool and are verified again like any
+        // other offered read.
+        if matches!(
+            rec.aux(b"RE"),
+            Ok(rust_htslib::bam::record::Aux::String("collapsed"))
+        ) {
+            out.push(pool_record(&rec));
+            continue;
+        }
         // Aligned columns, matching `ReadAlignment::aligned_and_matching` so
         // the density below is the same quantity the MAPQ cap used.
         let aligned: u32 = rec
@@ -1336,20 +1402,45 @@ fn collect_deferred(raw_bam: &Path) -> Result<Vec<RescueRead>, FlowError> {
         {
             continue;
         }
-        // BAM stores reference orientation; `apply_t13` is an involution, so
-        // applying it again recovers the read as sequenced — which is what the
-        // rescue transform and `verify_rescue_placement` both expect.
-        let qual: Vec<u8> = rec.qual().iter().map(|q| q.saturating_add(33)).collect();
-        let (seq, qual) = esperanto_bamio::apply_t13(rec.is_reverse(), &rec.seq().as_bytes(), &qual);
-        let name = String::from_utf8_lossy(rec.qname()).into_owned();
-        let name = if rec.is_paired() {
-            format!("{name}/{}", if rec.is_first_in_template() { 1 } else { 2 })
-        } else {
-            name
-        };
-        out.push((name, seq, qual));
+        out.push(pool_record(&rec));
     }
     Ok(out)
+}
+
+/// Drop duplicate pool entries by (template name, mate slot). A read sits in
+/// both halves of the pool when an earlier pass merged it into raw.bam but
+/// was killed before evicting it from unmapped.fq.gz; winner bookkeeping is
+/// keyed by pool index, so a duplicate would double the rescued set, the seal
+/// count and the merged records together — internally consistent and wrong.
+/// The first occurrence wins; the unmapped half always precedes the deferred
+/// half and its keys are unique by the writer contract, so the
+/// `fq[..n_unmapped]` eviction contract is unaffected.
+fn dedup_pool(fq: &mut Vec<RescueRead>) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    let before = fq.len();
+    fq.retain(|(name, _, _)| {
+        let (base, slot) = split_mate_marker(name);
+        seen.insert((base.as_bytes().to_vec(), slot))
+    });
+    before - fq.len()
+}
+
+/// A raw.bam record as a pool entry: sequence and quality as sequenced
+/// (BAM stores reference orientation; `apply_t13` is an involution, so
+/// applying it again recovers the read as sequenced — which is what the
+/// rescue transform and `verify_rescue_placement` both expect), named the
+/// way `unmapped.fq.gz` names its records so both sources share one code
+/// path downstream.
+fn pool_record(rec: &rust_htslib::bam::Record) -> RescueRead {
+    let qual: Vec<u8> = rec.qual().iter().map(|q| q.saturating_add(33)).collect();
+    let (seq, qual) = esperanto_bamio::apply_t13(rec.is_reverse(), &rec.seq().as_bytes(), &qual);
+    let name = String::from_utf8_lossy(rec.qname()).into_owned();
+    let name = if rec.is_paired() {
+        format!("{name}/{}", if rec.is_first_in_template() { 1 } else { 2 })
+    } else {
+        name
+    };
+    (name, seq, qual)
 }
 
 /// Whether a placement's ordinary-mismatch density reaches
@@ -1972,7 +2063,7 @@ fn stage_score(
     // Hybrid runs: only human-locus sites are scored (scientific contract —
     // there is no mouse model); mouse-contig sites reach the VCF marked
     // UNSCORED with VAF/DEPTH kept.
-    let manifest = crate::manifest::SpeciesManifest::read(&params.out_dir);
+    let manifest = crate::manifest::SpeciesManifest::read(&params.out_dir)?;
     let hybrid = manifest.as_ref().is_some_and(|m| m.kind == "hybrid");
     let scored: Vec<Option<f64>> = if hybrid {
         let m = manifest.as_ref().expect("hybrid checked");
@@ -2040,7 +2131,7 @@ fn stage_score(
 
     // Tier-2-only rescue sites: scored with the rescue model, never on mouse
     // contigs (hybrid runs keep those unscored).
-    let (_, hyper_rows) = vcf::hyper_rows(params, sites);
+    let (_, hyper_rows) = vcf::hyper_rows(params, sites)?;
     let mut hyper_probs: Vec<Option<f64>> = vec![None; hyper_rows.len()];
     if !hyper_rows.is_empty() {
         let human_idx: Vec<usize> = (0..hyper_rows.len())
@@ -2121,7 +2212,20 @@ fn load_score_state(
         hyper: Some(hyper),
     };
     let mut hyper_probs: Vec<Option<f64>> = Vec::new();
-    if let Ok(text) = fs::read_to_string(params.out_dir.join("score").join("hyper_scores.tsv")) {
+    // Absent hyper_scores.tsv = a run without tier-2 scoring (legal); a
+    // present-but-unreadable one is a hard error, never a fake "no scores".
+    let hpath = params.out_dir.join("score").join("hyper_scores.tsv");
+    let htext = match fs::read_to_string(&hpath) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(FlowError::BedParse {
+                line: 0,
+                msg: format!("cannot read {}: {e}", hpath.display()),
+            })
+        }
+    };
+    if let Some(text) = htext {
         let mut by_key: std::collections::HashMap<(String, i64), Option<f64>> =
             std::collections::HashMap::new();
         for line in text.lines() {
@@ -2140,7 +2244,7 @@ fn load_score_state(
             };
             by_key.insert((f[0].to_string(), pos), value);
         }
-        let (_, rows) = vcf::hyper_rows(params, sites);
+        let (_, rows) = vcf::hyper_rows(params, sites)?;
         hyper_probs = rows
             .iter()
             .map(|r| by_key.get(&r.key).copied().flatten())
@@ -2401,5 +2505,264 @@ mod rescue_tests {
         assert_eq!(rescue_mate_gate(&aln, "t/2", &other), Err("mate_contig"));
         let empty = std::collections::HashMap::new();
         assert_eq!(rescue_mate_gate(&aln, "t/2", &empty), Err("mate_unmapped"));
+    }
+
+    /// A minimal BAM writer for pool/merge tests: one contig, records as
+    /// specified. `(qname, flags, cigar, re_sealed)`.
+    fn write_pool_bam(
+        path: &std::path::Path,
+        contig: &str,
+        contig_len: u32,
+        specs: &[(&str, u16, Vec<rust_htslib::bam::record::Cigar>, bool)],
+    ) {
+        let mut hdr = rust_htslib::bam::Header::new();
+        let mut sq = rust_htslib::bam::header::HeaderRecord::new(b"SQ");
+        sq.push_tag(b"SN", contig);
+        sq.push_tag(b"LN", contig_len);
+        hdr.push_record(&sq);
+        let mut w =
+            rust_htslib::bam::Writer::from_path(path, &hdr, rust_htslib::bam::Format::Bam).unwrap();
+        for (i, (name, flags, cigar, re)) in specs.iter().enumerate() {
+            let mut rec = rust_htslib::bam::Record::new();
+            let seq = b"AAACCCGG";
+            let qual = [30u8; 8];
+            let cs = rust_htslib::bam::record::CigarString(cigar.clone());
+            rec.set(name.as_bytes(), Some(&cs), seq, &qual);
+            rec.set_tid(0);
+            rec.set_pos(100 + i as i64);
+            rec.set_flags(*flags);
+            if *re {
+                rec.push_aux(b"RE", rust_htslib::bam::record::Aux::String("collapsed"))
+                    .unwrap();
+            }
+            w.write(&rec).unwrap();
+        }
+    }
+
+    #[test]
+    fn merge_drop_rule_replaces_winners_and_stale_seals() {
+        let d = std::env::temp_dir().join(format!("esp-merge-drop-{}", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        let bam = d.join("raw.bam");
+        use rust_htslib::bam::record::Cigar;
+        write_pool_bam(
+            &bam,
+            "chr1",
+            10000,
+            &[
+                ("keep", 0, vec![Cigar::Match(8)], false),
+                ("orig", 0, vec![Cigar::Match(8)], false),
+                ("stale", 0, vec![Cigar::Match(8)], true),
+                ("rewin", 0, vec![Cigar::Match(8)], true),
+            ],
+        );
+        let mut slots: std::collections::HashSet<(Vec<u8>, usize)> =
+            std::collections::HashSet::new();
+        slots.insert((b"orig".to_vec(), 0));
+        slots.insert((b"rewin".to_vec(), 0));
+        use rust_htslib::bam::Read as _;
+        let mut rdr = rust_htslib::bam::Reader::from_path(&bam).unwrap();
+        let mut kept = Vec::new();
+        for r in rdr.records() {
+            let rec = r.unwrap();
+            let name = String::from_utf8_lossy(rec.qname()).into_owned();
+            assert_eq!(merge_drops_record(&rec, &slots), name != "keep", "{name}");
+            if !merge_drops_record(&rec, &slots) {
+                kept.push(name);
+            }
+        }
+        assert_eq!(kept, vec!["keep".to_string()]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn collect_deferred_recovers_sealed_records() {
+        let d = std::env::temp_dir().join(format!("esp-deferred-re-{}", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        let bam = d.join("raw.bam");
+        use rust_htslib::bam::record::Cigar;
+        // flags: 0x1 paired, 0x40 first in template, 0x10 reverse.
+        write_pool_bam(
+            &bam,
+            "chr1",
+            10000,
+            &[
+                ("sealed", 0x1 | 0x40 | 0x10, vec![Cigar::Match(8)], true),
+                ("clean", 0, vec![Cigar::Match(8)], false),
+                ("clipped", 0, vec![Cigar::Match(2), Cigar::SoftClip(6)], false),
+            ],
+        );
+        let pool = collect_deferred(&bam).unwrap();
+        let names: Vec<&str> = pool.iter().map(|(n, _, _)| n.as_str()).collect();
+        // The clean placement stays out; the sealed record and the clipped
+        // placement are offered.
+        assert!(names.contains(&"sealed/1"));
+        assert!(names.contains(&"clipped"));
+        assert!(!names.iter().any(|n| n.starts_with("clean")));
+        // The sealed record was stored reverse-complemented; the pool entry
+        // must carry the read as sequenced: revcomp(AAACCCGG) = CCGGGTTT,
+        // qualities back in ASCII offset.
+        let (_, seq, qual) = pool.iter().find(|(n, _, _)| n == "sealed/1").unwrap();
+        assert_eq!(seq.as_slice(), b"CCGGGTTT");
+        assert_eq!(qual.as_slice(), &[63u8; 8]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn dedup_pool_drops_cross_source_duplicates() {
+        let read = |n: &str| (n.to_string(), b"ACGT".to_vec(), b"IIII".to_vec());
+        // The unmapped half comes first; the deferred half re-offers x/1
+        // (merged by an interrupted pass) and both mates of y.
+        let mut fq = vec![
+            read("x/1"),
+            read("y/1"),
+            read("y/2"),
+            read("x/1"),
+            read("z"),
+        ];
+        let dropped = dedup_pool(&mut fq);
+        assert_eq!(dropped, 1);
+        let names: Vec<&str> = fq.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(names, ["x/1", "y/1", "y/2", "z"]);
+    }
+
+    /// RE:Z:collapsed record count in a BAM.
+    fn re_count(path: &std::path::Path) -> u64 {
+        use rust_htslib::bam::Read as _;
+        let mut rdr = rust_htslib::bam::Reader::from_path(path).unwrap();
+        let mut n = 0u64;
+        for r in rdr.records() {
+            let rec = r.unwrap();
+            if matches!(
+                rec.aux(b"RE"),
+                Ok(rust_htslib::bam::record::Aux::String("collapsed"))
+            ) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    fn rescued_tsv_rows(map_dir: &std::path::Path) -> u64 {
+        fs::read_to_string(map_dir.join("rescued.tsv"))
+            .unwrap()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .count() as u64
+            - 1
+    }
+
+    fn sealed_value(map_dir: &std::path::Path) -> Option<u64> {
+        let t = fs::read_to_string(map_dir.join("align_qc.json")).unwrap();
+        serde_json::from_str::<serde_json::Value>(&t).unwrap()["rescued_collapsed"].as_u64()
+    }
+
+    /// End-to-end over the rescue stage: a first pass rescues a hyperedited
+    /// read and seals; then the hand-built window state "raw.bam merged,
+    /// unmapped.fq.gz eviction pending, seal absent" is rerun, offering the
+    /// same read from both pool halves. Every counter must stay singular.
+    #[test]
+    fn rescue_rerun_after_merge_without_eviction_does_not_double() {
+        // Same period-7 fixture as the verify tests.
+        let bg = b"CGTATGCCTAGG";
+        let mut seq = Vec::with_capacity(400);
+        for i in 0..400 {
+            seq.push(if i % 7 == 0 { b'A' } else { bg[i % bg.len()] });
+        }
+        let fasta = format!(">c1\n{}\n", String::from_utf8(seq.clone()).unwrap());
+        let true_ref: &'static esperanto_map::fasta::Reference = Box::leak(Box::new(
+            esperanto_map::fasta::parse_fasta_bytes(fasta.as_bytes()).unwrap(),
+        ));
+        let read = hyper_read(true_ref, 20, 20, 110);
+        let qual = vec![b'I'; 150];
+
+        let d = std::env::temp_dir().join(format!("esp-rescue-e2e-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let map_dir = d.join("map");
+        fs::create_dir_all(&map_dir).unwrap();
+        // Collapsed-alphabet rescue indexes next to a nominal main paidx.
+        let paidx = d.join("ref.paidx");
+        for (from, to, ext) in [(b'A', b'G', "ag.paidx"), (b'T', b'C', "tc.paidx")] {
+            let tseq: Vec<u8> = seq
+                .iter()
+                .map(|&b| if b == from { to } else { b })
+                .collect();
+            let tfasta = format!(">c1\n{}\n", String::from_utf8(tseq).unwrap());
+            let tref = esperanto_map::fasta::parse_fasta_bytes(tfasta.as_bytes()).unwrap();
+            let tidx = esperanto_map::index::Index::build(
+                tref,
+                esperanto_map::seed::SeedParams { k: 31, w: 10 },
+            );
+            esperanto_map::index_io::save(&tidx, &paidx.with_extension(ext)).unwrap();
+        }
+        // Map-stage artifacts: the unmapped pool holds the read; raw.bam
+        // starts empty (header only).
+        let raw_bam = map_dir.join("raw.bam");
+        write_pool_bam(&raw_bam, "c1", 400, &[]);
+        let unm = map_dir.join("unmapped.fq.gz");
+        let write_unmapped = |with_read: bool| {
+            let text = if with_read {
+                format!(
+                    "@hyper1\n{}\n+\n{}\n",
+                    String::from_utf8(read.clone()).unwrap(),
+                    String::from_utf8(qual.clone()).unwrap()
+                )
+            } else {
+                String::new()
+            };
+            let f = fs::File::create(&unm).unwrap();
+            let mut e = flate2::write::GzEncoder::new(f, flate2::Compression::new(1));
+            use std::io::Write as _;
+            e.write_all(text.as_bytes()).unwrap();
+            e.finish().unwrap();
+        };
+        let write_stats = |sealed: Option<u64>| {
+            let stats = esperanto_map::stats::AlignStats {
+                esperanto_map_version: "test".into(),
+                mode: "rna-se".into(),
+                total_reads: 1,
+                mapped_reads: 0,
+                unmapped_reads: 1,
+                mapping_rate: 0.0,
+                proper_pairs: None,
+                insert_mean: None,
+                insert_stdev: None,
+                mapq_hist: vec![0; 61],
+                junctions_total: 0,
+                rescued_total: 0,
+                rescue_fail_total: 0,
+                rescued_collapsed: sealed,
+                rescue_rejected_collapsed: None,
+                rescue_prefiltered_collapsed: None,
+                rescue_control_verified: None,
+                decoy_reads: 0,
+                elapsed_seconds: 0.0,
+            };
+            fs::write(
+                map_dir.join("align_qc.json"),
+                serde_json::to_string_pretty(&stats).unwrap(),
+            )
+            .unwrap();
+        };
+        write_unmapped(true);
+        write_stats(None);
+
+        // First pass: the read is rescued and the seal is written.
+        let n1 = rescue_collapsed(&paidx, Some(true_ref), &map_dir, 1, &raw_bam, false).unwrap();
+        assert_eq!(n1, 1);
+        assert_eq!(re_count(&raw_bam), 1);
+        assert_eq!(rescued_tsv_rows(&map_dir), 1);
+        assert_eq!(sealed_value(&map_dir), Some(1));
+
+        // Hand-built window: merge done, eviction pending, seal absent. The
+        // rerun sees the read in unmapped.fq.gz AND as an RE record.
+        write_unmapped(true);
+        write_stats(None);
+        let n2 = rescue_collapsed(&paidx, Some(true_ref), &map_dir, 1, &raw_bam, false).unwrap();
+        assert_eq!(n2, 1);
+        assert_eq!(re_count(&raw_bam), 1);
+        assert_eq!(rescued_tsv_rows(&map_dir), 1);
+        assert_eq!(sealed_value(&map_dir), Some(1));
+        let _ = fs::remove_dir_all(&d);
     }
 }

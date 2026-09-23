@@ -2465,7 +2465,6 @@ mod tests {
                     half,
                     &format!("long rep={rep} off={offset} half={half}"),
                 );
-                cases += 1;
             }
         }
     }

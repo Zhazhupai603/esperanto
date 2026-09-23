@@ -1,6 +1,6 @@
 # ESPERANTO
 
-[![Version](https://img.shields.io/badge/version-1.0.6-green.svg)](https://github.com/Zhazhupai603/esperanto/releases)
+[![Version](https://img.shields.io/badge/version-1.0.8-green.svg)](https://github.com/Zhazhupai603/esperanto/releases)
 ![Language: Rust](https://img.shields.io/badge/language-Rust-orange.svg)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 

@@ -639,4 +639,74 @@ mod tests {
         assert!(!html[..html.find("let reportData").unwrap()].contains("</script>x"));
         assert!(html.contains("s<\\/script>x"));
     }
+
+    /// Same inputs, same binary: the report is byte-identical across repeated
+    /// generation, and a gene present on two contigs (PAR-style multi-copy)
+    /// is attributed to the last GTF row in file order — including its
+    /// hyperoverlap flag.
+    #[test]
+    fn report_is_deterministic_with_multicopy_genes() {
+        let dir = std::env::temp_dir().join(format!("esperanto-reportdet-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let out = dir.join("sample");
+        std::fs::create_dir_all(out.join("qc")).unwrap();
+        std::fs::create_dir_all(out.join("map")).unwrap();
+        std::fs::create_dir_all(out.join("hyper")).unwrap();
+        std::fs::write(
+            out.join("sites.vcf"),
+            "##fileformat=VCFv4.2\n\
+             #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+             chrX\t500\t.\tA\tG\t.\tPASS\tRE_PROB=0.95;VAF=0.4;DEPTH=40\n\
+             chrY\t700\t.\tA\tG\t.\tPASS\tRE_PROB=0.8;VAF=0.3;DEPTH=30\n",
+        )
+        .unwrap();
+        std::fs::write(out.join("qc").join("qc.json"), "{\"summary\":{\"reads_before\":4}}").unwrap();
+        std::fs::write(
+            out.join("map").join("align_qc.json"),
+            "{\"mapping_rate\":1.0,\"rescued_collapsed\":2}",
+        )
+        .unwrap();
+        // Rescued region overlaps the chrY copy only: has_hyper follows the
+        // attributed copy's coordinates.
+        std::fs::write(out.join("hyper").join("regions.bed"), "chrY\t100\t900\tAG\t3\t2\t0.5000\n").unwrap();
+
+        // Two-contig reference with a hand-computed .fai.
+        let seq = "ACGT".repeat(500); // 2000 bp per contig
+        let mut fa_text = String::new();
+        let mut fai = String::new();
+        for name in ["chrX", "chrY"] {
+            let offset = fa_text.len();
+            fa_text.push_str(&format!(">{name}\n"));
+            for i in (0..2000).step_by(60) {
+                fa_text.push_str(&seq[i..(i + 60).min(2000)]);
+                fa_text.push('\n');
+            }
+            fai.push_str(&format!("{name}\t2000\t{offset}\t60\t61\n"));
+        }
+        let fa = dir.join("ref.fa");
+        std::fs::write(&fa, &fa_text).unwrap();
+        std::fs::write(dir.join("ref.fa.fai"), &fai).unwrap();
+
+        // PARFX on chrX first, chrY second -> the chrY copy wins. One CDS
+        // transcript on chrX exercises the recoding walk.
+        let gtf = dir.join("ann.gtf");
+        std::fs::write(
+            &gtf,
+            "chrX\tsrc\tgene\t101\t900\t.\t+\t.\tgene_id \"gx\"; gene_name \"PARFX\";\n\
+             chrX\tsrc\tCDS\t401\t600\t.\t+\t0\tgene_id \"gx\"; gene_name \"PARFX\"; transcript_id \"tx1\";\n\
+             chrY\tsrc\tgene\t101\t900\t.\t+\t.\tgene_id \"gy\"; gene_name \"PARFX\";\n",
+        )
+        .unwrap();
+
+        let mut digests = Vec::new();
+        for _ in 0..3 {
+            let p = generate(&out, &fa, &gtf).unwrap();
+            digests.push(std::fs::read(&p).unwrap());
+        }
+        assert!(digests[0] == digests[1] && digests[1] == digests[2]);
+        let html = String::from_utf8(digests[0].clone()).unwrap();
+        assert!(html.contains("\"gene\":\"PARFX\",\"chrom\":\"chrY\""), "attribution must be the chrY copy");
+        assert!(html.contains("\"has_hyper\":true"), "chrY copy overlaps the rescued region");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

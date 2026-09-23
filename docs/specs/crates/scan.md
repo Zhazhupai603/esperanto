@@ -6,7 +6,7 @@ Genome-wide pileup from a coordinate-sorted BAM, emitting `candidates.bed`. The 
 
 - `--bam`: aligned BAM (requires `.bai`/`.csi`). Skips unmapped (0x4) / secondary (0x100) / supplementary (0x800) records and records with MAPQ < `min_mapq`. Reads tagged `RE:Z:collapsed` are MAPQ 0 and therefore never counted.
 - `--fasta` (required): reference; contigs absent from the `.fai` are skipped.
-- `--snp` (optional): known-SNP VCF (plain or gzip). Only CHROM/POS are read; every data row is an excluded position. Contig names match with or without a `chr` prefix.
+- Known-SNP exclusion is an internal channel, not exposed and always off: `CallParams.snp` is `None` on every entry point, so no position is ever excluded through it. When the channel is fed a VCF (plain or gzip), only CHROM/POS are read and every data row is an excluded position; contig names match with or without a `chr` prefix.
 - Thresholds: `min_mapq` 20, `min_bq` 30, `min_depth` 10, `min_edit_reads` 2, `min_edit_freq` 0.01.
 
 ## Counting (hard contract)

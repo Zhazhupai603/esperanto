@@ -63,7 +63,11 @@ pub struct Annotation {
     genes: HashMap<String, Vec<GeneRow>>,
     /// transcript_id -> transcript.
     txs: HashMap<String, Tx>,
-    /// gene name -> (chrom, start, end); the last GTF row wins.
+    /// gene name -> (chrom, start, end); the last GTF row in file order
+    /// wins. Built during the single file-order pass: grouping genes by
+    /// chrom first would lose the file order and make multi-copy gene
+    /// attribution (e.g. PAR genes present on both chrX and chrY) depend on
+    /// map iteration order.
     gcoord: HashMap<String, (String, i64, i64)>,
     /// chrom -> (CDS start, CDS end, transcript_id) sorted.
     tx_by_chrom: HashMap<String, Vec<(i64, i64, String)>>,
@@ -90,6 +94,7 @@ impl Annotation {
             .with_context(|| format!("reading GTF {}", gtf.display()))?;
         let mut genes: HashMap<String, Vec<GeneRow>> = HashMap::new();
         let mut txs: HashMap<String, Tx> = HashMap::new();
+        let mut gcoord = HashMap::new();
         for (ln, line) in text.lines().enumerate() {
             if line.starts_with('#') {
                 continue;
@@ -101,13 +106,18 @@ impl Annotation {
             match c[2] {
                 "gene" => {
                     if let Some(name) = quoted_attr(c[8], "gene_name") {
+                        let start = c[3].parse::<i64>().with_context(|| {
+                            format!("GTF line {}: bad gene start '{}'", ln + 1, c[3])
+                        })? - 1;
+                        let end = c[4].parse::<i64>().with_context(|| {
+                            format!("GTF line {}: bad gene end '{}'", ln + 1, c[4])
+                        })?;
+                        // File order is the attribution tie-break: the last
+                        // row carrying a gene name wins (reference semantics).
+                        gcoord.insert(name.clone(), (c[0].to_string(), start, end));
                         genes.entry(c[0].to_string()).or_default().push(GeneRow {
-                            start: c[3].parse::<i64>().with_context(|| {
-                                format!("GTF line {}: bad gene start '{}'", ln + 1, c[3])
-                            })? - 1,
-                            end: c[4].parse::<i64>().with_context(|| {
-                                format!("GTF line {}: bad gene end '{}'", ln + 1, c[4])
-                            })?,
+                            start,
+                            end,
                             name,
                         });
                     }
@@ -143,12 +153,6 @@ impl Annotation {
         }
         for t in txs.values_mut() {
             t.cds.sort();
-        }
-        let mut gcoord = HashMap::new();
-        for (chrom, rows) in &genes {
-            for r in rows {
-                gcoord.insert(r.name.clone(), (chrom.clone(), r.start, r.end));
-            }
         }
         let mut tx_by_chrom: HashMap<String, Vec<(i64, i64, String)>> = HashMap::new();
         for (tid, t) in &txs {
@@ -336,6 +340,36 @@ mod tests {
         assert_eq!(quoted_attr(a, "gene_name").as_deref(), Some("RPS24"));
         assert_eq!(quoted_attr(a, "transcript_id").as_deref(), Some("ENST1"));
         assert_eq!(quoted_attr(a, "gene_type"), None);
+    }
+
+    /// Multi-copy genes (one name, several loci) attribute to the last GTF
+    /// row in file order, independent of map iteration order.
+    #[test]
+    fn multicopy_gene_attribution_is_last_row_in_file_order() {
+        let gtf_text = |first: &str, second: &str| {
+            format!(
+                "{0}\tsrc\tgene\t101\t900\t.\t+\t.\tgene_id \"gx\"; gene_name \"PARFX\";\n\
+                 {1}\tsrc\tgene\t101\t900\t.\t+\t.\tgene_id \"gy\"; gene_name \"PARFX\";\n",
+                first, second
+            )
+        };
+        let dir = std::env::temp_dir().join(format!("esperanto-parfx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let gtf = dir.join("t.gtf");
+        // chrX first, chrY second -> the chrY copy wins.
+        std::fs::write(&gtf, gtf_text("chrX", "chrY")).unwrap();
+        // 200 fresh loads (fresh map seeds each time) must never flip.
+        for _ in 0..200 {
+            let ann = Annotation::load(&gtf).unwrap();
+            assert_eq!(ann.gene_coord("PARFX"), Some(("chrY", 100, 900)));
+        }
+        // Swapping the file order moves the attribution to chrX: the rule is
+        // file order, not name order.
+        std::fs::write(&gtf, gtf_text("chrY", "chrX")).unwrap();
+        let ann = Annotation::load(&gtf).unwrap();
+        assert_eq!(ann.gene_coord("PARFX"), Some(("chrX", 100, 900)));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
