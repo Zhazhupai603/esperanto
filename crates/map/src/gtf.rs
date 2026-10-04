@@ -5,7 +5,7 @@
 //! counts plus an end-point index for acceptor-side range queries.
 //!
 //! `SpliceSignal` and `RefinedJunction` live here because `RefinedJunction`
-//! references the signal enum; the splice module (later wave) adds its
+//! references the signal enum; the splice module adds its
 //! scoring machinery on top.
 
 use crate::error::AlignError;

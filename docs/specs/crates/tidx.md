@@ -54,7 +54,7 @@ Header (128 bytes):
 32  32  ref_blake3 (BLAKE3 of the reference FASTA file bytes)
 64  4   tx_count
 68  4   reserved = 0
-72  8   timestamp (unix seconds; build wall clock, can be pinned via --timestamp → byte-level reproducible for identical input)
+72  8   timestamp (unix seconds; build wall clock, can be pinned through BuildOptions.timestamp → byte-level reproducible for identical input)
 80  8   total_entries E
 88  8   bucket_count = 1<<P
 96  8   name_blob_len
@@ -75,7 +75,7 @@ Header (128 bytes):
 2. Group by contig; take the full sequence contig by contig in `.fai` order; within a contig, extract each transcript in parallel (rayon):
    - Concatenate exons (genomic ascending) → revcomp as a whole for the minus strand → obtain the 5'→3' transcript sequence
    - Slide a k=31 window; every N-free window yields (canonical, tx_id, offset), where offset = transcript coordinate
-   - Transcript length < k, or any exon exceeding the contig → drop that transcript
+   - Transcript length < k, or any exon exceeding the contig produces no indexed entries; its identifier slot is retained
 3. Sort the global Vec by (canonical, tx_id, offset)
 4. Write CSR directly; stream BLAKE3 over the reference file
 5. Write the file (large BufWriter)
@@ -93,13 +93,14 @@ Header (128 bytes):
 
 Io, BadMagic{magic,version}, UnsupportedVersion, Truncated (segment length mismatch), Inconsistent (k out of range, etc.), BadGtf{line,reason}, UnknownContig, RefMismatch (verify_reference).
 
-## Self-checks (not written as tests; manual verification points after implementation)
+## Validation invariants
 
 - encode/revcomp/canonical are mutually consistent on 31-base "ACGT…" windows
 - bucket + key_low can reconstruct the canonical k-mer
 - Two builds with identical input and identical timestamp produce byte-identical artifacts
 
-## Corrections from differential testing against the legacy binary
+## Validation and attribute syntax
 
-- Attribute parser aligned with the legacy version: values must be wrapped in double quotes (unquoted → the pair is skipped → missing transcript_id becomes an error); empty quoted values are legal; `=` separators (GFF style) are unsupported; semicolons inside quotes do not terminate the value.
-- Intentional deviations (recorded): the read side is stricter than the legacy version (m==16 / seed constant / trailing bytes / monotonicity checks — the legacy version checks none of these); the k=32 mask is correct (the legacy version has a shift overflow); build-parameter validation (k∈15..=32, P bounds); unquoted attributes were rejected by the legacy version and, after alignment, are likewise rejected now.
+GTF attribute values must use double quotes. Empty quoted values are accepted; semicolons inside quoted values do not terminate the attribute. GFF-style equals signs are not supported. Missing required transcript identifiers are errors.
+
+Index loading validates parameter ranges, reserved fields, seed constant, segment sizes, trailing bytes, and monotonic offsets. The supported k range is 15 through 32; k=32 uses the full 64-bit key mask.

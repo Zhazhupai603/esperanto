@@ -1,8 +1,6 @@
-//! esperanto-score — CMC feature extraction + frozen CNN/Transformer scoring
-//! (model bundle v1.7 contract).
+//! Native reference-aware molecular evidence scoring for ESPERANTO 1.1.
 pub mod bundle;
-pub mod cmc;
-pub mod cmcnet;
 pub mod pipeline;
+pub mod unified;
 
-pub use bundle::{is_cmc_bundle, load_cmc_bundle, load_cmc_thresholds, CmcBundle, ScoreError};
+pub use bundle::{is_unified_bundle, load_primary_threshold, ScoreError};

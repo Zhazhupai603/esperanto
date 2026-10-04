@@ -1,4 +1,4 @@
-//! GENCODE GTF ingestion, ported to match the reference tool's parser:
+//! GENCODE GTF ingestion:
 //!
 //! * Both `transcript` and `exon` rows are consumed. A transcript only exists
 //!   if it has a `transcript` row (metadata) plus at least one exon.
@@ -18,7 +18,7 @@ use std::path::Path;
 use crate::transcript::{Exon, Strand, TranscriptRecord};
 use crate::Error;
 
-/// Transcript biotypes retained by the reference parser.
+/// Transcript biotypes retained during GTF ingestion.
 pub const ALLOWED_TYPES: &[&str] = &["protein_coding", "lncRNA"];
 
 struct TxMeta {

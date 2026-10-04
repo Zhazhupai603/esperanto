@@ -6,7 +6,7 @@
 //! ±`refine_radius` box around naive breakpoints, `align_spliced` concatenates
 //! the flanking exon windows into a pseudo-reference, extends with a direct
 //! diagonal hint and stitches the CIGAR back to genomic coordinates with a
-//! `RefSkip` at the seam. S14 guards (short/unmotivated introns without
+//! `RefSkip` at the seam. Splice support guards (short/unmotivated introns without
 //! library support) gate every de-novo junction.
 
 use crate::extend::{
@@ -16,7 +16,7 @@ use crate::fasta::{Base, Reference};
 use crate::gtf::{Junction, JunctionLib, RefinedJunction, SpliceSignal};
 use crate::seed::Strand;
 
-/// Splice scoring parameters (frozen; see parameter table).
+/// Splice scoring parameters (see parameter table).
 #[derive(Clone, Copy, Debug)]
 pub struct SpliceParams {
     /// Shortest intron accepted anywhere.
@@ -52,11 +52,11 @@ impl Default for SpliceParams {
     }
 }
 
-/// Cost of rewriting an alignment into a split (frozen).
+/// Cost of rewriting an alignment into a split.
 pub const SPLIT_COST: i32 = 4;
 
-/// S14 guard: introns shorter than this need library support.
-pub const S14_MIN_INTRON_NO_LIB: u32 = 50;
+/// Splice support guard: introns shorter than this need library support.
+pub const MIN_INTRON_WITHOUT_SUPPORT: u32 = 50;
 
 impl SpliceSignal {
     /// Signal score under `params` (bonuses positive, NonCanonical negative).
@@ -102,10 +102,10 @@ pub fn splice_signal(donor: [u8; 2], acceptor: [u8; 2], minus: bool) -> SpliceSi
     }
 }
 
-/// S14 guard: reject library-unsupported introns that are too short or
+/// Splice support guard: reject library-unsupported introns that are too short or
 /// unmotivated (NonCanonical with support < 2).
-pub fn s14_pass(intron_len: u32, signal: SpliceSignal, support: u32) -> bool {
-    if intron_len < S14_MIN_INTRON_NO_LIB && support == 0 {
+pub fn splice_support_pass(intron_len: u32, signal: SpliceSignal, support: u32) -> bool {
+    if intron_len < MIN_INTRON_WITHOUT_SUPPORT && support == 0 {
         return false;
     }
     if signal == SpliceSignal::NonCanonical && support == 0 {
@@ -114,7 +114,7 @@ pub fn s14_pass(intron_len: u32, signal: SpliceSignal, support: u32) -> bool {
     true
 }
 
-/// Intron-length penalty, frozen formula: `8 × |log10(len) − 3|` as `i32` —
+/// Intron-length penalty, formula: `8 × |log10(len) − 3|` as `i32` —
 /// linear in log10 distance from the 1 kb mode (zero at 1 kb).
 pub fn intron_length_penalty(len: u32) -> i32 {
     (8.0 * ((len.max(1) as f64).log10() - 3.0).abs()) as i32
@@ -334,7 +334,7 @@ fn dinuc(ctg: &crate::fasta::Contig, p: u32, donor: bool) -> [u8; 2] {
 }
 
 /// Flank (in reference bases) added around the outermost segments of the
-/// pseudo-reference (frozen: 30).
+/// pseudo-reference (30).
 pub const ALIGN_SPLICED_FLANK: u32 = 30;
 
 /// One collinear anchor run of a chain: a genomic span with the matching
@@ -465,7 +465,7 @@ pub fn stitch_cigar(
                     let take = remaining.min(remain_in_exon);
                     // Zero-take ops ARE emitted: a Match/Del resuming exactly
                     // at an exon boundary yields a 0-length op before the
-                    // RefSkip (old stitch parity).
+                    // RefSkip (splice boundary).
                     push_op(&mut out, kind(take as u32));
                     p += take;
                     remaining -= take;
@@ -530,7 +530,7 @@ pub struct PreparedSpliced {
 /// The read must be in alignment orientation (anchor `qpos` space).
 /// `segment_chain(chain, k, min_intron)` must yield ≥2 segments. Every
 /// adjacent segment pair is refined with [`refine_junction_read`] and gated by
-/// min/max intron plus the per-pair S14 guards (short or NonCanonical intron
+/// min/max intron plus the per-pair splice support guards (short or NonCanonical intron
 /// without library support ⇒ `None`). The pseudo-reference concatenates one
 /// reference slice per segment — segment 0 starting [`ALIGN_SPLICED_FLANK`]
 /// before its first anchor, the last ending [`ALIGN_SPLICED_FLANK`] after its
@@ -553,7 +553,7 @@ pub fn prepare_spliced(
     let minus = chain.strand == Strand::Minus;
     let ctg = reference.contigs.get(contig as usize)?;
 
-    // Per-pair refinement + S14 guards.
+    // Per-pair refinement + splice support guards.
     let mut junctions: Vec<RefinedJunction> = Vec::with_capacity(segments.len() - 1);
     for w in segments.windows(2) {
         let refined = refine_junction_read(
@@ -565,17 +565,12 @@ pub fn prepare_spliced(
             lib,
             params,
         );
-        if std::env::var_os("ESP_PROBE").is_some() {
-            eprintln!("[probe-sp] refine seg r=({},{}) q=({},{}) -> {}",
-                w[0].r_end, w[1].r_start, w[0].q_end, w[1].q_start,
-                refined.as_ref().map_or("None".to_string(), |r| format!("intron=({},{}) sig={:?} known={}", r.junction.start, r.junction.end, r.signal, r.known_support)));
-        }
         let refined = refined?;
         let intron_len = refined.junction.end - refined.junction.start;
         if intron_len < params.min_intron || intron_len > params.max_intron {
             return None;
         }
-        if !s14_pass(intron_len, refined.signal, refined.known_support) {
+        if !splice_support_pass(intron_len, refined.signal, refined.known_support) {
             return None;
         }
         junctions.push(refined);
@@ -634,15 +629,6 @@ pub fn align_spliced(
         pseudo,
         exon_bounds,
     } = prepare_spliced(reference, lib, read, chain, k, params)?;
-
-    // TEMP parity probe: ESP_PROBE_PSEUDO=/path dumps pseudo-reference + bounds.
-    if let Ok(p) = std::env::var("ESP_PROBE_PSEUDO") {
-        for &(ps, rs, re) in &exon_bounds {
-            eprintln!("[probe] bound {ps} {rs} {re}");
-        }
-        std::fs::write(p, &pseudo).ok();
-    }
-    crate::prof::dp_call(crate::prof::DP_SPLICED);
     let extension = extend_hint(
         read,
         &pseudo,
@@ -676,7 +662,6 @@ pub fn score_tail_win(
     params: &ExtendParams,
     buf: &mut ExtendBuffer,
 ) -> Extension {
-    crate::prof::dp_call(crate::prof::DP_SPLICED);
     extend_hint(
         tail,
         ref_window,
@@ -701,7 +686,7 @@ pub struct SplitResolution {
     pub total: i32,
 }
 
-/// Tail-window half-width around the anchor point (frozen: ±20bp).
+/// Tail-window half-width around the anchor point (±20bp).
 pub const SPLIT_LIB_WINDOW: u32 = 20;
 
 /// Extra reference margin past the tail length in tail windows.
@@ -724,7 +709,7 @@ fn lib_bonus(support: u32) -> i32 {
 /// the reverse complement of the original read), so the tail always extends
 /// genomically right of the body: candidates are library junctions whose
 /// start (donor) lies in `body_end ± 20`, junction strand matching the
-/// placement. Each is filtered by min/max intron and S14, scored by
+/// placement. Each is filtered by min/max intron and splice support gates, scored by
 /// `score_tail_win` in the post-acceptor exon window under the
 /// `aligned >= 4/5 && score > 0` gate. Total =
 /// `tail + signal + lib_bonus - SPLIT_COST - intron_length_penalty`; the best
@@ -766,7 +751,7 @@ pub fn resolve_split_right(
             continue;
         }
         let signal = junction_signal(ctg, j);
-        if !s14_pass(intron_len, signal, support) {
+        if !splice_support_pass(intron_len, signal, support) {
             continue;
         }
         let lo = j.end;
@@ -838,7 +823,7 @@ pub fn resolve_split_left(
             continue;
         }
         let signal = junction_signal(ctg, j);
-        if !s14_pass(intron_len, signal, support) {
+        if !splice_support_pass(intron_len, signal, support) {
             continue;
         }
         let hi = j.start.min(ctg.len);

@@ -1,12 +1,9 @@
-//! FASTQ / BFQ record sources.
+//! Streaming plain and gzipped FASTQ record sources.
 //!
-//! `RecordSource` unifies plain and gzipped FASTQ (streaming) with the
-//! memory-mapped EBFQ format. All FASTQ format errors carry 1-based line
-//! numbers.
+//! Format errors carry 1-based line numbers.
 
 use crate::error::AlignError;
 use flate2::read::MultiGzDecoder;
-use memmap2::Mmap;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
@@ -158,85 +155,6 @@ impl RecordSource for FastqReader {
             });
         }
 
-        Ok(Some(FastqRecord { name, seq, qual }))
-    }
-}
-
-/// Memory-mapped EBFQ reader.
-///
-/// Layout: magic `EBFQ` at [0..4], [4..8] reserved, [8..16] read_count as
-/// u64 LE; each record is u16 name_len + name + u16 seq_len + seq + qual.
-pub struct BfqReader {
-    mmap: Mmap,
-    read_count: u64,
-    seen: u64,
-    pos: usize,
-}
-
-impl BfqReader {
-    /// Map `path` and validate the EBFQ header.
-    pub fn open(path: &Path) -> Result<Self, AlignError> {
-        let file = File::open(path).map_err(|e| AlignError::FastqIo {
-            path: path.display().to_string(),
-            source: e,
-        })?;
-        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| AlignError::FastqIo {
-            path: path.display().to_string(),
-            source: e,
-        })?;
-        if mmap.len() < 16 || &mmap[0..4] != b"EBFQ" {
-            return Err(AlignError::FastqFormat {
-                line: 0,
-                msg: "bad EBFQ magic".to_string(),
-            });
-        }
-        let read_count = u64::from_le_bytes(mmap[8..16].try_into().unwrap());
-        Ok(BfqReader {
-            mmap,
-            read_count,
-            seen: 0,
-            pos: 16,
-        })
-    }
-}
-
-impl RecordSource for BfqReader {
-    fn next_record(&mut self) -> Result<Option<FastqRecord>, AlignError> {
-        if self.seen >= self.read_count {
-            return Ok(None);
-        }
-        let data = &self.mmap[self.pos..];
-        if data.len() < 2 {
-            return Err(AlignError::FastqFormat {
-                line: 0,
-                msg: "truncated EBFQ record".to_string(),
-            });
-        }
-        let name_len = u16::from_le_bytes([data[0], data[1]]) as usize;
-        if data.len() < 2 + name_len + 2 {
-            return Err(AlignError::FastqFormat {
-                line: 0,
-                msg: "truncated EBFQ record".to_string(),
-            });
-        }
-        let raw_name = &data[2..2 + name_len];
-        let name: Vec<u8> = raw_name
-            .iter()
-            .copied()
-            .take_while(|b| !b.is_ascii_whitespace())
-            .collect();
-        let off = 2 + name_len;
-        let seq_len = u16::from_le_bytes([data[off], data[off + 1]]) as usize;
-        if data.len() < off + 2 + seq_len * 2 {
-            return Err(AlignError::FastqFormat {
-                line: 0,
-                msg: "truncated EBFQ record".to_string(),
-            });
-        }
-        let seq = data[off + 2..off + 2 + seq_len].to_vec();
-        let qual = data[off + 2 + seq_len..off + 2 + seq_len * 2].to_vec();
-        self.pos += off + 2 + seq_len * 2;
-        self.seen += 1;
         Ok(Some(FastqRecord { name, seq, qual }))
     }
 }

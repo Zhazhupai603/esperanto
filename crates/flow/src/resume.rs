@@ -11,7 +11,7 @@ use crate::params::{Entry, RunParams};
 use crate::FlowError;
 
 /// run.json schema version (bump on layout change).
-pub const RUN_JSON_VERSION: u32 = 1;
+pub const RUN_JSON_VERSION: u32 = 2;
 
 /// BGZF end-of-file marker: presence proves a BAM/fq.gz writer finished.
 const BGZF_EOF: [u8; 28] = [
@@ -41,17 +41,12 @@ pub struct ParamsJson {
     pub fasta: PathBuf,
     /// Optional GTF.
     pub gtf: Option<PathBuf>,
-    /// Optional known-SNP VCF.
-    #[serde(default, alias = "gnomad")]
-    pub snp: Option<PathBuf>,
     /// score bundle root.
     pub bundle: PathBuf,
     /// Optional L1 engine bundle.
     pub l1_bundle: Option<PathBuf>,
     /// Worker threads.
     pub threads: usize,
-    /// score batch size.
-    pub batch: usize,
 }
 
 /// run.json: everything `esperanto resume` needs to reconstruct a run.
@@ -134,11 +129,9 @@ pub fn write_run_json(dir: &Path, sample: &str, params: &RunParams) -> Result<()
             index: params.index.clone(),
             fasta: params.fasta.clone(),
             gtf: params.gtf.clone(),
-            snp: params.snp.clone(),
             bundle: params.bundle.clone(),
             l1_bundle: params.l1_bundle.clone(),
             threads: params.threads,
-            batch: params.batch,
         },
     };
     let text = serde_json::to_string_pretty(&doc)
@@ -163,7 +156,7 @@ pub fn read_run_json(dir: &Path) -> Result<RunJson, FlowError> {
     })?;
     if doc.version != RUN_JSON_VERSION {
         return Err(FlowError::Entry(format!(
-            "run.json version {} in {} is not supported by this build (expects {RUN_JSON_VERSION})",
+            "run.json version {} in {} is not supported (requires {RUN_JSON_VERSION}); start a new run to regenerate unified candidates and scores",
             doc.version,
             dir.display()
         )));
@@ -231,10 +224,6 @@ pub enum Stage {
     Sort,
     /// scan + candidate filter (one artifact, one stage).
     Scan,
-    /// supporting-read re-alignment (scan/candidates.verified.bed).
-    Verify,
-    /// hyperedited-region caller over map/rescued.tsv (hyper/regions.bed).
-    Hyper,
     /// score.
     Score,
     /// vcf.
@@ -244,15 +233,13 @@ pub enum Stage {
 }
 
 impl Stage {
-    /// Parse a `--stop-after` stage name (qc|map|sort|scan|verify|hyper|score|vcf).
+    /// Parse a `--stop-after` stage name (qc|map|sort|scan|score|vcf).
     pub fn parse(s: &str) -> Option<Stage> {
         Some(match s {
             "qc" => Stage::Qc,
             "map" => Stage::Map,
             "sort" => Stage::Sort,
             "scan" => Stage::Scan,
-            "verify" => Stage::Verify,
-            "hyper" => Stage::Hyper,
             "score" => Stage::Score,
             "vcf" => Stage::Vcf,
             _ => return None,
@@ -276,8 +263,6 @@ impl Stage {
             Stage::Rescue => "rescue",
             Stage::Sort => "sort",
             Stage::Scan => "scan",
-            Stage::Verify => "verify",
-            Stage::Hyper => "hyper",
             Stage::Score => "score",
             Stage::Vcf => "vcf",
             Stage::Report => "report",
@@ -334,16 +319,15 @@ fn valid_bed(path: &Path) -> bool {
 }
 
 /// scores.tsv: empty is legal (zero candidates); otherwise every data line
-/// is `chrom<TAB>pos<TAB>prob` with a parseable number or `NA` (unscored
-/// hybrid rows).
+/// is `chrom<TAB>pos<TAB>score` with a parseable classifier score.
 fn valid_scores(path: &Path) -> bool {
     let Ok(text) = fs::read_to_string(path) else {
         return false;
     };
     text.lines().filter(|l| !l.is_empty()).all(|l| {
         match l.split('\t').collect::<Vec<_>>().as_slice() {
-            [_, pos, prob] => {
-                pos.parse::<i64>().is_ok() && (*prob == "NA" || prob.parse::<f64>().is_ok())
+            [_, pos, score] => {
+                pos.parse::<i64>().is_ok() && score.parse::<f64>().is_ok_and(|v| v.is_finite())
             }
             _ => false,
         }
@@ -357,15 +341,9 @@ fn valid_vcf(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether the rescue stage's output is complete and internally consistent.
-/// The seal key in align_qc.json alone is not proof: a run killed with the
-/// key in place but the raw.bam merge pending (the seal order older builds
-/// used) leaves rescued.tsv, raw.bam and the key disagreeing, and resuming
-/// past that state lets every downstream stage read a short BAM as if it
-/// were whole. `true` here means the sealed count, the rescued.tsv data rows
-/// and the RE:Z:collapsed records in raw.bam all agree; any disagreement
-/// sends the walk back to the rescue stage, which re-runs to a consistent
-/// state instead of continuing over a half-merged map.
+/// Require the persisted rescued count, rescued.tsv rows, and
+/// RE:Z:collapsed records in raw.bam to agree. An incomplete merge or sidecar
+/// write restarts rescue before later stages consume the BAM.
 fn rescue_recorded(map_dir: &Path) -> bool {
     let sealed = fs::read_to_string(map_dir.join("align_qc.json"))
         .ok()
@@ -401,7 +379,11 @@ fn rescue_recorded(map_dir: &Path) -> bool {
 /// clean triple zero — key, sidecar and BAM — counts as recorded.
 fn rescue_seal_consistent(map_dir: &Path, sealed: u64) -> bool {
     let tsv_rows = match fs::read_to_string(map_dir.join("rescued.tsv")) {
-        Ok(t) => t.lines().filter(|l| !l.is_empty()).count().saturating_sub(1) as u64,
+        Ok(t) => t
+            .lines()
+            .filter(|l| !l.is_empty())
+            .count()
+            .saturating_sub(1) as u64,
         Err(_) => 0,
     };
     if tsv_rows != sealed {
@@ -427,14 +409,13 @@ fn rescue_seal_consistent(map_dir: &Path, sealed: u64) -> bool {
 }
 
 /// Map-stage three-state check: done / only the rescue is pending / rerun.
-/// The seal is raw.bam + align_qc.json + unmapped.fq.gz + align.baln intact;
+/// The seal is raw.bam + align_qc.json + unmapped.fq.gz intact;
 /// `has_rescue_index` decides whether the rescue is expected at all.
 fn map_state(out_dir: &Path, has_rescue_index: bool) -> Stage {
     let map_dir = out_dir.join("map");
     let seal = valid_bgzf(&map_dir.join("raw.bam"))
         && valid_json(&map_dir.join("align_qc.json"))
-        && valid_gzip(&map_dir.join("unmapped.fq.gz"))
-        && map_dir.join("align.baln").exists();
+        && valid_gzip(&map_dir.join("unmapped.fq.gz"));
     if !seal {
         return Stage::Map;
     }
@@ -507,17 +488,6 @@ pub fn walk(out_dir: &Path, entry: Entry, has_rescue_index: bool, has_gtf: bool)
     }
     if first <= Stage::Scan && !valid_bed(&out_dir.join("scan").join("candidates.bed")) {
         return Stage::Scan;
-    }
-    if first <= Stage::Verify
-        && !valid_nonempty(&out_dir.join("scan").join("candidates.verified.bed"))
-    {
-        return Stage::Verify;
-    }
-    if first <= Stage::Hyper
-        && out_dir.join("map").join("rescued.tsv").is_file()
-        && !valid_bed(&out_dir.join("hyper").join("regions.bed"))
-    {
-        return Stage::Hyper;
     }
     if first <= Stage::Score && !valid_scores(&out_dir.join("score").join("scores.tsv")) {
         return Stage::Score;
@@ -643,14 +613,20 @@ mod tests {
         bam_with_records(&map.join("raw.bam"), 0, 0);
         fs::write(map.join("align_qc.json"), "{\"rescued_collapsed\": 0}").unwrap();
         gzip(&map.join("unmapped.fq.gz"), "");
-        fs::write(map.join("align.baln"), "").unwrap();
         bgzf(&map.join("sorted.bam"));
         fs::write(map.join("sorted.bam.bai"), "x").unwrap();
         let scan = root.join("scan");
         fs::create_dir_all(&scan).unwrap();
-        fs::write(scan.join("candidates.bed"), "chr1\t0\t100\t+\tx\ty\t10\tz\n").unwrap();
-        fs::write(scan.join("candidates.verified.bed"), "chr1\t0\t100\tA\t10\t0\t0\t2\t0\t0.2\t\t2\t0\n")
-            .unwrap();
+        fs::write(
+            scan.join("candidates.bed"),
+            "chr1\t0\t100\t+\tx\ty\t10\tz\n",
+        )
+        .unwrap();
+        fs::write(
+            scan.join("candidates.verified.bed"),
+            "chr1\t0\t100\tA\t10\t0\t0\t2\t0\t0.2\t\t2\t0\n",
+        )
+        .unwrap();
         let score = root.join("score");
         fs::create_dir_all(&score).unwrap();
         fs::write(score.join("scores.tsv"), "chr1\t100\t0.9\n").unwrap();
@@ -706,7 +682,10 @@ mod tests {
         // Seal intact, rescue key missing, unmapped non-empty -> Rescue.
         full_pe_dir(&d);
         fs::write(d.join("map").join("align_qc.json"), "{}").unwrap();
-        gzip(&d.join("map").join("unmapped.fq.gz"), "@a/1\nACGT\n+\nIIII\n");
+        gzip(
+            &d.join("map").join("unmapped.fq.gz"),
+            "@a/1\nACGT\n+\nIIII\n",
+        );
         assert_eq!(walk(&d, Entry::FastqPe, true, true), Stage::Rescue);
         // Same but empty unmapped: rescue counts as done and the rest of the
         // directory is intact, so the walk reaches the end.
@@ -768,21 +747,24 @@ mod tests {
             index: Some(d.join("ref.paidx")),
             fasta: d.join("ref.fa"),
             gtf: None,
-            snp: None,
             bundle: d.join("bundle"),
             l1_bundle: None,
             out_dir: d.clone(),
             threads: 4,
-            batch: 64,
-                rescue_control: false,
-        stop_after: None,
-    };
+            stop_after: None,
+        };
         write_run_json(&d, "s1", &params).unwrap();
         let doc = read_run_json(&d).unwrap();
         assert_eq!(doc.sample, "s1");
         assert_eq!(doc.entry, "fastq-se");
         assert_eq!(doc.inputs.len(), 1);
         verify_inputs(&doc).unwrap();
+        assert_eq!(doc.version, RUN_JSON_VERSION);
+        let mut old = serde_json::to_value(&doc).unwrap();
+        old["version"] = serde_json::json!(1);
+        fs::write(d.join("run.json"), serde_json::to_string(&old).unwrap()).unwrap();
+        let error = read_run_json(&d).unwrap_err().to_string();
+        assert!(error.contains("start a new run"));
         // Size change -> refusal.
         fs::write(&input, b"@a\nACGTACGT\n+\nIIIIIIII\n").unwrap();
         assert!(verify_inputs(&doc).is_err());
@@ -807,8 +789,8 @@ mod tests {
         sq.push_tag(b"SN", "chr1");
         sq.push_tag(b"LN", 1000);
         hdr.push_record(&sq);
-        let mut w = rust_htslib::bam::Writer::from_path(path, &hdr, rust_htslib::bam::Format::Bam)
-            .unwrap();
+        let mut w =
+            rust_htslib::bam::Writer::from_path(path, &hdr, rust_htslib::bam::Format::Bam).unwrap();
         for i in 0..(re + plain) {
             let mut rec = rust_htslib::bam::Record::new();
             let qname = format!("r{i}");
@@ -919,12 +901,8 @@ mod tests {
         bam_with_records(&map.join("raw.bam"), 0, 5);
         assert_eq!(walk(&d, Entry::FastqPe, true, true), Stage::Rescue);
         // After the rescue re-run completes, the three counters agree and the
-        // walk proceeds past the map stage again. The hyper stage consumes
-        // rescued.tsv, so its artifact has to exist for the walk to finish.
+        // walk proceeds past the map stage again.
         bam_with_records(&map.join("raw.bam"), 2, 5);
-        let hyper = d.join("hyper");
-        fs::create_dir_all(&hyper).unwrap();
-        fs::write(hyper.join("regions.bed"), "chr1\t0\t100\t+\tx\ty\t10\tz\n").unwrap();
         assert_eq!(walk(&d, Entry::FastqPe, true, true), Stage::Report);
         let _ = fs::remove_dir_all(&d);
     }
@@ -939,9 +917,6 @@ mod tests {
         fs::write(map.join("align_qc.json"), "{\"rescued_collapsed\": 2}").unwrap();
         rescued_tsv(&map.join("rescued.tsv"), 2);
         bam_with_records(&map.join("raw.bam"), 2, 5);
-        let hyper = d.join("hyper");
-        fs::create_dir_all(&hyper).unwrap();
-        fs::write(hyper.join("regions.bed"), "chr1\t0\t100\t+\tx\ty\t10\tz\n").unwrap();
         assert_eq!(walk(&d, Entry::FastqPe, true, true), Stage::Report);
         let _ = fs::remove_dir_all(&d);
     }

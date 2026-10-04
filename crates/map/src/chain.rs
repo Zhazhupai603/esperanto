@@ -12,7 +12,7 @@
 use crate::seed::{Anchor, Strand};
 use std::collections::HashSet;
 
-/// Chaining parameters (see frozen-parameter table).
+/// Chaining parameters (see parameter table).
 #[derive(Clone, Copy, Debug)]
 pub struct ChainParams {
     /// Maximum gap in query or reference between chainable anchors.
@@ -43,7 +43,7 @@ impl Default for ChainParams {
 }
 
 impl ChainParams {
-    /// RNA defaults (frozen): max_gap 1M, min score 40, k 15, intron 20/8.
+    /// RNA defaults : max_gap 1M, min score 40, k 15, intron 20/8.
     pub fn rna_default() -> ChainParams {
         ChainParams {
             rna: true,

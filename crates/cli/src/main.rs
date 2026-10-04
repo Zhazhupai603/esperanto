@@ -4,23 +4,20 @@
 //! parse args → zero-config resolution → crate entry points. No scientific
 //! semantics live here.
 
-mod hybrid;
+mod confirm;
+mod delete;
+mod fetch;
 mod index;
 mod map;
-mod pile;
 mod qc;
 mod report;
 mod resolve;
 mod resume;
-mod confirm;
-mod fetch;
-mod delete;
 mod run;
 mod scan;
 mod score;
 mod setup;
 mod update;
-mod verify;
 
 use clap::{Parser, Subcommand};
 
@@ -36,21 +33,17 @@ struct Cli {
 enum Cmd {
     /// FASTQ quality control (trim/filter/report).
     Qc(qc::QcArgs),
-/// Build a paidx alignment index from a reference FASTA.
-Index(index::IndexArgs),
+    /// Build a paidx alignment index from a reference FASTA.
+    Index(index::IndexArgs),
     /// Read alignment (RNA 2-pass; unsorted raw.bam — sort happens in `run`).
     Map(map::MapArgs),
-    /// Pileup feature extraction for single sites or a site list.
-    Pile(pile::PileArgs),
-    /// Candidate editing-site discovery from BAM/.baln.
+    /// Candidate editing-site discovery from indexed BAM.
     Scan(scan::ScanArgs),
-    /// Supporting-read re-alignment: withdraw votes with better placements.
-    Verify(verify::VerifyArgs),
-    /// RE_PROB scoring for a site list.
+    /// Unified evidence scoring for a site list.
     Score(score::ScoreArgs),
     /// Full pipeline: qc → map → sort → scan → score → vcf.
     Run(run::RunArgs),
-/// Regenerate the standalone HTML report for a finished run directory.
+    /// Regenerate the standalone HTML report for a finished run directory.
     Report(report::ReportArgs),
     /// Continue an interrupted run from the first broken stage.
     Resume(resume::ResumeArgs),
@@ -69,9 +62,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Qc(a) => qc::run(a),
         Cmd::Index(a) => index::run(a),
         Cmd::Map(a) => map::run(a),
-        Cmd::Pile(a) => pile::run(a),
         Cmd::Scan(a) => scan::run(a),
-        Cmd::Verify(a) => verify::run(a),
         Cmd::Score(a) => score::run(a),
         Cmd::Run(a) => run::run(a),
         Cmd::Report(a) => report::run(a),

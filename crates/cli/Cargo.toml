@@ -14,9 +14,6 @@ clap.workspace = true
 rust-htslib.workspace = true
 esperanto-map = { path = "../map" }
 esperanto-qc = { path = "../qc" }
-esperanto-pile = { path = "../pile" }
-esperanto-scan = { path = "../scan" }
-esperanto-verify = { path = "../verify" }
 esperanto-score = { path = "../score" }
 esperanto-flow = { path = "../flow" }
 esperanto-report = { path = "../report" }

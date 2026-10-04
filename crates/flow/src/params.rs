@@ -34,8 +34,6 @@ pub struct RunParams {
     pub fasta: PathBuf,
     /// Optional GTF (junction library for map; gene annotation for the report).
     pub gtf: Option<PathBuf>,
-    /// Optional known-SNP VCF; listed positions are removed from the candidates.
-    pub snp: Option<PathBuf>,
     /// score bundle root.
     pub bundle: PathBuf,
     /// Optional L1 engine bundle (`engine::L1Index::open`).
@@ -44,12 +42,7 @@ pub struct RunParams {
     pub out_dir: PathBuf,
     /// Worker threads.
     pub threads: usize,
-    /// score batch size (default 64).
-    pub batch: usize,
-    /// Also run the negative-control (A>C / T>G) collapsed-alphabet rescue
-    /// passes, count-only (`align_qc.json: rescue_control_verified`).
-    pub rescue_control: bool,
-    /// Stop after this stage (`--stop-after qc|map|sort|scan|verify|hyper|score|vcf`).
+    /// Stop after this stage (`--stop-after qc|map|sort|scan|score|vcf`).
     pub stop_after: Option<String>,
 }
 

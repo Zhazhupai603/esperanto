@@ -1,10 +1,5 @@
 //! Output sinks for the map serial write section.
 //!
-//! - [`RecordSinks`]: BAM (BGZF) + `.baln` sharing ONE binary encode per
-//!   record. The `.baln` record is exactly the BAM record bytes (`block_size`
-//!   prefix included) without BGZF framing, so the whole encode — CIGAR
-//!   serialization, reg2bin, 4-bit SEQ packing, tag rendering — runs once per
-//!   record and the byte string is written to whichever sinks are present.
 //! - [`UnmappedFq`]: gzipped unmapped FASTQ (level 1, rescue-channel contract)
 //!   with an 8 MiB staging buffer in front of the file and one encoder write
 //!   per record.
@@ -34,12 +29,11 @@ fn io_err_unm(e: io::Error) -> AlignError {
     }
 }
 
-/// BAM + `.baln` writers with a shared per-record encode buffer.
+/// BAM writer with a reusable record encoding buffer.
 pub(crate) struct RecordSinks {
     bam: Option<
         noodles::bam::io::Writer<noodles::bgzf::io::MultithreadedWriter<Box<dyn Write + Send>>>,
     >,
-    baln: Option<std::io::BufWriter<Box<dyn Write + Send>>>,
     /// Retained for the rare fast-path decline that must fall back to the
     /// noodles RecordBuf builder.
     header: Header,
@@ -47,12 +41,8 @@ pub(crate) struct RecordSinks {
 }
 
 impl RecordSinks {
-    /// Take the pipeline's sinks (`out.bam.take()` / `out.baln.take()`) and
-    /// write both headers, in the same order the pipeline historically did:
-    /// BAM header into BGZF first, then the `.baln` contig-name table.
     pub(crate) fn new(
         bam_sink: Option<Box<dyn Write + Send>>,
-        baln_sink: Option<Box<dyn Write + Send>>,
         index: &Index,
         threads: usize,
     ) -> Result<Self, AlignError> {
@@ -61,34 +51,13 @@ impl RecordSinks {
             Some(sink) => Some(bam::create_writer(sink, &header, threads).map_err(io_err)?),
             None => None,
         };
-        let baln = match baln_sink {
-            Some(w) => {
-                let mut bw = std::io::BufWriter::with_capacity(8 << 20, w);
-                let names: Vec<String> = index
-                    .reference
-                    .contigs
-                    .iter()
-                    .map(|c| c.name.clone())
-                    .collect();
-                crate::baln::write_header(&mut bw, &names).map_err(io_err)?;
-                std::io::Write::flush(&mut bw).map_err(io_err)?;
-                Some(bw)
-            }
-            None => None,
-        };
         Ok(RecordSinks {
             bam,
-            baln,
             header,
             buf: Vec::with_capacity(8192),
         })
     }
 
-    /// Encode `rec` once and write it to every present sink.
-    ///
-    /// Record order and bytes are identical to writing each sink separately:
-    /// both formats store `block_size u32 | record bytes`, the BAM writer just
-    /// wraps the same byte string in BGZF.
     pub(crate) fn write(&mut self, rec: &BamRecord) -> Result<(), AlignError> {
         self.buf.clear();
         self.buf.extend_from_slice(&0u32.to_le_bytes()); // block_size placeholder
@@ -100,42 +69,22 @@ impl RecordSinks {
                 if let Some(w) = &mut self.bam {
                     w.get_mut().write_all(&self.buf).map_err(io_err)?;
                 }
-                if let Some(w) = &mut self.baln {
-                    w.write_all(&self.buf).map_err(io_err)?;
-                }
                 Ok(())
             }
             Some(Err(e)) => Err(io_err(e)),
             None => {
-                // Fast-path decline (exotic name / qual>93 / cigar overflow):
-                // BAM falls back to the noodles RecordBuf builder; .baln has
-                // no slow path and surfaces the decline as an error — never
-                // silently drop a record. BAM write first, matching the
-                // historical per-sink write order.
                 if let Some(w) = &mut self.bam {
                     esperanto_bamio::write_record_slow(w, &self.header, rec).map_err(io_err)?;
-                }
-                if self.baln.is_some() {
-                    return Err(io_err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "baln: fast-path declined for record {}",
-                            String::from_utf8_lossy(&rec.name)
-                        ),
-                    )));
                 }
                 Ok(())
             }
         }
     }
 
-    /// Close both sinks (BGZF EOF block / final `.baln` flush).
+    /// Finish the BAM stream and write the BGZF EOF block.
     pub(crate) fn finish(self) -> Result<(), AlignError> {
         if let Some(w) = self.bam {
             w.into_inner().finish().map_err(io_err)?;
-        }
-        if let Some(mut bw) = self.baln {
-            std::io::Write::flush(&mut bw).map_err(io_err)?;
         }
         Ok(())
     }
@@ -304,42 +253,10 @@ mod tests {
         out
     }
 
-    /// The shared encode must be byte-identical to the historical
-    /// per-sink encodes: `.baln` output vs `baln::write_record` per record,
-    /// and the BAM byte stream vs `bamio::create_writer` +
-    /// `bamio::write_record` per record (gunzipped, @PG-free by construction).
     #[test]
     fn record_sinks_bytes_match_per_sink_encodes() {
         let index = tiny_index();
         let records = synthetic_records();
-
-        // --- .baln side: old per-record encode (fresh Vec per call) ---
-        let mut old_baln = Vec::new();
-        let names: Vec<String> = index
-            .reference
-            .contigs
-            .iter()
-            .map(|c| c.name.clone())
-            .collect();
-        crate::baln::write_header(&mut old_baln, &names).expect("old baln header");
-        for r in &records {
-            crate::baln::write_record(&mut old_baln, r).expect("old baln write");
-        }
-
-        let baln_cell = Arc::new(Mutex::new(Vec::new()));
-        let mut sinks = RecordSinks::new(
-            None,
-            Some(Box::new(SharedSink(baln_cell.clone()))),
-            &index,
-            1,
-        )
-        .expect("sinks");
-        for r in &records {
-            sinks.write(r).expect("sink write");
-        }
-        sinks.finish().expect("finish");
-        let new_baln = baln_cell.lock().expect("sink lock").clone();
-        assert_eq!(new_baln, old_baln, ".baln byte stream must be unchanged");
 
         // --- BAM side: old thread-local-buffer path via bamio::write_record ---
         let header = crate::bam::build_header(&index);
@@ -360,7 +277,6 @@ mod tests {
         {
             let mut sinks = RecordSinks::new(
                 Some(Box::new(SharedSink(new_bam_cell.clone()))),
-                None,
                 &index,
                 1,
             )

@@ -3,7 +3,7 @@ name = "esperanto-map"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "ESPERANTO splice-aware genomic aligner (minimap2 school: minimizer seed + chain + banded extend; Track 1 + Track 2)"
+description = "ESPERANTO splice-aware genomic aligner (minimap2 school: minimizer seed + chain + banded extend)"
 
 [dependencies]
 thiserror.workspace = true

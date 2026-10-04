@@ -5,9 +5,9 @@
 //! soft clips — CIGAR `M/I/S` ops consume exactly the read length.
 //!
 //! Two execution paths produce **identical scores and CIGARs** on any input:
-//! `run_banded_packed` (i16 accumulation + substitution LUT) runs when every
+//! Packed i16 accumulation with a substitution LUT runs when every
 //! byte of both sequences is one of {A,C,G,T,N} (uppercase); any other byte
-//! (lowercase, ambiguity codes) routes to `run_banded_legacy`, the byte-wise
+//! (lowercase, ambiguity codes) routes to the scalar byte-wise
 //! i32 path. Band scheduling is exactly two attempts — half-width 30, then
 //! the full matrix — with the second attempt gated on the first attempt's
 //! score falling below 85% of the perfect read score (see `extend_hint`).
@@ -92,7 +92,7 @@ pub fn exempt_dir(ref_b: u8, read_b: u8) -> Option<bool> {
     }
 }
 
-/// Extension scoring parameters (frozen: match 2, mismatch −4, gap open 4,
+/// Extension scoring parameters (match 2, mismatch −4, gap open 4,
 /// extension 2).
 #[derive(Clone, Copy, Debug)]
 pub struct ExtendParams {
@@ -123,13 +123,6 @@ impl Default for ExtendParams {
 /// First (and only) banded attempt's half-width; the second attempt is the
 /// full matrix.
 pub const INITIAL_BAND: i64 = 30;
-/// Second escalation tier of [`extend_hint`]: same acceptance rule, wider band.
-pub const MID_BAND: i64 = 90;
-/// Shadow-measured middle tier of the escalation ladder (work order §四):
-/// half-width a `band30 → band64 → full` ladder would probe. Used ONLY by
-/// the ESP_SHADOW measurement path; production dispatch never sees it.
-const SHADOW_BAND: i64 = 64;
-
 /// CIGAR operation (SAM; `=`/`X` folded into `Match`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CigarOp {
@@ -219,11 +212,9 @@ pub struct Extension {
     pub score: i32,
 }
 
-/// Where a banded attempt first touched a strict band edge (measured for
-/// escalation attribution). The `touched` flag is the escalation signal and is unchanged;
-/// the rest only records the touch for profiling. `clamped` marks a touch on
-/// the window boundary (column 1 or n), which is NOT evidence of band
-/// truncation: the full matrix has the same window edge there.
+/// First strict band-edge touch. The `touched` flag controls escalation;
+/// the coordinates describe the boundary condition and support kernel
+/// equivalence checks. A clamped edge lies on the reference window boundary.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TouchRec {
     /// Any row maximum sat on a strict band edge.
@@ -239,14 +230,14 @@ pub struct TouchRec {
 /// Reusable per-thread DP buffers (no semantic effect).
 pub struct ExtendBuffer {
     packed: BandBuf<i16>,
-    legacy: BandBuf<i32>,
+    scalar: BandBuf<i32>,
 }
 
 impl Default for ExtendBuffer {
     fn default() -> ExtendBuffer {
         ExtendBuffer {
             packed: BandBuf::new(),
-            legacy: BandBuf::new(),
+            scalar: BandBuf::new(),
         }
     }
 }
@@ -295,7 +286,7 @@ fn pure_byte(b: u8) -> bool {
 }
 
 /// Path dispatch: pure {A,C,G,T,N} inputs run the i16+LUT packed path; any
-/// other byte (lowercase, ambiguity codes) routes to the byte-wise legacy
+/// other byte (lowercase, ambiguity codes) routes to the byte-wise scalar
 /// path. Both paths score every byte pair identically, so the produced
 /// `Extension` is the same either way.
 fn run_dispatch(
@@ -312,7 +303,7 @@ fn run_dispatch(
     // `run_band::<i16>` cell-for-cell (see `avx2_full`). Banded attempts
     // run the banded AVX2 kernel (`avx2_band`) under the same gate when the
     // band is the unit-slope form (num == den == 1) every call site uses;
-    // other slopes, the legacy i32 path, and tiny windows stay scalar.
+    // other slopes, the scalar i32 path, and tiny windows stay scalar.
     #[cfg(target_arch = "x86_64")]
     if pure
         && band_spec.is_none()
@@ -340,7 +331,7 @@ fn run_dispatch(
     if pure {
         run_band(read, ref_window, &core, &mut buf.packed, band_spec)
     } else {
-        run_band(read, ref_window, &core, &mut buf.legacy, band_spec)
+        run_band(read, ref_window, &core, &mut buf.scalar, band_spec)
     }
 }
 
@@ -418,184 +409,11 @@ pub fn extend_hint(
     // still improve the path; or the score is under 85% of perfect.
     let perfect = read.len() as i32 * params.match_score;
     if touch.touched || ext.score * 20 < perfect * 17 {
-        // (An intermediate band tier was measured NOT byte-identical to the
-        // straight full matrix: an in-band maximal cell does not imply the
-        // full matrix's optimum path stays in-band. Dropped.)
-        crate::prof::bump(crate::prof::DP_FULL_MATRIX, 1);
-        if touch.touched {
-            crate::prof::bump(crate::prof::DP_FULL_EDGE, 1);
-            crate::prof::bump(
-                if touch.clamped {
-                    if touch.left {
-                        crate::prof::ESC_LEFT_CLAMPED
-                    } else {
-                        crate::prof::ESC_RIGHT
-                    }
-                } else if touch.left {
-                    crate::prof::ESC_LEFT_TRUE
-                } else {
-                    crate::prof::ESC_RIGHT
-                },
-                1,
-            );
-        } else {
-            crate::prof::bump(crate::prof::DP_FULL_SCORE, 1);
-        }
-        let full = run_dispatch(read, ref_window, params, buf, None);
-        if crate::prof::enabled() {
-            crate::prof::record_touch(crate::prof::TouchEvent {
-                site: crate::prof::site(),
-                row: touch.row,
-                m,
-                n,
-                left: touch.left,
-                clamped: touch.clamped,
-                by_score: !touch.touched,
-                offset: hint.offset,
-                start_diag: full.0.ref_start as i64 - full.0.read_start as i64,
-                band_score: ext.score,
-                full_score: full.0.score,
-            });
-        }
-        if crate::prof::shadow_enabled() {
-            shadow_ladder(
-                &ShadowProbe {
-                    read,
-                    window: ref_window,
-                    params,
-                    hint,
-                    touch,
-                    band30: &ext,
-                    full: &full.0,
-                },
-                buf,
-            );
-        }
-        return full.0;
+        return run_dispatch(read, ref_window, params, buf, None).0;
     }
     ext
 }
 
-// ---- Shadow ladder measurement (ESP_SHADOW=1; read-only extra DP) ----
-
-/// Whether two `Extension`s agree on every observable field — score,
-/// coordinates, and exact CIGAR op sequence — i.e. the byte-identity a
-/// ladder would need to accept one in place of the other.
-fn ext_fields_eq(a: &Extension, b: &Extension) -> bool {
-    a.score == b.score
-        && a.read_start == b.read_start
-        && a.read_end == b.read_end
-        && a.ref_start == b.ref_start
-        && a.cigar == b.cigar
-}
-
-/// §五 ceiling input: the full-matrix optimum's unused window margin on the
-/// tighter side. `ref_start` is the 0-based offset into the window; the ref
-/// footprint's right end adds every ref-consuming CIGAR op. A tiered flank
-/// shrinking the window by (f - f') per side is provably result-identical
-/// for this call iff both margins exceed f - f'.
-fn window_slack(full: &Extension, win_len: i64) -> i64 {
-    let consumed: i64 = full
-        .cigar
-        .iter()
-        .map(|op| match op {
-            CigarOp::Match(k) | CigarOp::Del(k) | CigarOp::RefSkip(k) => *k as i64,
-            CigarOp::Ins(_) | CigarOp::SoftClip(_) => 0,
-        })
-        .sum();
-    let left = full.ref_start as i64;
-    let right = win_len - (full.ref_start as i64 + consumed);
-    left.min(right)
-}
-
-/// Everything the shadow measurement borrows from one escalated
-/// `extend_hint` frame.
-struct ShadowProbe<'a> {
-    read: &'a [u8],
-    window: &'a [u8],
-    params: &'a ExtendParams,
-    hint: DiagHint,
-    touch: TouchRec,
-    band30: &'a Extension,
-    full: &'a Extension,
-}
-
-/// Re-run an escalated window at band 64 and classify it against the
-/// band-30 and full-matrix answers: A = band64 reproduces the full matrix
-/// (a ladder could accept it and skip the full run), B = band64 reproduces
-/// band-30 but NOT full (stability is not proof — the ladder would be
-/// wrong here), C = all three differ. Measurement only: the caller's
-/// return value never depends on this.
-fn shadow_ladder(p: &ShadowProbe<'_>, buf: &mut ExtendBuffer) {
-    let core = CoreParams::new(p.params);
-    let pure =
-        p.read.iter().all(|&b| pure_byte(b)) && p.window.iter().all(|&b| pure_byte(b));
-    // Scalar `run_band` on purpose: keeps the shadow free of SIMD dispatch
-    // (band-64 would stay scalar in any future production ladder anyway),
-    // and reuses the caller's scratch buffer after `full` was produced.
-    let (b64, _) = if pure {
-        run_band(
-            p.read,
-            p.window,
-            &core,
-            &mut buf.packed,
-            Some((p.hint.offset, 1, 1, SHADOW_BAND)),
-        )
-    } else {
-        run_band(
-            p.read,
-            p.window,
-            &core,
-            &mut buf.legacy,
-            Some((p.hint.offset, 1, 1, SHADOW_BAND)),
-        )
-    };
-    let class = if ext_fields_eq(&b64, p.full) {
-        crate::prof::SHADOW_CLASS_A
-    } else if ext_fields_eq(&b64, p.band30) {
-        crate::prof::SHADOW_CLASS_B
-    } else {
-        crate::prof::SHADOW_CLASS_C
-    };
-    crate::prof::shadow_record(crate::prof::ShadowEvent {
-        site: crate::prof::site(),
-        read_len: p.read.len() as i64,
-        win_len: p.window.len() as i64,
-        by_edge: p.touch.touched,
-        class,
-        min_slack: window_slack(p.full, p.window.len() as i64),
-        full_cells: (p.read.len() as u64) * (p.window.len() as u64),
-    });
-}
-
-/// i16+LUT banded DP. `band_spec = None` runs the full window; `Some((offset,
-/// half_width))` restricts cells to `|j − i − offset| <= half_width`. Also
-/// reports whether any row's best H sat on a strict band edge.
-pub fn run_banded_packed(
-    read: &[u8],
-    ref_window: &[u8],
-    params: &ExtendParams,
-    buf: &mut ExtendBuffer,
-    band_spec: Option<(i64, i64, i64, i64)>,
-) -> (Extension, TouchRec) {
-    let core = CoreParams::new(params);
-    run_band(read, ref_window, &core, &mut buf.packed, band_spec)
-}
-
-/// Legacy byte-wise i32 path — taken automatically by [`extend`] /
-/// [`extend_hint`] on non-{A,C,G,T,N} input, and directly callable; must
-/// produce identical scores and CIGARs to [`run_banded_packed`] for the same
-/// band specification.
-pub fn run_banded_legacy(
-    read: &[u8],
-    ref_window: &[u8],
-    params: &ExtendParams,
-    buf: &mut ExtendBuffer,
-    band_spec: Option<(i64, i64, i64, i64)>,
-) -> (Extension, TouchRec) {
-    let core = CoreParams::new(params);
-    run_band(read, ref_window, &core, &mut buf.legacy, band_spec)
-}
 fn empty_extension(read_len: u32) -> Extension {
     Extension {
         read_start: 0,
@@ -620,7 +438,7 @@ impl CoreParams {
     fn new(params: &ExtendParams) -> CoreParams {
         CoreParams {
             lut: SubstLut::new(params),
-            open_ext: -params.gap_open, // first gap base pays gap_open only (frozen legacy model)
+            open_ext: -params.gap_open, // first gap base pays gap_open only
             ext: -params.gap_ext,
         }
     }
@@ -636,13 +454,9 @@ trait Acc: Copy {
 }
 
 impl Acc for i16 {
-    // NOTE: a saturating sentinel (NEG = -16384) was tried and reverted:
-    // is_neg = threshold) and it was NOT equivalent: on long windows (mate
-    // anchor, n up to 20,000) E/F chains sink below -30000, where the legacy
-    // exact-equality sentinel + `.max(NEG)` clamp collapses every deep value
-    // to one NEG, changing tie outcomes vs. a saturating form that keeps them
-    // distinct. The legacy semantics below are load-bearing; do not
-    // "optimize" them without a full-window E-chain analysis.
+    // Long-window E/F chains may sink below -30000. Exact sentinel
+    // equality and the `.max(NEG)` clamp merge these unreachable states
+    // while preserving deterministic ties in the gap recurrences.
     const NEG: i16 = -30000;
     #[inline]
     fn is_neg(x: i16) -> bool {
@@ -797,9 +611,7 @@ fn run_band<T: Acc>(
 
     let (offset, num, den, half) = match band_spec {
         Some((o, nm, dn, h)) => (o, nm, dn.max(1), h.max(0)),
-        // Full window: half = n covers every diagonal whenever m <= n (the
-        // case at every call site); the legacy m + n doubled the clearing
-        // and storage cost for nothing.
+        // Full window: half = n covers every diagonal whenever m <= n.
         None => {
             debug_assert!(m <= n);
             (0, 1, 1, n)
@@ -863,11 +675,6 @@ fn run_band<T: Acc>(
     let mut best_i = 0i64;
     let mut best_j = 0i64;
     let mut touch = TouchRec::default();
-
-    if crate::prof::enabled() {
-        // Cell census: rows x width (exactly the loop's extent per row).
-        crate::prof::bump(crate::prof::DP_CELLS, (m as u64) * (width as u64));
-    }
     // Previous row's window, tracked across iterations (no recompute).
     let (mut plo, mut phi) = (lo0, hi0);
     for i in 1..=m {
@@ -897,8 +704,7 @@ fn run_band<T: Acc>(
             let cidx = (jj - lo) as usize;
 
             // E: vertical (insertion): from H[i-1][j] or E[i-1][j].
-            // Out-of-band H reads see the margin/boundary value 0 (legacy
-            // writes margins and col 0 as 0); E reads stay NEG.
+            // Out-of-band H reads see the zero boundary; E reads stay NEG.
             let in_prev = jj >= plo && jj <= phi;
             let (h_up, e_up) = if in_prev {
                 (
@@ -917,7 +723,7 @@ fn run_band<T: Acc>(
             };
 
             // F: horizontal (deletion): from H[i][j-1] or F[i][j-1]; the
-            // left margin/boundary cell reads H=0 (legacy), F stays NEG.
+            // left margin/boundary cell reads H=0; F stays NEG.
             let (h_left, f_left) = if jj > lo {
                 (buf.h_cur[cidx - 1], buf.f_cur[cidx - 1])
             } else {
@@ -932,7 +738,7 @@ fn run_band<T: Acc>(
             };
 
             // Diagonal: the H read never fails — in-band cells are stored,
-            // col 0 is the pinned 0 boundary, margin cells read 0 (legacy).
+            // col 0 is the pinned 0 boundary, margin cells read 0.
             let h_prev_idx = jj - 1;
             let h_diag = if h_prev_idx >= plo && h_prev_idx <= phi {
                 buf.h_prev[(h_prev_idx - plo) as usize]
@@ -1247,7 +1053,7 @@ mod avx2_full {
         debug_assert!(m <= n);
 
         // LUT-derived substitution constants. The vector `add` assumes the
-        // constant operand is never the sentinel; frozen scoring never is,
+        // constant operand is never the sentinel; default scoring never is,
         // and anything exotic falls back to the scalar kernel (which bumps
         // dp_cells itself, so the census below stays exact).
         let s_diag = core.lut.score(0, 0);
@@ -1311,12 +1117,6 @@ mod avx2_full {
             (0..n as usize).map(|q| buf.ref_codes[(n as usize) - 1 - q] as i16),
         );
         buf.avx_refrev.resize(n as usize + 16, 0);
-
-        if crate::prof::enabled() {
-            // Cell census identical to the scalar full-matrix path
-            // (width = 2n + 1 with half = n).
-            crate::prof::bump(crate::prof::DP_CELLS, (m as u64) * ((2 * n + 1) as u64));
-        }
 
         let hp = [
             buf.avx_h[0].as_mut_ptr(),
@@ -1774,12 +1574,6 @@ mod avx2_band {
             (0..n as usize).map(|q| buf.ref_codes[(n as usize) - 1 - q] as i16),
         );
         buf.avx_refrev.resize(n as usize + 16, 0);
-
-        if crate::prof::enabled() {
-            // Cell census identical to the scalar banded path (width after
-            // half.max(0)).
-            crate::prof::bump(crate::prof::DP_CELLS, (m as u64) * ((2 * half + 1) as u64));
-        }
 
         let hp = [
             buf.avx_h[0].as_mut_ptr(),
@@ -2594,142 +2388,4 @@ mod tests {
         assert!(st.success());
     }
 
-    // ---- Shadow ladder (ESP_SHADOW measurement; no behavior change) ----
-
-    /// Window = all-'A' flank with the read (a CGT repeat, so it shares no
-    /// base with the flank) embedded at diagonal `embed`; `decoy` also
-    /// plants the read's first 40 bases at diagonal 45 (inside band-64,
-    /// outside band-30). Hint offset 0: band-30 sees only the flank,
-    /// band-64 reaches |j−i| ≤ 64, the full matrix always finds the embed.
-    fn shadow_case(read_len: usize, win_len: usize, embed: i64, decoy: bool) -> (Vec<u8>, Vec<u8>) {
-        let read: Vec<u8> = (0..read_len).map(|i| b"CGT"[i % 3]).collect();
-        let mut win = vec![b'A'; win_len];
-        let off = embed.max(0) as usize;
-        for (k, &b) in read.iter().enumerate() {
-            if off + k < win_len {
-                win[off + k] = b;
-            }
-        }
-        if decoy {
-            for k in 0..40.min(read_len) {
-                if 45 + k < win_len {
-                    win[45 + k] = read[k];
-                }
-            }
-        }
-        (read, win)
-    }
-
-    /// Child body of `shadow_ladder_classes_hand_built_escalations`: runs
-    /// only in a fresh process with ESP_SHADOW=1 from the start, so the
-    /// OnceLock gate caches `true` deterministically and the counters are
-    /// untouched by any other test.
-    fn shadow_child_body() {
-        assert!(crate::prof::shadow_enabled());
-        let params = ExtendParams::default();
-        let mut buf = ExtendBuffer::new();
-        let hint = DiagHint {
-            offset: 0,
-            num: 1,
-            den: 1,
-        };
-        let cases = [
-            (
-                "a: band64 reaches full",
-                100usize,
-                300usize,
-                45i64,
-                false,
-                crate::prof::SHADOW_CLASS_A,
-            ),
-            (
-                "b: band64 stalls at band30",
-                100,
-                300,
-                200,
-                false,
-                crate::prof::SHADOW_CLASS_B,
-            ),
-            (
-                "c: decoy inside band64 only",
-                100,
-                300,
-                200,
-                true,
-                crate::prof::SHADOW_CLASS_C,
-            ),
-        ];
-        for (ctx, m, n, embed, decoy, want) in cases {
-            let (read, win) = shadow_case(m, n, embed, decoy);
-            // Construction check via run_band directly, before going through
-            // extend_hint: the three answers must sit in the claimed classes.
-            let core = CoreParams::new(&params);
-            let (b30, _) = run_band(&read, &win, &core, &mut buf.packed, Some((0, 1, 1, INITIAL_BAND)));
-            let (b64, _) = run_band(&read, &win, &core, &mut buf.packed, Some((0, 1, 1, SHADOW_BAND)));
-            let (ff, _) = run_band(&read, &win, &core, &mut buf.packed, None);
-            match want {
-                crate::prof::SHADOW_CLASS_A => {
-                    assert!(ext_fields_eq(&b64, &ff), "{ctx}: band64 must equal full");
-                    assert!(!ext_fields_eq(&b30, &ff), "{ctx}: band30 must differ from full");
-                }
-                crate::prof::SHADOW_CLASS_B => {
-                    assert!(ext_fields_eq(&b64, &b30), "{ctx}: band64 must equal band30");
-                    assert!(!ext_fields_eq(&b64, &ff), "{ctx}: band64 must differ from full");
-                }
-                crate::prof::SHADOW_CLASS_C => {
-                    assert!(
-                        !ext_fields_eq(&b64, &b30)
-                            && !ext_fields_eq(&b64, &ff)
-                            && !ext_fields_eq(&b30, &ff),
-                        "{ctx}: all three answers must differ"
-                    );
-                }
-                _ => unreachable!(),
-            }
-            // Through extend_hint: the escalation branch must fire (score
-            // gate: band-30 finds nothing) and the shadow must record
-            // exactly one event of the claimed class.
-            crate::prof::set_site(crate::prof::DP_UNSPLICED);
-            let site = crate::prof::DP_UNSPLICED;
-            let before: u64 = (0..2)
-                .map(|t| crate::prof::shadow_count(site, t, want))
-                .sum();
-            let got = extend_hint(&read, &win, &params, &mut buf, hint);
-            assert!(
-                ext_fields_eq(&got, &ff),
-                "{ctx}: extend_hint must return the full-matrix answer"
-            );
-            let after: u64 = (0..2)
-                .map(|t| crate::prof::shadow_count(site, t, want))
-                .sum();
-            assert_eq!(after - before, 1, "{ctx}: exactly one class-{want} event expected");
-        }
-        let line = crate::prof::shadow_lines();
-        eprintln!("{line}");
-        assert!(line.starts_with("[shadow] {\"total\": 3"), "report line: {line}");
-        assert!(line.contains("dp_calls_unspliced"), "report line: {line}");
-    }
-
-    /// Hand-built escalations through `extend_hint` with ESP_SHADOW=1: the
-    /// band-64 shadow tier must classify a/b/c as constructed, change no
-    /// returned value, and emit the `[shadow]` report line. Checked in a
-    /// fresh child process (ESP_SHADOW set before anything initializes the
-    /// gate), mirroring `esp_no_simd_escape_hatch`.
-    #[test]
-    fn shadow_ladder_classes_hand_built_escalations() {
-        if std::env::var_os("ESP_CHILD_SHADOW").is_some() {
-            shadow_child_body();
-            return;
-        }
-        let exe = std::env::current_exe().unwrap();
-        let st = std::process::Command::new(exe)
-            .arg("extend::tests::shadow_ladder_classes_hand_built_escalations")
-            .arg("--exact")
-            .arg("--nocapture")
-            .env("ESP_SHADOW", "1")
-            .env("ESP_CHILD_SHADOW", "1")
-            .status()
-            .unwrap();
-        assert!(st.success());
-    }
 }

@@ -8,9 +8,7 @@
 //! inlined as a JS object literal so `report.html` renders standalone from
 //! `file://`.
 //!
-//! Data semantics are ported verbatim from the validated reference
-//! implementation; every threshold, ordering and rounding rule here is
-//! contract, not taste.
+//! Aggregation uses deterministic ordering and decimal rounding.
 
 mod annotate;
 
@@ -31,16 +29,15 @@ const TEMPLATE: &str = include_str!("report_template.html");
 const MARKER: &str = "null; // __ESPERANTO_DATA__";
 /// Per-gene top-sites cap.
 const GENE_SITES_CAP: usize = 60;
-/// Minimum probability for a site to enter a gene's site list.
-const GENE_SITE_MIN_PROB: f64 = 0.3;
-/// Minimum probability for the recoding check.
-const RECODE_MIN_PROB: f64 = 0.2;
+/// Minimum score for a site to enter a gene's site list.
+const GENE_SITE_MIN_SCORE: f64 = 0.3;
+/// Minimum score for the recoding check.
+const RECODE_MIN_SCORE: f64 = 0.2;
 /// A site is flagged "hyperedited" when a rescued read lands within this
 /// many base pairs of it.
 const HYPER_PAD: i64 = 500;
 
-/// Decimal rounding that matches the reference implementation: correct
-/// decimal rounding of the exact binary value, ties to even, then back to
+/// Round the exact binary value to decimal places, ties to even, and return
 /// the nearest f64.
 fn round_dp(x: f64, dp: usize) -> f64 {
     format!("{x:.dp$}").parse().unwrap_or(x)
@@ -50,16 +47,14 @@ fn round_dp(x: f64, dp: usize) -> f64 {
 struct Site {
     chrom: String,
     pos: i64,
-    prob: f64,
+    score: f64,
     vaf: f64,
     depth: i64,
     pass_: bool,
     gene: String,
-    /// True on hybrid-run rows with no matching model (FILTER=UNSCORED).
-    unscored: bool,
 }
 
-/// Output document (field order mirrors the reference data pack).
+/// Embedded report document.
 #[derive(Serialize)]
 struct DataPack {
     sample: String,
@@ -83,17 +78,6 @@ struct Metrics {
     map_rate: f64,
     rescued: u64,
     recodings: u64,
-    /// Hybrid runs: sites on contigs with no matching model.
-    unscored: u64,
-    /// Channel signal-to-noise (editing sites / mean control sites).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    channel_snr: Option<f64>,
-    /// mean(C1,C2)/E before verify.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    implied_fdr: Option<f64>,
-    /// mean(C1,C2)/E after verify.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    implied_fdr_post: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -102,9 +86,9 @@ struct ChromLen {
     len: i64,
 }
 
-/// Site row serialized as `[pos, prob, vaf, depth, pass, gene, hyper]`.
+/// Site row serialized as `[pos, score, vaf, depth, pass, gene, hyper]`.
 #[derive(Serialize)]
-struct SiteRow(i64, Option<f64>, f64, i64, i64, String, bool);
+struct SiteRow(i64, f64, f64, i64, i64, String, bool);
 
 #[derive(Serialize)]
 struct Recoding {
@@ -112,7 +96,7 @@ struct Recoding {
     chrom: String,
     pos: i64,
     change: String,
-    prob: f64,
+    score: f64,
     vaf: f64,
     depth: i64,
     pass: i64,
@@ -127,7 +111,7 @@ struct GeneOut {
     end: i64,
     n: u64,
     pass: u64,
-    maxprob: f64,
+    maxscore: f64,
     n_rec: u64,
     sites: Vec<GeneSiteOut>,
     has_hyper: bool,
@@ -136,7 +120,7 @@ struct GeneOut {
 #[derive(Clone, Serialize)]
 struct GeneSiteOut {
     pos: i64,
-    prob: f64,
+    score: f64,
     vaf: f64,
     depth: i64,
     pass: i64,
@@ -147,12 +131,12 @@ struct GeneAcc {
     gene: String,
     n: u64,
     pass: u64,
-    maxprob: f64,
+    maxscore: f64,
     n_rec: u64,
     sites: Vec<GeneSiteOut>,
 }
 
-/// Parse `<out>/sites.vcf`: INFO keys RE_PROB / VAF / DEPTH (defaults 0),
+/// Parse `<out>/sites.vcf`: INFO keys ESP_SCORE / VAF / DEPTH (defaults 0),
 /// FILTER column `PASS`.
 fn read_sites(vcf: &Path) -> anyhow::Result<Vec<Site>> {
     let text =
@@ -169,16 +153,13 @@ fn read_sites(vcf: &Path) -> anyhow::Result<Vec<Site>> {
         let pos: i64 = f[1]
             .parse()
             .with_context(|| format!("{} line {}: bad POS '{}'", vcf.display(), ln + 1, f[1]))?;
-        let unscored = f[6] == "UNSCORED";
-        let (mut prob, mut vaf, mut depth) = (0.0f64, 0.0f64, 0i64);
-        let mut has_prob = false;
+        let (mut score, mut vaf, mut depth) = (0.0f64, 0.0f64, 0i64);
         for part in f[7].split(';') {
             if let Some((k, v)) = part.split_once('=') {
                 match k {
-                    "RE_PROB" => {
-                        has_prob = true;
-                        prob = v.parse().with_context(|| {
-                            format!("{} line {}: bad RE_PROB '{v}'", vcf.display(), ln + 1)
+                    "ESP_SCORE" => {
+                        score = v.parse().with_context(|| {
+                            format!("{} line {}: bad ESP_SCORE '{v}'", vcf.display(), ln + 1)
                         })?
                     }
                     "VAF" => {
@@ -198,13 +179,12 @@ fn read_sites(vcf: &Path) -> anyhow::Result<Vec<Site>> {
         sites.push(Site {
             chrom: f[0].to_string(),
             pos,
-            prob,
+            score,
             vaf,
             depth,
             pass_: f[6] == "PASS",
             gene: String::new(),
-                unscored: unscored || !has_prob,
-    });
+        });
     }
     Ok(sites)
 }
@@ -236,55 +216,11 @@ fn read_metrics(out_dir: &Path) -> anyhow::Result<(u64, f64, u64)> {
     Ok((reads_in, map_rate, rescued))
 }
 
-/// channel metrics inputs: `scan/channels.json` `snr`, `implied_fdr` and
-/// `implied_fdr_post` (present only when the verify stage ran). Missing
-/// artifacts read as None and are omitted from the pack.
-fn read_channels(out_dir: &Path) -> (Option<f64>, Option<f64>, Option<f64>) {
-    let Ok(text) = std::fs::read_to_string(out_dir.join("scan").join("channels.json")) else {
-        return (None, None, None);
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return (None, None, None);
-    };
-    (
-        v["snr"].as_f64(),
-        v["implied_fdr"].as_f64(),
-        v["implied_fdr_post"].as_f64(),
-    )
-}
-
-/// Reportable chromosomes straight from the `.fai` in file order:
-/// `chr`-prefixed, no `_` (decoys/alternates), excluding `chrM`.
-/// Reportable chromosomes: with a hybrid manifest (`species.json` in the run
-/// directory) every declared contig except mitochondria; legacy runs keep the
-/// `chr`-prefixed, no-underscore filter.
-fn report_chroms(fa: &FastaIndex, out_dir: &Path) -> Vec<ChromLen> {
-    if let Ok(text) = std::fs::read_to_string(out_dir.join("species.json")) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-            let declared: std::collections::BTreeSet<&str> = v["contig_owner"]
-                .as_object()
-                .map(|m| m.keys().map(|k| k.as_str()).collect())
-                .unwrap_or_default();
-            if !declared.is_empty() {
-                return fa
-                    .contigs()
-                    .iter()
-                    .filter(|(n, _)| {
-                        declared.contains(n.as_str()) && n != "chrM" && !n.starts_with("decoy_")
-                    })
-                    .map(|(n, l)| ChromLen {
-                        chrom: n.clone(),
-                        len: *l,
-                    })
-                    .collect();
-            }
-        }
-    }
+/// Reportable primary chromosomes in FASTA index order.
+fn report_chroms(fa: &FastaIndex) -> Vec<ChromLen> {
     fa.contigs()
         .iter()
-        .filter(|(n, _)| {
-            n.starts_with("chr") && !n.contains('_') && n != "chrM" && !n.starts_with("decoy_")
-        })
+        .filter(|(n, _)| n.starts_with("chr") && !n.contains('_') && n != "chrM")
         .map(|(n, l)| ChromLen {
             chrom: n.clone(),
             len: *l,
@@ -292,7 +228,7 @@ fn report_chroms(fa: &FastaIndex, out_dir: &Path) -> Vec<ChromLen> {
         .collect()
 }
 
-/// PASS-site probability mass per `win`-sized window, rounded to 2 dp.
+/// PASS-site score mass per `win`-sized window, rounded to 2 dp.
 fn mkheat(sites: &[Site], chroms: &[ChromLen], win: i64) -> BTreeMap<String, Vec<f64>> {
     let mut vals: HashMap<&str, Vec<f64>> = chroms
         .iter()
@@ -303,7 +239,7 @@ fn mkheat(sites: &[Site], chroms: &[ChromLen], win: i64) -> BTreeMap<String, Vec
             continue;
         }
         if let Some(v) = vals.get_mut(s.chrom.as_str()) {
-            v[(s.pos / win) as usize] += s.prob;
+            v[(s.pos / win) as usize] += s.score;
         }
     }
     vals.into_iter()
@@ -316,27 +252,8 @@ fn mkheat(sites: &[Site], chroms: &[ChromLen], win: i64) -> BTreeMap<String, Vec
         .collect()
 }
 
-/// Rescued-read placements for the hyperedited-density track:
-/// `hyper/regions.bed` (clustered, midpoint per region) when the hyper stage
-/// ran, else the raw `map/rescued.bed` per-read positions. A missing or
-/// unparsable sidecar yields an empty map (pre-sidecar runs stay reportable).
+/// Rescued-read placements from the mapping stage, grouped by chromosome.
 fn read_rescued(out_dir: &Path) -> BTreeMap<String, Vec<i64>> {
-    if let Ok(text) = std::fs::read_to_string(out_dir.join("hyper").join("regions.bed")) {
-        let mut pos: BTreeMap<String, Vec<i64>> = BTreeMap::new();
-        for line in text.lines() {
-            let f: Vec<&str> = line.split('\t').collect();
-            if f.len() < 3 {
-                continue;
-            }
-            if let (Ok(s), Ok(e)) = (f[1].parse::<i64>(), f[2].parse::<i64>()) {
-                pos.entry(f[0].to_owned()).or_default().push((s + e) / 2);
-            }
-        }
-        for v in pos.values_mut() {
-            v.sort_unstable();
-        }
-        return pos;
-    }
     let Ok(text) = std::fs::read_to_string(out_dir.join("map").join("rescued.bed")) else {
         return BTreeMap::new();
     };
@@ -403,9 +320,8 @@ pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<Path
     let mut sites = read_sites(&out_dir.join("sites.vcf"))?;
     let ann = Annotation::load(gtf)?;
     let mut fa = FastaIndex::open(fasta)?;
-    let chroms = report_chroms(&fa, out_dir);
+    let chroms = report_chroms(&fa);
     let (reads_in, map_rate, rescued) = read_metrics(out_dir)?;
-    let (channel_snr, implied_fdr, implied_fdr_post) = read_channels(out_dir);
     let rescued_pos = read_rescued(out_dir);
 
     // Gene annotation + aggregation + recoding in one VCF-order pass.
@@ -422,7 +338,7 @@ pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<Path
                     gene: gname.clone(),
                     n: 0,
                     pass: 0,
-                    maxprob: 0.0,
+                    maxscore: 0.0,
                     n_rec: 0,
                     sites: Vec::new(),
                 });
@@ -431,18 +347,18 @@ pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<Path
             let pg = &mut per_gene[gi];
             pg.n += 1;
             pg.pass += u64::from(s.pass_);
-            pg.maxprob = pg.maxprob.max(s.prob);
-            if s.prob >= GENE_SITE_MIN_PROB {
+            pg.maxscore = pg.maxscore.max(s.score);
+            if s.score >= GENE_SITE_MIN_SCORE {
                 pg.sites.push(GeneSiteOut {
                     pos: s.pos,
-                    prob: round_dp(s.prob, 3),
+                    score: round_dp(s.score, 3),
                     vaf: round_dp(s.vaf, 3),
                     depth: s.depth,
                     pass: i64::from(s.pass_),
                 });
             }
         }
-        if s.prob < RECODE_MIN_PROB {
+        if s.score < RECODE_MIN_SCORE {
             continue;
         }
         // First valid transcript hit per site (transcripts sorted by CDS
@@ -466,7 +382,7 @@ pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<Path
                 chrom: s.chrom.clone(),
                 pos: s.pos,
                 change: format!("{ra}{ap}{aa}"),
-                prob: round_dp(s.prob, 3),
+                score: round_dp(s.score, 3),
                 vaf: round_dp(s.vaf, 3),
                 depth: s.depth,
                 pass: i64::from(s.pass_),
@@ -483,7 +399,7 @@ pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<Path
     for s in &sites {
         per_chrom.entry(s.chrom.clone()).or_default().push(SiteRow(
             s.pos,
-            if s.unscored { None } else { Some(round_dp(s.prob, 3)) },
+            round_dp(s.score, 3),
             round_dp(s.vaf, 3),
             s.depth,
             i64::from(s.pass_),
@@ -495,19 +411,19 @@ pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<Path
         v.sort_by(cmp_site_row);
     }
 
-    // Recodings by probability descending (stable).
-    recodings.sort_by(|a, b| b.prob.total_cmp(&a.prob));
+    // Recodings by score descending (stable).
+    recodings.sort_by(|a, b| b.score.total_cmp(&a.score));
 
-    // Genes by unrounded maxprob descending (stable, insertion order on
+    // Genes by unrounded maxscore descending (stable, insertion order on
     // ties), dropping names without gene coordinates.
     let mut gene_pairs: Vec<(f64, GeneOut)> = per_gene
         .iter()
         .filter_map(|pg| {
             let (gchrom, gstart, gend) = ann.gene_coord(&pg.gene)?;
             let mut top = pg.sites.clone();
-            top.sort_by(|a, b| b.prob.total_cmp(&a.prob));
+            top.sort_by(|a, b| b.score.total_cmp(&a.score));
             Some((
-                pg.maxprob,
+                pg.maxscore,
                 GeneOut {
                     gene: pg.gene.clone(),
                     chrom: gchrom.to_string(),
@@ -515,7 +431,7 @@ pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<Path
                     end: gend,
                     n: pg.n,
                     pass: pg.pass,
-                    maxprob: round_dp(pg.maxprob, 3),
+                    maxscore: round_dp(pg.maxscore, 3),
                     n_rec: pg.n_rec,
                     sites: top.into_iter().take(GENE_SITES_CAP).collect(),
                     has_hyper: overlaps_rescued(&rescued_pos, gchrom, gstart, gend),
@@ -543,10 +459,6 @@ pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<Path
             map_rate,
             rescued,
             recodings: recodings.len() as u64,
-            unscored: sites.iter().filter(|s| s.unscored).count() as u64,
-            channel_snr,
-            implied_fdr,
-            implied_fdr_post,
         },
         chroms,
         heat5,
@@ -563,17 +475,12 @@ pub fn generate(out_dir: &Path, fasta: &Path, gtf: &Path) -> anyhow::Result<Path
     Ok(out_path)
 }
 
-/// Lexicographic row comparison mirroring the reference list-of-lists sort:
-/// pos, prob, vaf, depth, pass, gene. The trailing `hyper` flag is display
+/// Lexicographic row comparison:
+/// pos, score, vaf, depth, pass, gene. The trailing `hyper` flag is display
 /// metadata and never participates in ordering.
 fn cmp_site_row(a: &SiteRow, b: &SiteRow) -> std::cmp::Ordering {
     a.0.cmp(&b.0)
-        .then(match (a.1, b.1) {
-            (None, None) => std::cmp::Ordering::Equal,
-            (None, _) => std::cmp::Ordering::Less,
-            (_, None) => std::cmp::Ordering::Greater,
-            (Some(x), Some(y)) => x.total_cmp(&y),
-        })
+        .then(a.1.total_cmp(&b.1))
         .then(a.2.total_cmp(&b.2))
         .then(a.3.cmp(&b.3))
         .then(a.4.cmp(&b.4))
@@ -618,10 +525,6 @@ mod tests {
                 map_rate: 0.5,
                 rescued: 0,
                 recodings: 0,
-                unscored: 0,
-                channel_snr: None,
-                implied_fdr: None,
-                implied_fdr_post: None,
             },
             chroms: vec![],
             heat5: BTreeMap::new(),
@@ -651,16 +554,19 @@ mod tests {
         let out = dir.join("sample");
         std::fs::create_dir_all(out.join("qc")).unwrap();
         std::fs::create_dir_all(out.join("map")).unwrap();
-        std::fs::create_dir_all(out.join("hyper")).unwrap();
         std::fs::write(
             out.join("sites.vcf"),
             "##fileformat=VCFv4.2\n\
              #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
-             chrX\t500\t.\tA\tG\t.\tPASS\tRE_PROB=0.95;VAF=0.4;DEPTH=40\n\
-             chrY\t700\t.\tA\tG\t.\tPASS\tRE_PROB=0.8;VAF=0.3;DEPTH=30\n",
+             chrX\t500\t.\tA\tG\t.\tPASS\tESP_SCORE=0.95;VAF=0.4;DEPTH=40\n\
+             chrY\t700\t.\tA\tG\t.\tPASS\tESP_SCORE=0.8;VAF=0.3;DEPTH=30\n",
         )
         .unwrap();
-        std::fs::write(out.join("qc").join("qc.json"), "{\"summary\":{\"reads_before\":4}}").unwrap();
+        std::fs::write(
+            out.join("qc").join("qc.json"),
+            "{\"summary\":{\"reads_before\":4}}",
+        )
+        .unwrap();
         std::fs::write(
             out.join("map").join("align_qc.json"),
             "{\"mapping_rate\":1.0,\"rescued_collapsed\":2}",
@@ -668,7 +574,7 @@ mod tests {
         .unwrap();
         // Rescued region overlaps the chrY copy only: has_hyper follows the
         // attributed copy's coordinates.
-        std::fs::write(out.join("hyper").join("regions.bed"), "chrY\t100\t900\tAG\t3\t2\t0.5000\n").unwrap();
+        std::fs::write(out.join("map").join("rescued.bed"), "chrY\t500\n").unwrap();
 
         // Two-contig reference with a hand-computed .fai.
         let seq = "ACGT".repeat(500); // 2000 bp per contig
@@ -705,8 +611,14 @@ mod tests {
         }
         assert!(digests[0] == digests[1] && digests[1] == digests[2]);
         let html = String::from_utf8(digests[0].clone()).unwrap();
-        assert!(html.contains("\"gene\":\"PARFX\",\"chrom\":\"chrY\""), "attribution must be the chrY copy");
-        assert!(html.contains("\"has_hyper\":true"), "chrY copy overlaps the rescued region");
+        assert!(
+            html.contains("\"gene\":\"PARFX\",\"chrom\":\"chrY\""),
+            "attribution must be the chrY copy"
+        );
+        assert!(
+            html.contains("\"has_hyper\":true"),
+            "chrY copy overlaps the rescued region"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,9 +1,2 @@
-.omo/
-.codegraph/
 target/
-.ruff_cache/
-worknotes/
-.playwright-mcp/
-*.png
-papers/
 /target-x86-64-baseline/

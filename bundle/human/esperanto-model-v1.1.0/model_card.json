@@ -1,0 +1,16 @@
+{
+  "model": "esperanto-unified-evidence-v1.1.0",
+  "species": "human",
+  "reference": "GRCh38",
+  "task": "reference-aware RNA editing evidence classification",
+  "features": 27,
+  "trees": 400,
+  "threshold": 0.9399543771371561,
+  "score_semantics": "classifier score; not a calibrated probability",
+  "annotation": "Alu intervals from the GRCh38 RepeatMasker annotation",
+  "limitations": [
+    "Catalogue RNA-editing positives are weak labels unless accompanied by an explicit reference whole-genome genotype.",
+    "Calibration constrains empirical canonical DNA-labelled candidates, not all genomic errors.",
+    "The development benchmark informed prior error analysis; performance on it is not an independent held-out evaluation."
+  ]
+}

@@ -62,7 +62,7 @@ pub enum AlignError {
         msg: String,
     },
 
-    /// Failed to open or read a FASTQ/BFQ file.
+    /// Failed to open or read a FASTQ file.
     #[error("fastq io error: {path}: {source}")]
     FastqIo {
         /// File path that failed (or logical sink name).

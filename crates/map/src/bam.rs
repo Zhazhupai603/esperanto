@@ -21,7 +21,7 @@ pub use esperanto_bamio::{apply_t13, create_writer, flag, write_record};
 /// Map-side record type = bamio output record.
 pub type BamRecord = OutRecord;
 
-/// Build the BAM header from the index (comment string frozen; any change shifts artifact bytes).
+/// Build the BAM header from the index (stable comment string).
 pub fn build_header(index: &Index) -> Header {
     let contigs: Vec<(String, u64)> = index
         .reference

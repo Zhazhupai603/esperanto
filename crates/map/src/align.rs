@@ -1,11 +1,10 @@
 //! Per-read alignment driver: seed → anchor → chain → (L1 / intron-chain /
 //! spliced / EA-Myers / banded DP) → split/span rescue → recount → coverage gate.
 //!
-//! All production gates are frozen (no env switches): the splice gate (skip try_spliced on
+//! Alignment gates include: the splice gate (skip try_spliced on
 //! <2 segments), the non-best-chain spliced Myers pre-gate (skip the spliced DP when the
 //! pseudo-reference is farther than read_len/3 edits from the read), the tail-rescue gate
 //! (small-tail rescue tightening), multitie marking, EA-Myers decisive path, window cap.
-//! Profiling instrumentation is not ported.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -170,25 +169,6 @@ impl Placement {
     }
 }
 
-/// One fully-scored placement from the exhaustive path (verify stage): the
-/// strict score plus the reference M blocks, everything the vote-withdrawal
-/// checks need.
-#[derive(Clone, Debug)]
-pub struct ScoredPlacement {
-    /// Contig index into the alignment index.
-    pub contig: u32,
-    /// Leftmost 0-based reference position.
-    pub pos: u32,
-    /// Read strand.
-    pub strand: Strand,
-    /// Strict-domain score.
-    pub score: i32,
-    /// Reference M blocks `(start, end)`, half-open.
-    pub blocks: Vec<(u32, u32)>,
-    /// Full CIGAR (reference orientation) for column mapping.
-    pub cigar: Vec<CigarOp>,
-}
-
 /** Genomic layer output: per-chain placement candidates plus read evidence.
  */
 pub(crate) struct GenomicBatch {
@@ -203,7 +183,7 @@ pub struct Aligner<'a> {
     pub config: AlignConfig,
     /// Junction library (sjdb / 2-pass discoveries; RNA mode).
     pub jlib: Option<Arc<JunctionLib>>,
-    /// L1 transcriptome-first engine bundle (None = pure legacy path).
+    /// L1 transcriptome-first engine bundle (None = genomic alignment only).
     pub l1: Option<Arc<esperanto_engine::L1Index>>,
     pub(crate) buf: ExtendBuffer,
     /// Reusable hot-path buffers (seeding / chaining / revcomp / windows).
@@ -260,7 +240,7 @@ impl<'a> Aligner<'a> {
     }
 
     /// Enable the L1 transcriptome-first fast path: hit → direct placement;
-    /// miss (Fallback) → transparent drop to the legacy genomic path.
+    /// miss (Fallback) → genomic alignment.
     pub fn with_l1(mut self, l1: Arc<esperanto_engine::L1Index>) -> Self {
         self.l1 = Some(l1);
         self
@@ -357,7 +337,7 @@ impl<'a> Aligner<'a> {
         &mut self,
         seq: &[u8],
     ) -> (Option<ReadAlignment>, Option<CachedPlacements>) {
-        let Some((placements, n_seeds, genomic_any)) = self.scored_placements(seq, false)
+        let Some((placements, n_seeds, genomic_any)) = self.scored_placements(seq)
         else {
             return (None, None);
         };
@@ -370,14 +350,10 @@ impl<'a> Aligner<'a> {
     }
 
     /// Collect, strictly rescore, dedup and order the candidate placements of
-    /// a read from both layers. `exhaustive` widens the genomic extension to
-    /// every chained locus (TOP_CANDIDATES) and disables the decisive fast
-    /// lane — the verify stage's re-alignment mode; the map stage uses the
-    /// budgeted mode. Returns None when no layer produced any candidate.
+    /// a read from both layers. Returns None when no layer produced any candidate.
     fn scored_placements(
         &mut self,
         seq: &[u8],
-        exhaustive: bool,
     ) -> Option<(Vec<Placement>, usize, bool)> {
         let mut placements: Vec<Placement> = Vec::new();
 
@@ -398,9 +374,8 @@ impl<'a> Aligner<'a> {
             }
         }
 
-        // 2. Candidate generation — genomic layer (always consulted; the L1
-        // full-branch early return is abolished).
-        let batch = self.genomic_candidates(seq, exhaustive);
+        // 2. Candidate generation — genomic layer (always consulted).
+        let batch = self.genomic_candidates(seq);
         let n_seeds = batch.n_seeds;
         let genomic_any = !batch.placements.is_empty();
         placements.extend(batch.placements);
@@ -490,8 +465,7 @@ impl<'a> Aligner<'a> {
             // aligned once already.
             Some(c) => (c.placements.clone(), c.n_seeds, c.genomic_any),
             None => {
-                crate::prof::bump(crate::prof::MATE_REALIGNED, 1);
-                self.scored_placements(seq, false)
+                self.scored_placements(seq)
                     .unwrap_or((Vec::new(), 0, false))
             }
         };
@@ -579,7 +553,6 @@ impl<'a> Aligner<'a> {
             num: 1,
             den: 1,
         };
-        crate::prof::dp_call(crate::prof::DP_MATE);
         let ext = extend_hint(q, &window, &self.config.extend, &mut self.buf, hint);
         self.scratch.rc = rc_storage;
         self.scratch.win = window;
@@ -597,26 +570,6 @@ impl<'a> Aligner<'a> {
         ))
     }
 
-    /// Exhaustive re-alignment for the verify stage: every chained locus
-    /// extended, decisive shortcuts off, the full strict-scored candidate
-    /// list returned without arbitration or refusal.
-    pub fn align_read_exhaustive(&mut self, seq: &[u8]) -> Vec<ScoredPlacement> {
-        let Some((placements, _, _)) = self.scored_placements(seq, true) else {
-            return Vec::new();
-        };
-        placements
-            .into_iter()
-            .map(|p| ScoredPlacement {
-                blocks: ref_m_blocks(p.pos, &p.cigar),
-                cigar: p.cigar,
-                contig: p.contig,
-                pos: p.pos,
-                strand: p.strand,
-                score: p.strict.score,
-            })
-            .collect()
-    }
-
     /// The Tier-1 decision over an ordered, deduplicated candidate list.
     fn arbitrate(
         &mut self,
@@ -627,33 +580,6 @@ impl<'a> Aligner<'a> {
     ) -> Option<ReadAlignment> {
         if placements.is_empty() {
             return None;
-        }
-        if std::env::var_os("ESP_PROBE").is_some() {
-            for (i, p) in placements.iter().enumerate() {
-                eprintln!(
-                    "[probe] cand {i} rtag={} origin={} contig={} pos={} strand={:?} strict={} mm={} ea={}/{} clip={} cigar={}",
-                    String::from_utf8_lossy(&seq[..16.min(seq.len())]),
-                    p.origin.label(),
-                    self.index.reference.contigs[p.contig as usize].name,
-                    p.pos,
-                    p.strand,
-                    p.strict.score,
-                    p.strict.mm,
-                    p.strict.ea_ag,
-                    p.strict.ea_tc,
-                    p.strict.clipped,
-                    p.cigar
-                        .iter()
-                        .map(|op| match op {
-                            CigarOp::Match(n) => format!("{n}M"),
-                            CigarOp::Ins(n) => format!("{n}I"),
-                            CigarOp::Del(n) => format!("{n}D"),
-                            CigarOp::RefSkip(n) => format!("{n}N"),
-                            CigarOp::SoftClip(n) => format!("{n}S"),
-                        })
-                        .collect::<String>()
-                );
-            }
         }
         let best = &placements[0];
         // Runner-up must be a different locus (footprint overlap < 0.5).
@@ -830,16 +756,9 @@ impl<'a> Aligner<'a> {
                     ro += *n;
                 }
                 CigarOp::RefSkip(n) => {
-                    // An annotated intron earns the known bonus alone,
-                    // regardless of the read's orientation: a read
-                    // antisense to the transcript crosses the same
-                    // annotated intron. Signal score and intron-length
-                    // penalty exist to discriminate *novel* junctions from
-                    // spurious ones — charging them on annotated junctions
-                    // lets a one-base soft clip beat a real splice across
-                    // every long or noncanonical intron (measured on the
-                    // simulated corpus: junction-exact 92.8% vs the 96%
-                    // gate; the loss concentrated exactly there).
+                    // Annotated introns receive the known-junction bonus on
+                    // either read orientation. Signal and length penalties
+                    // apply to novel junctions only.
                     if lib.contains_any_strand(p.contig, rf, rf + *n) {
                         score += sp.known_bonus;
                     } else {
@@ -916,7 +835,6 @@ impl<'a> Aligner<'a> {
         };
         let mut ep = self.config.extend;
         ep.edit_dir = dir;
-        crate::prof::dp_call(crate::prof::DP_HYPER);
         let ext = extend_hint(query, &window, &ep, &mut self.buf, hint);
         self.scratch.win = window;
         let new_aligned: u32 = ext
@@ -1001,10 +919,9 @@ impl<'a> Aligner<'a> {
     /// Genomic layer driver, in candidate form: seed → anchor → chain →
     /// build a locus-deduplicated chain list → extend each chain
     /// (intron-chain / spliced / EA-Myers / fast lane / banded DP) into
-    /// 0..2 placements → split/span rescue on the best placement. The
-    /// single-winner logic of the old path is gone: every defensible locus
-    /// is reported and the arbiter in [`Aligner::align_read`] decides.
-    fn genomic_candidates(&mut self, seq: &[u8], exhaustive: bool) -> GenomicBatch {
+    /// 0..2 placements → split/span rescue on the best placement. Each
+    /// defensible locus enters arbitration in [`Aligner::align_read`].
+    fn genomic_candidates(&mut self, seq: &[u8]) -> GenomicBatch {
         let cfg = self.config;
         let k = cfg.seed.k;
         let read_len = seq.len() as u32;
@@ -1021,23 +938,10 @@ impl<'a> Aligner<'a> {
 
         // Round 1: default-density seeding, occurrence cap = freq_cutoff.
         let r1 = self.chain_round(&mins, read_len, k, self.index.freq_cutoff);
-        if std::env::var_os("ESP_PROBE").is_some() {
-            eprintln!(
-                "[probe] mins={} r1_best={:?}",
-                mins.len(),
-                r1.as_ref().and_then(|r| r.best()).map(|b| b.score)
-            );
-        }
 
-        // Round 2: mid-occurrence seeding when round 1 explains little of
-        // the read. A read from a high-copy repeat has every k-mer above the
-        // default occurrence cap, so round 1 sees only its rare (mutated)
-        // k-mers and chains them at whichever paralog they happen to hit —
-        // measured on the real sample, the true locus of such a read was
-        // absent from the candidate list for nearly every read STAR placed
-        // uniquely and esperanto placed elsewhere. minimap2 runs the same
-        // second round (`--mid-occ`); anchors are capped so a read made of
-        // nothing but Alu k-mers cannot turn chaining quadratic.
+        // Round 2 raises the occurrence cap when the first round covers
+        // little of the read, retaining candidates from high-copy repeats.
+        // The anchor limit bounds chaining cost on repetitive sequence.
         let r1_cov = r1
             .as_ref()
             .and_then(|r| r.best())
@@ -1076,8 +980,7 @@ impl<'a> Aligner<'a> {
             .unwrap_or(0)
             == 0;
         let r3 = if cfg.extend.edit_dir.is_on() && weak {
-            // Base anchors first (see the note in the old single-winner path:
-            // edit-variant anchors must not pollute a clean chain).
+            // Base anchors first: edit-variant anchors must not alter a clean chain.
             let mut base_anchors = std::mem::take(&mut self.scratch.anchors);
             collect_anchors_into(
                 self.index,
@@ -1157,17 +1060,6 @@ impl<'a> Aligner<'a> {
                 }
             }
         };
-        if std::env::var_os("ESP_PROBE").is_some() {
-            eprintln!(
-                "[probe] best chain: contig={} strand={:?} score={} anchors={} second={} tied={}",
-                self.index.reference.contigs[best.contig as usize].name,
-                best.strand,
-                best.score,
-                best.anchors.len(),
-                second,
-                tied_best(&cr.chains).len()
-            );
-        }
 
         // Candidate chains: deduplicated by locus (same contig+strand,
         // ref-span start within 50bp), in chain-score order.
@@ -1197,19 +1089,14 @@ impl<'a> Aligner<'a> {
         let rc_storage = self.take_rc(seq);
         let mut placements: Vec<Placement> = Vec::new();
         let mut dp_budget = EXTEND_BUDGET;
-        let width = if exhaustive {
-            TOP_CANDIDATES
-        } else {
-            MAX_TIED_CANDIDATES
-        };
-        for (i, chain) in cand_chains.iter().take(width).enumerate() {
+        for (i, chain) in cand_chains.iter().take(MAX_TIED_CANDIDATES).enumerate() {
             let is_best = i == 0;
             self.extend_chain(
                 seq,
                 &mins,
                 chain,
                 is_best,
-                decisive && is_best && !exhaustive,
+                decisive && is_best,
                 &rc_storage,
                 &mut dp_budget,
                 &mut placements,
@@ -1286,7 +1173,7 @@ impl<'a> Aligner<'a> {
         let k = cfg.seed.k;
         let read_len = seq.len() as u32;
 
-        // Spliced interpretation (RNA; splice gate frozen on: <2 segments
+        // Spliced interpretation (RNA; splice gate: <2 segments
         // has no spliced reading).
         if cfg.rna {
             let min_intron = SpliceParams::default().min_intron;
@@ -1384,7 +1271,6 @@ impl<'a> Aligner<'a> {
         if fast_lane_ok {
             if let Some((ext, wstart)) = self.try_fast_lane(seq, rc_storage, chain, read_len, k) {
                 if ext.score > 0 {
-                    crate::prof::bump(crate::prof::FAST_LANE_HITS, 1);
                     out.push(Placement::from_genomic(
                         chain.contig,
                         wstart + ext.ref_start,
@@ -1461,7 +1347,6 @@ impl<'a> Aligner<'a> {
                 }
                 if usable {
                     // Optimal soft clip ≡ Kadane max subarray on the diagonal.
-                    crate::prof::bump(crate::prof::MYERS_ONLY_HITS, 1);
                     let mut best_sum = 0i32;
                     let (mut bi, mut bj) = (0usize, 0usize);
                     let mut cur_sum = 0i32;
@@ -1544,7 +1429,6 @@ impl<'a> Aligner<'a> {
             num: 1,
             den: 1,
         };
-        crate::prof::dp_call(crate::prof::DP_UNSPLICED);
         let ext = extend_hint(q, &window, &cfg.extend, &mut self.buf, hint);
         self.scratch.win = window;
         if ext.score > 0 {
@@ -1561,7 +1445,7 @@ impl<'a> Aligner<'a> {
     }
 
     /// Splice path: segment → junction refine → pseudo-reference extend →
-    /// N CIGAR. splice gate frozen on: <2 segments ⇒ None (align_spliced would
+    /// N CIGAR. splice gate: <2 segments ⇒ None (align_spliced would
     /// return None anyway — skip the revcomp + entry cost).
     fn try_spliced(&mut self, seq: &[u8], rc_storage: &[u8], best: &Chain) -> Option<ReadAlignment> {
         let min_intron = SpliceParams::default().min_intron;
@@ -1602,98 +1486,6 @@ impl<'a> Aligner<'a> {
             ..Default::default()
         };
         self.recount_mm_ea(query, &mut aln);
-        Some(aln)
-    }
-
-    /// Rescue channel: mate anchored, A/G-masking reseeding in the anchored
-    /// window. Success → rescued=true (RE tag).
-    pub fn rescue_with_mate_anchor(
-        &mut self,
-        seq: &[u8],
-        mate: &ReadAlignment,
-        est_insert: u32,
-    ) -> Option<ReadAlignment> {
-        let read_len = seq.len() as u32;
-        let mut mins = std::mem::take(&mut self.scratch.mins_out);
-        minimizers_into(seq, self.config.seed, &mut self.scratch.seed, &mut mins);
-        if mins.is_empty() {
-            self.scratch.mins_out = mins;
-            return None;
-        }
-        let k = self.config.seed.k;
-        // Anchor window: mate pos ± (est_insert + 3×est_insert/2 + read_len).
-        let span = est_insert + est_insert / 2 + read_len;
-        let wlo = mate.pos.saturating_sub(span);
-        let whi = mate.pos.saturating_add(span) + read_len;
-        // Normal + single-edit-variant anchors (A/G masking), window-filtered.
-        let (mut anchors, _) =
-            crate::index::collect_anchors_edit_variants(self.index, &mins, read_len, k, 500);
-        let mut base = std::mem::take(&mut self.scratch.anchors);
-        collect_anchors_into(self.index, &mins, read_len, k, 500, &mut base);
-        anchors.append(&mut base);
-        self.scratch.anchors = base;
-        let n_seeds = mins.len();
-        anchors.retain(|a| a.contig == mate.contig && a.rpos >= wlo && a.rpos <= whi);
-        if anchors.len() < 3 {
-            return None;
-        }
-        let mut cp = self.config.chain;
-        cp.min_chain_score = 20; // lower chaining threshold for rescue
-        let mut chains = std::mem::take(&mut self.scratch.chains_out);
-        chain_anchors_into(&mut anchors, &cp, &mut chains, &mut self.scratch.chain);
-        self.scratch.mins_out = mins;
-        let second = second_score_with(&chains, &mut self.scratch.second_keys);
-        let best = chains.into_iter().next()?;
-        // EA-scored extension (window = chain span ± read_len).
-        let contig = &self.index.reference.contigs[best.contig as usize];
-        let (rs, re) = best.ref_span(k);
-        let flank = read_len + 50;
-        let wstart = rs.saturating_sub(flank);
-        let wend = (re + flank).min(contig.len).min(wstart + MAX_EXTEND_WINDOW);
-        let window = self.take_win(wstart, wend, contig);
-        let rc_storage = self.take_rc(seq);
-        let query: &[u8] = match best.strand {
-            Strand::Plus => seq,
-            Strand::Minus => &rc_storage,
-        };
-        let hint = DiagHint {
-            offset: (rs - wstart) as i64 - best.read_span(k).0 as i64,
-            num: 1,
-            den: 1,
-        };
-        // The mate window has already fixed the locus, so an editing exemption
-        // here only has to explain the read's substitutions — but it still has
-        // to pick a direction, since a read is one transcript and exempting
-        // both at once would score a paralogous copy as an edited one. Extend
-        // once per direction and keep the better explanation.
-        let mut ep = self.config.extend;
-        ep.edit_dir = EditDir::Ag;
-        crate::prof::dp_call(crate::prof::DP_MATE);
-        let ag = extend_hint(query, &window, &ep, &mut self.buf, hint);
-        ep.edit_dir = EditDir::Tc;
-        crate::prof::dp_call(crate::prof::DP_MATE);
-        let tc = extend_hint(query, &window, &ep, &mut self.buf, hint);
-        self.scratch.win = window;
-        let ext = if tc.score > ag.score { tc } else { ag };
-        if ext.score <= 0 {
-            self.scratch.rc = rc_storage;
-            return None;
-        }
-        let mut aln = ReadAlignment {
-            contig: best.contig,
-            pos: wstart + ext.ref_start,
-            strand: best.strand,
-            score: ext.score,
-            chain_score: best.score,
-            second_chain_score: second,
-            cigar: ext.cigar,
-            n_anchors: best.anchors.len(),
-            n_seeds,
-            rescued: true,
-            ..Default::default()
-        };
-        self.recount_mm_ea(query, &mut aln);
-        self.scratch.rc = rc_storage;
         Some(aln)
     }
 
@@ -1759,7 +1551,7 @@ impl<'a> Aligner<'a> {
             };
             if let Some(rescue) = crate::split::rescue_right_tail(&ctx, &mut self.buf) {
                 if cigar_read_span(&rescue.cigar) == query.len() as u32 {
-                    // tail-rescue gate (frozen on): tails <12bp require either
+                    // tail-rescue gate: tails <12bp require either
                     // known_support ≥ 2 OR (canonical signal + zero tail-vs-ref
                     // mismatch) — a de-novo short tail with a perfect anchor-side
                     // junction match is accepted.
@@ -1801,7 +1593,7 @@ impl<'a> Aligner<'a> {
             };
             if let Some(rescue) = crate::split::rescue_left_tail(&ctx, &mut self.buf) {
                 if cigar_read_span(&rescue.cigar) == query.len() as u32 {
-                    // Mirror of the right-tail gate (frozen asymmetry removed):
+                    // Mirror of the right-tail gate:
                     // de-novo short tails accepted with canonical signal +
                     // zero tail-vs-ref mismatch.
                     let t3_reject = read_start < 12 && {
@@ -2188,8 +1980,7 @@ fn count_tail_mismatches(
                 if in_tail {
                     for i in 0..*n {
                         let qb = query[(read_pos + i) as usize];
-                        // Out-of-bounds ⇒ mismatch (old base() None semantics;
-                        // new base() is total and would panic OOB).
+                        // Out-of-bounds reference positions count as mismatches.
                         if ref_pos + i >= contig.len {
                             mismatches += 1;
                             continue;
@@ -2231,12 +2022,6 @@ pub fn is_decoy_contig(reference: &crate::fasta::Reference, contig: u32) -> bool
         .contigs
         .get(contig as usize)
         .is_some_and(|c| c.name.starts_with("decoy_"))
-}
-
-/// Public wrapper of [`ref_m_blocks`] for sibling crates (verify's column
-/// mapping tests).
-pub fn ref_m_blocks_public(pos: u32, cigar: &[CigarOp]) -> Vec<(u32, u32)> {
-    ref_m_blocks(pos, cigar)
 }
 
 /// Reference-side M blocks (spliced gaps excluded) of a placement, as

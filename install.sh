@@ -9,9 +9,9 @@
 #   ESPERANTO_TARBALL local tarball path (skips download when set)
 set -eu
 
-VERSION="v1.0.6"
+VERSION="v1.1.0"
 ARCH="linux-x86_64"
-PKG_BASE="esperanto-1.0.6-${ARCH}"
+PKG_BASE="esperanto-1.1.0-${ARCH}"
 
 # CPU build selection: prefer the AVX2-optimized (-v3) build when the local
 # CPU supports it, fall back to the portable baseline build.

@@ -94,22 +94,9 @@ impl TranscriptRecord {
         Ok(())
     }
 
-    /// Intron pairs between transcription-adjacent exons, stored RAW as
-    /// `(exon[i].g_end, exon[i+1].g_start)` — the reference tool's exact
-    /// representation. On the plus strand this is the legal forward intron
-    /// `(start, end)`; on the minus strand (exons genomically descending) it
-    /// is the inverted pair `(end, start)`. The inverted entries are kept
-    /// bug-compatibly: they are part of the serialized junction table.
-    /// Intron pairs between transcription-adjacent exons as FORWARD 0-based
-    /// half-open intervals `(start, end)` with `start <= end`, independent of
-    /// strand. The old tool stored raw transcription-order pairs, which for
-    /// minus-strand transcripts (exons genomically descending) produced
-    /// inverted `(end, start)` entries that could never match the forward
-    /// intron queries used by junction-support scoring — minus-strand
-    /// annotated junctions silently contributed zero support. ESPERANTO
-    /// 1.0.0 normalizes (scientific-priority deviation, see
-    /// docs/SCIENCE-DEVIATIONS.md); the reader still accepts legacy inverted
-    /// entries and normalizes on load.
+    /// Intron pairs between transcription-adjacent exons as forward
+    /// 0-based half-open intervals `(start, end)`, with `start <= end` on
+    /// either strand. Junction-support queries use the same convention.
     pub fn introns(&self) -> Vec<(u32, u32)> {
         self.exons
             .windows(2)

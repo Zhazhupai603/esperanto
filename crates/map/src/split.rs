@@ -19,14 +19,14 @@ use crate::index::Index;
 use crate::intron_chain::cigar_conserving;
 use crate::seed::{minimizers, SeedParams, Strand};
 use crate::splice::{
-    junction_signal, lib_window_candidates, refine_junction, s14_pass, splice_signal, tail_gate,
+    junction_signal, lib_window_candidates, refine_junction, splice_support_pass, splice_signal, tail_gate,
     SpliceParams, SPLIT_COST, SPLIT_LIB_WINDOW,
 };
 
-/// Library-driven tail lower bound (frozen).
+/// Library-driven tail lower bound.
 pub const TAIL_MIN: usize = 7;
 
-/// Tail-start retry radius (parity experiments, frozen: ±5bp).
+/// Tail-start retry radius (±5bp).
 pub const TAIL_RETRY_RADIUS: i64 = 5;
 
 /// Direct-scan channel tail length range (5..19bp; tails ≥ 19 bp reach the
@@ -190,9 +190,7 @@ pub fn retry_tail_start(
             num: 1,
             den: 1,
         };
-        crate::prof::dp_call(crate::prof::DP_TAIL);
         let le = extend_hint(lseg, &lwin, extend_params, buf, hint);
-        crate::prof::dp_call(crate::prof::DP_TAIL);
         let re = extend_hint(rseg, &rwin, extend_params, buf, hint);
         let l_aligned = le.read_end.saturating_sub(le.read_start) as usize;
         let r_aligned = re.read_end.saturating_sub(re.read_start) as usize;
@@ -349,7 +347,6 @@ pub(crate) fn extend_tail(
         return None;
     }
     let win = ctg.slice_ascii(win_lo, win_hi);
-    crate::prof::dp_call(crate::prof::DP_TAIL);
     let ext = extend_hint(
         tail,
         &win,
@@ -585,9 +582,6 @@ fn channel_b(ctx: &SplitContext, right: bool, buf: &mut ExtendBuffer) -> Option<
             }
         }
     }
-    if std::env::var_os("ESP_PROBE").is_some() {
-        eprintln!("[probe-cb] right={right} tail={tl} best={best:?}");
-    }
     let (scan_score, start, end, over) = best?;
     let intron_len = end - start;
 
@@ -612,9 +606,6 @@ fn channel_b(ctx: &SplitContext, right: bool, buf: &mut ExtendBuffer) -> Option<
         (lo, hi)
     };
     let ext_res = extend_tail(ctg, ext_tail, win_lo, win_hi, &ctx.extend_params, buf);
-    if std::env::var_os("ESP_PROBE").is_some() {
-        eprintln!("[probe-cb] start={start} end={end} over={over} ext={}", ext_res.as_ref().map_or("None".to_string(), |(_, e)| format!("score={} ref_start={}", e.score, e.ref_start)));
-    }
     let (_, ext) = ext_res?;
     let signal = splice_signal(
         dinuc_after(&win, scan_lo, start),
@@ -656,7 +647,7 @@ fn channel_b(ctx: &SplitContext, right: bool, buf: &mut ExtendBuffer) -> Option<
 /// Channel C (seed-driven, empty library only): seed the tail, map its first
 /// minimizers through the index, keep hits on the same contig/strand falling
 /// in the min/max intron window across the body edge, refine with
-/// `refine_junction` + S14, extension-validate. First success (deterministic
+/// `refine_junction` + splice support gates, extension-validate. First success (deterministic
 /// candidate order) wins.
 fn channel_c(ctx: &SplitContext, right: bool, buf: &mut ExtendBuffer) -> Option<SplitRescue> {
     let index = ctx.index?;
@@ -731,7 +722,7 @@ fn channel_c(ctx: &SplitContext, right: bool, buf: &mut ExtendBuffer) -> Option<
             continue;
         };
         let intron_len = refined.junction.end - refined.junction.start;
-        if !s14_pass(intron_len, refined.signal, refined.known_support) {
+        if !splice_support_pass(intron_len, refined.signal, refined.known_support) {
             continue;
         }
         let (win_lo, win_hi) = if right {
@@ -779,9 +770,6 @@ pub fn rescue_right_tail(ctx: &SplitContext, buf: &mut ExtendBuffer) -> Option<S
     let tail_len = ctx.read.len() - ctx.read_end as usize;
     if tail_len < TAIL_MIN {
         return None;
-    }
-    if std::env::var_os("ESP_PROBE").is_some() && !ctx.lib.is_empty() {
-        eprintln!("[probe-tail] rescue_right_tail tail_len={tail_len} read_end={} lib_empty={}", ctx.read_end, ctx.lib.is_empty());
     }
     if !ctx.lib.is_empty() {
         // Library first (high-confidence); fall back to de-novo scan/seed

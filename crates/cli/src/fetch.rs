@@ -184,13 +184,7 @@ pub fn file(url: &str, dest: &Path) -> anyhow::Result<()> {
 
 /// Fetch one chunk into its file offset. Read errors (connection drops
 /// mid-body) and short bodies are errors -> the caller retries the chunk.
-fn try_chunk(
-    a: &ureq::Agent,
-    url: &str,
-    dest: &Path,
-    start: u64,
-    end: u64,
-) -> anyhow::Result<()> {
+fn try_chunk(a: &ureq::Agent, url: &str, dest: &Path, start: u64, end: u64) -> anyhow::Result<()> {
     let resp = a
         .get(url)
         .header("Range", format!("bytes={start}-{end}"))
@@ -222,19 +216,3 @@ fn try_chunk(
     }
     Ok(())
 }
-
-/// Try each mirror in order; the first successful download wins.
-pub fn from_mirrors(mirrors: &[&str], dest: &Path) -> anyhow::Result<()> {
-    let mut last = String::new();
-    for url in mirrors {
-        match file(url, dest) {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                last = format!("{url}: {e}");
-                eprintln!("[fetch] mirror failed, trying next: {last}");
-            }
-        }
-    }
-    Err(anyhow!("all mirrors failed; last: {last}"))
-}
-

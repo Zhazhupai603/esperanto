@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use clap::Args;
-use esperanto_qc::{OutFormat, PolygMode, QcParams};
+use esperanto_qc::{PolygMode, QcParams};
 
 #[derive(Args)]
 pub struct QcArgs {
@@ -67,9 +67,6 @@ pub struct QcArgs {
     /// Worker threads (0 = all cores).
     #[arg(long, default_value_t = 0)]
     threads: usize,
-    /// Output format.
-    #[arg(long, default_value = "fqgz", value_parser = ["fqgz", "bfq"])]
-    format: String,
 }
 
 pub fn run(a: QcArgs) -> anyhow::Result<()> {
@@ -104,11 +101,6 @@ pub fn run(a: QcArgs) -> anyhow::Result<()> {
     p.keep_unpaired = a.keep_unpaired;
     p.detect_adapter_se = a.detect_adapter_se;
     p.threads = crate::resolve::threads(a.threads);
-    p.out_format = if a.format == "bfq" {
-        OutFormat::Bfq
-    } else {
-        OutFormat::Fqgz
-    };
     esperanto_qc::run(&p)?;
     Ok(())
 }

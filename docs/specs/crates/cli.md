@@ -1,153 +1,60 @@
-# cli — command-line shell (bin `esperanto`, zero-config resolution)
+# cli — command-line interface
 
-Thin orchestration layer: parse arguments → zero-config fill-in → dispatch to each crate entry. **Zero scientific semantics**; all numeric/byte contracts belong to the stage crates and flow. 1.0.0 ships 7 subcommands: index / qc / map / pile / scan / score / run.
+The `esperanto` executable parses arguments, resolves reference and model paths, and delegates to library crates. `--threads 0` selects the available worker count.
 
-## Subcommands and parameters
+## Commands
 
-Conventions: `--threads` 0 = all cores (converted to the actual core count before dispatch); repeatable parameters may be comma-separated or given multiple times.
+| Command | Required arguments | Optional arguments and behavior |
+|---|---|---|
+| `setup` | None | `--force`, `--no-decoys`; prepare reference files and indexes |
+| `index` | `--fasta`, `--out` | `--gtf`, `--k` (15), `--w` (5), repeatable `--decoy`; build alignment indexes |
+| `run` | `--out` and FASTQ or BAM input | `--r1`, `--r2`, `--bam`, `--sites`, `--index`, `--fasta`, `--gtf`, `--bundle`, `--l1-bundle`, `--sample`, `--threads`, `--stop-after` |
+| `resume` | Run directory | Validate and continue a compatible interrupted run |
+| `map` | `--r1`, `--index`, `--out` | `--r2`, `--gtf`, `--l1-bundle`, `--threads`; write unsorted BAM |
+| `scan` | `--bam`, `--out` | `--fasta`, `--threads`; unified candidate discovery |
+| `score` | `--bam`, `--sites`, `--out` | `--fasta`, `--bundle`, `--threads`; unified classifier scores |
+| `report` | `--out` | `--fasta`, `--gtf`; regenerate HTML from a finished run |
+| `update` | None | `--check` reports availability; `--yes` confirms installation |
+| `delete` | `refs`, `bundle`, or `all` | `--yes` confirms removal |
 
-### index — build the paidx alignment index (→ `map::index_io::save`)
+`index --gtf` builds the L1 `.bndl` and `.tidx` files alongside the `.paidx`. The A-to-G and T-to-C transformed rescue indexes use `.ag.paidx` and `.tc.paidx`. `map` writes `raw.bam`, `unmapped.fq.gz`, `align_qc.json`, and discovered junctions. `run` performs the subsequent coordinate sort and indexing.
 
-| flag | type | default | meaning |
-|---|---|---|---|
-| `--fasta` | PathBuf | **required** | reference FASTA |
-| `--out` | PathBuf | **required** | output paidx index path |
-| `--gtf` | PathBuf | optional | transcript annotation; also builds the L1 bundle (`<out stem>.bndl` + `<out stem>.tidx`) |
-| `--k` | u32 | 15 | k-mer length (must match alignment time) |
-| `--w` | u32 | 5 | window size (number of k-mers) |
+## QC command
 
-The produced paidx connects directly to `run`/`map`'s `--index`; `rna_default`'s seed parameters are exactly k=15/w=5. Every build also writes `<out stem>.cpaidx` (collapsed-alphabet index, k=31/w=10) — the map-stage rescue index.
+`qc --r1 <FASTQ> --out <directory>` accepts optional `--r2`; multiple lanes are supplied as repeated or comma-separated input arguments. Reads are written as gzip-compressed FASTQ.
 
-### qc — FASTQ quality control (→ `qc::run`)
+| Option | Default |
+|---|---|
+| `--adapter-r1`, `--adapter-r2` | Built-in adapter handling |
+| `--disable-adapter-trim`, `--disable-pe-overlap` | false |
+| `--qtrim` | false |
+| `--qtrim-cutoff` | 20 |
+| `--trim-front1`, `--trim-front2`, `--trim-tail1`, `--trim-tail2` | 0 |
+| `--polyg` | auto |
+| `--min-len` | 15 |
+| `--n-max` | 5 |
+| `--q15-frac-max` | 0.4 |
+| `--keep-unpaired`, `--detect-adapter-se` | false |
+| `--threads` | 0 |
 
-| flag | type | default | meaning |
-|---|---|---|---|
-| `--r1` | Vec\<PathBuf\> | **required** | R1 input (multiple lanes merged in order) |
-| `--r2` | Vec\<PathBuf\> | empty=SE | R2 (same length as r1) |
-| `--out` | PathBuf | **required** | output directory |
-| `--adapter-r1` / `--adapter-r2` | Vec\<String\> | built-in table | override adapter table |
-| `--disable-adapter-trim` | bool | false | disable adapter trimming |
-| `--disable-pe-overlap` | bool | false | disable PE overlap trimming |
-| `--qtrim` / `--qtrim-cutoff` | bool / u8 | false / 20 | 3' quality trimming |
-| `--trim-front1/2` `--trim-tail1/2` | usize | 0 | fixed-length front/back trimming |
-| `--polyg` | auto\|on\|off | auto | polyG mode |
-| `--min-len` | usize | 15 | minimum length |
-| `--n-max` | usize | 5 | max N count |
-| `--q15-frac-max` | f64 | 0.4 | max fraction of Q<15 |
-| `--keep-unpaired` | bool | false | keep the passing mate when one PE mate fails |
-| `--detect-adapter-se` | bool | false | SE adapter auto-detection |
-| `--threads` | usize | 0 | threads |
-| `--format` | fqgz\|bfq | fqgz | output format |
+## Discovery and scoring
 
-### map — alignment (→ `map::pipeline::run_se_2pass` / `run_pe_2pass`)
+`scan` uses the same observation filters as the scorer: MAPQ at least 20, BQ at least 13, and exclusion of unmapped, secondary, and supplementary alignments. Reference A/T positions with one or more editing-consistent observations are emitted. Thresholds are part of the model contract.
 
-| flag | type | default | meaning |
-|---|---|---|---|
-| `--r1` / `--r2` | PathBuf | r1 **required**, r2 empty=SE | input FASTQ |
-| `--index` | PathBuf | **required** | paidx index |
-| `--gtf` | PathBuf | None | sjdb junction library |
-| `--l1-bundle` | PathBuf | None | L1 engine bundle (`engine::L1Index::open`) |
-| `--out` | PathBuf | **required** | output directory |
-| `--threads` | usize | 0 | threads |
+`score` reads a headerless `chrom<TAB>pos` file with 1-based positive positions and writes `chrom<TAB>pos<TAB>score` in input order. The model bundle must contain `model.txt`, `freeze.json`, and `alu.bed`.
 
-Behavior contract: `AlignConfig::rna_default()` unchanged (`extend.edit_dir = EditDir::Off` — Tier 1 is strict; the editing exemption belongs to the Tier-2 rescue in flow); RNA always 2-pass; `jkmer=None`. Fixed artifact names: `raw.bam` (streamed, unsorted; sorting happens in run's sort step) + `unmapped.fq.gz` + `align_qc.json` + `align.baln`.
+## Path resolution
 
-### pile — pileup features (→ `pile::extract_pileup_features[_batch]`)
+Explicit paths take precedence. Discovery only fills missing values.
 
-| flag | type | default | meaning |
-|---|---|---|---|
-| `--bam` | PathBuf | **required** | BAM (requires .bai/.csi) |
-| `--chrom` + `--pos` | String / i64 | single-site mode | 1-based site |
-| `--sites` | PathBuf | batch mode | `chrom\tpos` (1-based) file |
-| `--out` | PathBuf | stdout | output TSV |
-| `--min-mapq` | u8 | 20 | reads below this MAPQ do not count |
+Model resolution checks `ESPERANTO_BUNDLE`, the source-tree bundle, bundle directories beside the executable or its parent, and the user-data bundle. The bundled model path is `bundle/human/esperanto-model-v1.1.0/rust`. An unresolved bundle is an error listing attempted paths.
 
-Single-site and batch are mutually exclusive; giving both is an error. Output columns: `chrom pos depth A_count C_count G_count T_count mean_base_quality strand_bias mean_mapq hyperedited` (FEATURE_NAMES order, values Display); batch output row order = input order.
+Reference resolution checks `ESPERANTO_REFS`, `refs` beside the executable or its parent, the user-data `refs` directory, and `./refs`. FASTA selection prefers `hg38.fa`; other eligible files are selected in sorted filename order. FASTA files require matching `.fai` indexes.
 
-### scan — candidate-site discovery (→ `scan::run_call`)
+User data resides under `ESPERANTO_HOME` when set, otherwise under `$XDG_DATA_HOME/esperanto`, or `$HOME/.local/share/esperanto`. `setup` honors `ESPERANTO_REFS` for reference installation.
 
-| flag | type | default | meaning |
-|---|---|---|---|
-| `--bam` | PathBuf | **required** | input BAM (sorted, indexed) |
-| `--out` | PathBuf | **required** | candidates.bed |
-| `--fasta` | PathBuf | refs probing by default | reference (needs .fai) |
-| `--min-mapq` | u8 | 20 | reads below this MAPQ do not count |
-| `--min-bq` | u8 | 30 | bases below this quality do not count |
-| `--min-depth` | u32 | 10 | minimum counted depth |
-| `--min-edit-reads` | u32 | 2 | minimum editing-consistent alternate reads |
-| `--min-edit-freq` | f64 | 0.01 | minimum editing-consistent alternate frequency |
-| `--threads` | usize | 0 | threads |
+An explicit L1 bundle or `ESPERANTO_L1_BUNDLE` takes precedence over the bundle next to the alignment index. The bundle needs its matching `.tidx` sidecar. Missing automatic discovery leaves genomic alignment available.
 
-### score — RE_PROB scoring (→ `score::pipeline::score_sites_batched`)
+## Exit behavior
 
-| flag | type | default | meaning |
-|---|---|---|---|
-| `--bam` | PathBuf | **required** | BAM (requires index) |
-| `--sites` | PathBuf | **required** | `chrom\tpos` 1-based (pos ≥ 1, validated at library level) |
-| `--fasta` | PathBuf | refs probing by default | reference (needs .fai) |
-| `--bundle` | PathBuf | zero-config 5-level | model bundle root |
-| `--out` | PathBuf | **required** | TSV `chrom\tpos\tprob` |
-| `--threads` | usize | 0 | threads |
-
-### run — full-pipeline orchestration (→ `flow::run_pipeline`)
-
-| flag | type | default | meaning |
-|---|---|---|---|
-| `--r1` / `--r2` | Vec\<PathBuf\> | entry derivation | FASTQ (multi-lane) |
-| `--bam` | PathBuf | entry derivation | input BAM (must be sorted + indexed) |
-| `--sites` | PathBuf | entry derivation | user sites (BamSites) |
-| `--index` | PathBuf | required for FASTQ entries | paidx |
-| `--fasta` | PathBuf | refs probing by default | reference (needs .fai) |
-| `--gtf` | PathBuf | None (refs probing by default) | annotation |
-| `--bundle` | PathBuf | zero-config 5-level | model bundle |
-| `--l1-bundle` | PathBuf | None | L1 engine |
-| `--out` | PathBuf | **required** | output root |
-| `--threads` | usize | 0 | threads |
-| `--batch` | usize | 256 | score batch |
-| `--hybrid` | Option\<String\> | None | knock-in mouse run: comma-separated human gene symbols spliced onto the mouse reference; bare `--hybrid` opens the interactive gene picker |
-
-Entry derivation / species guardrail / stage paths / VCF contract all belong to the flow spec.
-
-## Zero-config resolution
-
-Everything follows "explicit flag first; probing only fills blanks". The first level that hits stops the search; if all levels miss → English error listing the attempted paths, exit code 1.
-
-### bundle (5 levels, used by run / score)
-
-1. `ESPERANTO_BUNDLE` environment variable;
-2. `CARGO_MANIFEST_DIR/../../../bundle/human/esperanto-model-v1.7.0/rust` (source tree);
-3. `<exe>/bundle/human/esperanto-model-v1.7.0/rust` and `<exe>/../bundle/human/esperanto-model-v1.7.0/rust` (release package);
-4. `~/.local/share/esperanto/bundle/bundle/human/esperanto-model-v1.7.0/rust`;
-5. No hit → error.
-
-Validity at each level: the directory contains `net_main.safetensors`.
-
-### refs (4 levels, used by run's fasta/gtf/index, scan's fasta and score's fasta)
-
-1. `ESPERANTO_REFS`; 2. `<exe>/refs` and `<exe>/../refs`; 3. `~/.local/share/esperanto/refs`; 4. `./refs`.
-
-Directory validity: contains a `*.fa` with a same-named `.fai`. File location: fasta = `hg38.fa` preferred, otherwise the first `*.fa` in lexicographic order; gtf = first `*.gtf`; index = first `*.paidx`. **Only fills blanks; never overrides explicit values.**
-
-
-## Exit codes and errors
-
-- 0 success; 1 runtime error (downstream crate errors propagate verbatim through anyhow without swallowing semantics; zero-config failures list candidate paths); 2 argument error (clap).
-- All user-facing strings are in English; `--help` on every subcommand exits 0.
-
-## Determinism
-
-cli itself writes no wall-clock/random quantities into any artifact; artifact byte contracts belong to each crate / flow.
-
-## Out of scope (1.0.0)
-
-- realign / report (not ported; defined in the flow spec); ui / web / fetch-refs / build-ref / bfq2fq (BACKLOG).
-- config/preset YAML four-layer merge (BACKLOG); resume / --only / --stop-after (BACKLOG); `--keep-*` cleanup switches (BACKLOG); run's --name.
-- The map subcommand does not emit sorted.bam (sorting belongs to run's sort step; use run when a sorted BAM is needed).
-
-## Self-checks
-
-- Every subcommand `--help` exits 0; illegal entry combinations (e.g., r1 and bam both given) exit 1 with a message identifying the fields.
-- `ESPERANTO_BUNDLE` pointing to a valid bundle → score/run can run without `--bundle`; all 5 levels missing → error listing paths, exit 1.
-- `ESPERANTO_REFS` pointing to a valid directory → run can run without `--fasta`; an explicit `--fasta` is never overridden.
-- run FastqSe / BamSites and direct library calls with the same input → final artifacts byte-identical.
-- `cargo clippy -p esperanto-cli -- -D warnings` zero warnings.
+Exit status is 0 on success, 1 on a runtime error, and 2 on an argument parsing error. Error messages identify the relevant path or value. `update` and `delete` require confirmation unless `--yes` is supplied; noninteractive invocation without confirmation does not mutate the installation.

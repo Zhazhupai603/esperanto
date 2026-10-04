@@ -22,7 +22,7 @@ pub enum CigarOp { Match(u32), RefSkip(u32) }               // extensible; two k
 `TxMap::project(tx_id, tx_start, len) -> Option<(contig_id, genomic_start, Vec<CigarOp>)>`
 
 - `len==0` or `tx_start >= tx_len` → `None`
-- **Overhang clamping**: when `tx_start+len > tx_len`, truncate at the transcript end (does not return None); design rationale: reads with poly(A) tails / slight overextension are real
+- **Overhang clamping**: when `tx_start+len > tx_len`, truncate at the transcript end (does not return None); overhanging intervals are truncated to the available transcript sequence
 - Walk the exons and compute the intersection of `[tx_start, end)` with each exon's transcript interval:
   - plus strand: `(exon.g_start + r_lo, exon.g_start + r_hi)`
   - minus strand: reflect within the exon `(exon.g_end - r_hi, exon.g_end - r_lo)`
@@ -83,15 +83,8 @@ Same GENCODE semantics as the tidx crate (1-based→0-based half-open, aggregate
 - Minus-strand reflection: tx=0 maps to the end of the rightmost exon
 - Attribution: identical projections merged; junction support count decides; ties → MAPQ=0
 
-## Corrections from differential testing against the legacy binary
+## GTF selection and normalization
 
-1. transcript_type whitelist: keep only `protein_coding` and `lncRNA` (fall back to gene_type when transcript_type is missing).
-2. TranscriptRecord.name = transcript_id (not transcript_name).
-3. Exons are stored in ascending exon_number order (= transcript order), deduplicated across rows with the same (start,end); when exon_number is non-monotonic, fall back to genomic sort (reversed for the minus strand).
-4. The junction table stores raw transcript-order pairs (exon[i].g_end, exon[i+1].g_start) — the minus strand produces inverted (end,start) intervals, **stored as-is without normalization** (bug compatibility, part of the serialization format).
-5. strand "." is accepted and treated as the plus strand.
-6. Both transcript lines and exon lines are consumed; exon-only transcripts without a transcript line are dropped.
+The GTF loader retains protein-coding and lncRNA transcripts, using `gene_type` when `transcript_type` is absent. Transcript identifiers are stored as names. Both transcript and exon rows are required; exon-only transcripts are omitted. Strand `.` is interpreted as plus.
 
-## Correction to fix #4 (science-first ruling)
-
-Inverted junctions were originally ruled "keep for bug compatibility" — after scientific review this was changed to **normalized forward intervals**: under the legacy semantics, minus-strand annotated splice sites could never match in junction support, which is a genuine scientific defect; model features do not pass through txmap, so fixing this does not affect the gold standard. The read side stays compatible with old files (normalize on load). chr22 verification: the old and new sets are element-wise equivalent after normalization (6422/6422, 3424 inverted intervals normalized, 0 lost).
+Exons are deduplicated by interval and ordered by exon number when consistent; otherwise they use genomic order, reversed on minus-strand transcripts. Junction intervals are normalized to forward coordinates during loading and construction.

@@ -30,24 +30,10 @@ pub struct IndexArgs {
     /// three-letter rescue indexes and the L1 bundle exclude them.
     #[arg(long = "decoy")]
     decoys: Vec<PathBuf>,
-    /// Also build the negative-control rescue alphabet indexes
-    /// (`<out stem>.ac.paidx` A->C, `<out stem>.tg.paidx` T->G, k=31/w=10).
-    #[arg(long)]
-    rescue_control: bool,
-    /// Build only the rescue alphabet indexes (all four), leaving an
-    /// existing paidx untouched.
-    #[arg(long)]
-    rescue_only: bool,
 }
 
 pub fn run(a: IndexArgs) -> anyhow::Result<()> {
-    if a.rescue_only {
-        // Rescue indexes only (the paidx already exists; decoys never enter
-        // the rescue alphabets, so the plain FASTA is the right source).
-        let bytes = std::fs::read(&a.fasta).map_err(|e| anyhow::anyhow!("read fasta: {e}"))?;
-        return build_rescue_indexes(&bytes, &a.out, true);
-    }
-    build_all(&a.fasta, a.gtf.as_deref(), &a.decoys, &a.out, a.k, a.w, a.rescue_control)
+    build_all(&a.fasta, a.gtf.as_deref(), &a.decoys, &a.out, a.k, a.w)
 }
 
 /// Concatenate decoy FASTAs onto the main one, forcing the `decoy_` contig
@@ -129,7 +115,6 @@ pub(crate) fn build_all(
     out: &std::path::Path,
     k: u32,
     w: u32,
-    rescue_control: bool,
 ) -> anyhow::Result<()> {
     let bytes = std::fs::read(fasta).map_err(|e| anyhow::anyhow!("read fasta: {e}"))?;
     // Decoys join the paidx only: the rescue indexes below transform the
@@ -139,8 +124,8 @@ pub(crate) fn build_all(
     } else {
         with_decoys(&bytes, decoys)?
     };
-    let reference = fasta::parse_fasta_bytes(&combined)
-        .map_err(|e| anyhow::anyhow!("parse fasta: {e}"))?;
+    let reference =
+        fasta::parse_fasta_bytes(&combined).map_err(|e| anyhow::anyhow!("parse fasta: {e}"))?;
     let idx = index::Index::build(reference, SeedParams { k, w });
     index_io::save(&idx, out).map_err(|e| anyhow::anyhow!("save paidx: {e}"))?;
     if !decoys.is_empty() {
@@ -154,7 +139,7 @@ pub(crate) fn build_all(
     } else {
         eprintln!("[index] wrote {}", out.display());
     }
-    build_rescue_indexes(&bytes, out, rescue_control)?;
+    build_rescue_indexes(&bytes, out)?;
     if let Some(gtf) = gtf {
         // The L1 runtime needs BOTH the .bndl (projection + sequences) and its
         // .tidx sidecar (k-mer index) — keep all three artifacts together.
@@ -181,19 +166,10 @@ pub(crate) fn build_all(
     Ok(())
 }
 
-/// The three-letter rescue indexes (`ag`/`tc`, plus `ac`/`tg` when
-/// `rescue_control`): the main reference bytes transformed per alphabet,
+/// The three-letter rescue indexes (`ag`/`tc`): reference sequence transformed per alphabet,
 /// k=31/w=10, decoys never included.
-fn build_rescue_indexes(
-    bytes: &[u8],
-    out: &std::path::Path,
-    rescue_control: bool,
-) -> anyhow::Result<()> {
-    let mut rescue: Vec<(u8, u8, &str)> = vec![(b'A', b'G', "ag.paidx"), (b'T', b'C', "tc.paidx")];
-    if rescue_control {
-        // Negative-control alphabets: transforms editing cannot produce.
-        rescue.extend([(b'A', b'C', "ac.paidx"), (b'T', b'G', "tg.paidx")]);
-    }
+fn build_rescue_indexes(bytes: &[u8], out: &std::path::Path) -> anyhow::Result<()> {
+    let rescue: Vec<(u8, u8, &str)> = vec![(b'A', b'G', "ag.paidx"), (b'T', b'C', "tc.paidx")];
     for (from, to, ext) in rescue {
         let tref = fasta::parse_fasta_bytes(&transform_fasta_bytes(bytes, from, to))
             .map_err(|e| anyhow::anyhow!("parse {ext} fasta: {e}"))?;

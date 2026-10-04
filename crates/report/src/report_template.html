@@ -492,7 +492,7 @@
               <thead>
                 <tr>
                   <th>Position</th>
-                  <th>Probability</th>
+                  <th>Score</th>
                   <th>VAF</th>
                   <th>Depth</th>
                   <th>Status</th>
@@ -523,7 +523,7 @@
                 <th>Gene</th>
                 <th>Change</th>
                 <th>Location</th>
-                <th>Probability</th>
+                <th>Score</th>
                 <th>VAF</th>
                 <th>Depth</th>
                 <th>Status</th>
@@ -589,16 +589,10 @@
       return { chrX: 23, chrY: 24, chrM: 25 }[c] ?? 99;
     };
 
-    async function init() {
+    function init() {
       try {
-        if (typeof EMBEDDED_DATA !== 'undefined') {
-          reportData = EMBEDDED_DATA;
-        } else {
-          const res = await fetch('data.json');
-          if (!res.ok) throw new Error('Failed to load data.json');
-          reportData = await res.json();
-        }
-        
+        reportData = EMBEDDED_DATA;
+
         // Sort chroms
         reportData.chroms.sort((a, b) => chromRank(a.chrom) - chromRank(b.chrom));
         
@@ -615,7 +609,7 @@
         document.getElementById('loading-state').style.display = 'none';
         const errDiv = document.getElementById('error-state');
         errDiv.style.display = 'block';
-        errDiv.innerHTML = `<strong>Error loading data:</strong> ${err.message}<br><br>Please ensure you are serving this folder with a local web server, e.g., <code>python3 -m http.server</code>`;
+        errDiv.textContent = `Unable to render this report: ${err.message}`;
       }
     }
 
@@ -627,9 +621,6 @@
         { label: 'Recoded proteins', value: formatNumber(reportData.metrics.recodings), tip: 'Number of amino acid changes caused by editing.' },
         { label: 'Rescued hyperedited reads', value: formatNumber(reportData.metrics.rescued), tip: 'Reads with dense editing rescued by the hyperediting pipeline.' }
       ];
-      if (reportData.metrics.unscored > 0) {
-        metrics.push({ label: 'Unscored (no matching model)', value: formatNumber(reportData.metrics.unscored), tip: 'Sites on contigs without a matching scoring model (hybrid reference).' });
-      }
       
       document.getElementById('metrics-container').innerHTML = metrics.map(m => `
         <div class="card">
@@ -801,20 +792,20 @@
       drawL2();
       
       // Info panel: top genes in this chromosome
-      const genesInChrom = reportData.genes.filter(g => g.chrom === chrom).sort((a, b) => b.maxprob - a.maxprob).slice(0, 10);
+      const genesInChrom = reportData.genes.filter(g => g.chrom === chrom).sort((a, b) => b.maxscore - a.maxscore).slice(0, 10);
       
       document.getElementById('info-panel').innerHTML = `
         <h3 class="section-title" style="font-size: 16px;">Top Genes in ${chrom}</h3>
         <div class="table-container">
           <table class="sites-table">
-            <thead><tr><th>Gene</th><th>Sites</th><th>Confident</th><th>Max Prob</th></tr></thead>
+            <thead><tr><th>Gene</th><th>Sites</th><th>Confident</th><th>Max Score</th></tr></thead>
             <tbody>
               ${genesInChrom.map(g => `
                 <tr class="clickable" onclick="selectGeneByName('${g.gene}')">
                   <td>${g.gene}${g.has_hyper ? '<span class="hyper-mark" title="overlaps a hyperedited region">◆</span>' : ''}</td>
                   <td>${g.n}</td>
                   <td>${g.pass}</td>
-                  <td>${g.maxprob.toFixed(3)}</td>
+                  <td>${g.maxscore.toFixed(3)}</td>
                 </tr>
               `).join('')}
               ${genesInChrom.length === 0 ? '<tr><td colspan="4" class="empty-state" style="padding: 24px;">No genes found in this chromosome</td></tr>' : ''}
@@ -1031,13 +1022,13 @@
             <h3 class="section-title" style="font-size: 16px;">Sites in Window</h3>
             <div class="table-container" style="max-height: 300px; overflow-y: auto;">
               <table class="sites-table">
-                <thead><tr><th>Pos</th><th>Gene</th><th>Prob</th><th>VAF</th><th>Depth</th><th>Status</th></tr></thead>
+                <thead><tr><th>Pos</th><th>Gene</th><th>Score</th><th>VAF</th><th>Depth</th><th>Status</th></tr></thead>
                 <tbody>
                   ${sites.map(s => `
                     <tr ${highlightPos === s[0] ? 'style="background: var(--accent-muted);"' : ''}>
                       <td>${formatNumber(s[0])}</td>
                       <td>${s[5] || '-'}${s[6] ? '<span class="hyper-mark" title="overlaps a hyperedited region">◆</span>' : ''}</td>
-                      <td>${s[1] == null ? 'NA' : s[1].toFixed(3)}</td>
+                      <td>${s[1].toFixed(3)}</td>
                       <td>${s[2].toFixed(3)}</td>
                       <td>${s[3]}</td>
                       <td><span class="badge ${s[4] ? 'pass' : 'fail'}">${s[4] ? 'Pass' : 'Filtered'}</span></td>
@@ -1085,7 +1076,7 @@
       const circles = sites.map(s => {
         const pos = s[0];
         if (pos < xMin || pos > xMax) return '';
-        const prob = s[1];
+        const score = s[1];
         const vaf = s[2];
         const depth = s[3];
         const pass = s[4];
@@ -1096,7 +1087,7 @@
         const cy = height - padBottom - (vaf * (height - padding - padBottom));
         const r = 3 + (depth / maxDepth) * 5;
         const fill = pass ? (hyper ? '#dc2626' : 'var(--accent)') : '#d1d5db';
-        const tip = `Pos: ${formatNumber(pos)} | Gene: ${gene || 'Intergenic'} | Prob: ${prob == null ? 'NA' : prob.toFixed(3)} | VAF: ${vaf.toFixed(3)} | Depth: ${depth}${hyper ? ' | hyperedited' : ''}`;
+        const tip = `Pos: ${formatNumber(pos)} | Gene: ${gene || 'Intergenic'} | Score: ${score.toFixed(3)} | VAF: ${vaf.toFixed(3)} | Depth: ${depth}${hyper ? ' | hyperedited' : ''}`;
         
         let highlight = '';
         if (highlightPos && pos === highlightPos) {
@@ -1284,11 +1275,11 @@
       document.getElementById('gene-view').style.display = 'block';
 
       document.getElementById('gene-name').innerHTML = gene.gene + (gene.has_hyper ? '<span class="hyper-mark" title="overlaps a hyperedited region">◆</span>' : '');
-      document.getElementById('gene-summary').textContent = `${gene.n} sites (${gene.pass} confident) • Max prob: ${gene.maxprob.toFixed(3)}`;
+      document.getElementById('gene-summary').textContent = `${gene.n} sites (${gene.pass} confident) • Max score: ${gene.maxscore.toFixed(3)}`;
       
       let dominantMb = 0;
       if (gene.sites.length > 0) {
-        const topSite = gene.sites.reduce((prev, current) => (prev.prob > current.prob) ? prev : current);
+        const topSite = gene.sites.reduce((prev, current) => (prev.score > current.score) ? prev : current);
         dominantMb = Math.floor(topSite.pos / 1000000);
       } else {
         dominantMb = Math.floor(gene.start / 1000000);
@@ -1355,7 +1346,7 @@
       tbody.innerHTML = gene.sites.map(s => `
         <tr>
           <td>${formatNumber(s.pos)}</td>
-          <td>${s.prob.toFixed(3)}</td>
+          <td>${s.score.toFixed(3)}</td>
           <td>${s.vaf.toFixed(3)}</td>
           <td>${s.depth}</td>
           <td><span class="badge ${s.pass ? 'pass' : 'fail'}">${s.pass ? 'Pass' : 'Filtered'}</span></td>
@@ -1379,7 +1370,7 @@
       const circles = sites.map(s => {
         const pos = s.pos;
         if (pos < xMin || pos > xMax) return '';
-        const prob = s.prob;
+        const score = s.score;
         const vaf = s.vaf;
         const depth = s.depth;
         const pass = s.pass;
@@ -1388,7 +1379,7 @@
         const cy = height - padBottom - (vaf * (height - padding - padBottom));
         const r = 3 + (depth / maxDepth) * 5;
         const fill = pass ? 'var(--accent)' : '#d1d5db';
-        const tip = `Pos: ${formatNumber(pos)} | Prob: ${prob.toFixed(3)} | VAF: ${vaf.toFixed(3)} | Depth: ${depth}`;
+        const tip = `Pos: ${formatNumber(pos)} | Score: ${score.toFixed(3)} | VAF: ${vaf.toFixed(3)} | Depth: ${depth}`;
         
         return `<circle class="track-point" cx="${cx}" cy="${cy}" r="${r}" fill="${fill}" onmouseenter="showTooltip(event, '${tip}')" onmouseleave="hideTooltip()" onmousemove="showTooltip(event, '${tip}')" />`;
       }).join('');
@@ -1524,7 +1515,7 @@
             <td style="font-weight: 500;">${r.gene}${r.has_hyper ? '<span class="hyper-mark" title="overlaps a hyperedited region">◆</span>' : ''}</td>
             <td><span class="chip" style="margin: 0;">${r.change}</span></td>
             <td>${r.chrom}:${formatNumber(r.pos)}</td>
-            <td>${r.prob.toFixed(3)}</td>
+            <td>${r.score.toFixed(3)}</td>
             <td>${r.vaf.toFixed(3)}</td>
             <td>${r.depth}</td>
             <td><span class="badge ${r.pass ? 'pass' : 'fail'}">${r.pass ? 'Pass' : 'Filtered'}</span></td>

@@ -7,7 +7,7 @@ use crate::fasta::{Base, Reference};
 use crate::seed::{minimizers_from_codes, Minimizer, SeedParams, Strand};
 use rayon::prelude::*;
 
-/// Share fraction `HIGH_FREQ_FRAC` (frozen parameter): a k-mer whose hit
+/// Share fraction `HIGH_FREQ_FRAC` (parameter): a k-mer whose hit
 /// count exceeds [`Index::freq_cutoff`] is treated as high-frequency.
 pub const HIGH_FREQ_FRAC: f64 = 0.0002;
 
@@ -271,7 +271,7 @@ fn canonical(kmer: u64, k: u32) -> (u64, Strand) {
 
 /// Emit anchors for one hitting variant round.
 ///
-/// `take` caps the positions consumed (64 for single-site, 32 for double);
+/// `take` caps the positions consumed;
 /// `rev` selects the round: fwd round anchors carry the reference strand,
 /// rev round anchors carry its flip. qpos always follows the anchor strand.
 fn emit_variant_round(
@@ -367,65 +367,4 @@ pub fn collect_anchors_edit_variants(
         }
     }
     (anchors, var_hits)
-}
-
-/// Double-site edit variants (deep fallback): pairs of editable sites
-/// (i < j, each G→A / C→T), two orientation rounds per pair, first 32
-/// positions per round, no `var_hits` accounting, no deduplication (the same
-/// canonical key produced by a different site pair emits again).
-/// Double-site edit variants (deep fallback): pairs of editable sites
-/// (i < j, each G→A / C→T). Per orientation round both slots of that
-/// packing are replaced (rev round carries 3−alt at both, editing the
-/// mirror read positions); no no-op skip; first 32 positions per hitting
-/// round; no var_hits accounting; no deduplication.
-pub fn collect_anchors_edit_variants_double(
-    index: &Index,
-    read_mins: &[Minimizer],
-    read_len: u32,
-    k: u32,
-    occ_cap: u32,
-) -> Vec<crate::seed::Anchor> {
-    let mut anchors = Vec::new();
-    for m in read_mins {
-        let fwd = if m.strand == Strand::Minus {
-            revcomp_kmer(m.kmer, k)
-        } else {
-            m.kmer
-        };
-        let rev = revcomp_kmer(fwd, k);
-        // editable sites in left-to-right (i) order: (slot, alt)
-        let sites: Vec<(usize, u64)> = (0..k as usize)
-            .filter_map(|i| {
-                let slot = (k as usize - 1) - i;
-                match (fwd >> (2 * slot)) & 3 {
-                    2 => Some((slot, 0u64)), // G -> A
-                    1 => Some((slot, 3u64)), // C -> T
-                    _ => None,
-                }
-            })
-            .collect();
-        for a in 0..sites.len() {
-            for b in (a + 1)..sites.len() {
-                let (pa, wa) = sites[a];
-                let (pb, wb) = sites[b];
-                for (packing, rev_round) in [(fwd, false), (rev, true)] {
-                    let (wa2, wb2) = if rev_round {
-                        (3 - wa, 3 - wb)
-                    } else {
-                        (wa, wb)
-                    };
-                    let mut v = packing;
-                    v = (v & !(3 << (2 * pa))) | (wa2 << (2 * pa));
-                    v = (v & !(3 << (2 * pb))) | (wb2 << (2 * pb));
-                    let key = canonical(v, k).0;
-                    let hit = index.query(key);
-                    if hit.count == 0 || hit.count > occ_cap {
-                        continue;
-                    }
-                    emit_variant_round(&mut anchors, hit.positions, m, read_len, k, 32, rev_round);
-                }
-            }
-        }
-    }
-    anchors
 }

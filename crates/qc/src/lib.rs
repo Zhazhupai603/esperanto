@@ -31,7 +31,7 @@ mod trim;
 mod detect;
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -113,16 +113,6 @@ pub enum PolygMode {
     Off,
 }
 
-/// Output format for cleaned reads.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum OutFormat {
-    /// Gzip-compressed FASTQ (`.clean.fq.gz`), one gzip member per chunk.
-    #[default]
-    Fqgz,
-    /// Uncompressed little-endian binary FASTQ (`.clean.bfq`).
-    Bfq,
-}
-
 /// All QC pipeline tunables. Defaults follow fastp.
 #[derive(Debug, Clone)]
 pub struct QcParams {
@@ -169,8 +159,6 @@ pub struct QcParams {
     /// Worker thread hint (0 = all cores). Sequential build: accepted,
     /// recorded in the report, not used for scheduling.
     pub threads: usize,
-    /// Output container for cleaned reads.
-    pub out_format: OutFormat,
 }
 
 impl Default for QcParams {
@@ -196,7 +184,6 @@ impl Default for QcParams {
             q15_frac_max: 0.4,
             keep_unpaired: false,
             threads: 0,
-            out_format: OutFormat::Fqgz,
         }
     }
 }
@@ -427,9 +414,8 @@ fn match_indel(read: &[u8], adapter: &[u8], start: isize, read_has_extra: bool) 
             break;
         }
         let budget = (cmplen as usize / 8).saturating_sub(1);
-        // Old-tool fast-path gate (documented deviation): the indel variant is
-        // only attempted where the UNGAPPED first min(8, cmplen) bases already
-        // match within the variant budget. Ported as a hard filter for parity.
+        // Attempt an indel variant only when the first min(8, cmplen)
+        // ungapped bases already match within the variant budget.
         let pre = 8.min(cmplen as usize);
         let mut ungapped = 0usize;
         let mut gated = false;
@@ -787,10 +773,12 @@ impl GzChunkWriter {
         self.buf.extend_from_slice(b"\n");
     }
 
-    /// Close the current chunk as one gzip member. Only chunks with records
-    /// emit a member; a stream that produced zero records leaves the file at
-    /// 0 bytes (reference behavior: old tool writes an empty file, not an
-    /// empty gzip member).
+    fn write(&mut self, rec: &Record) -> Result<(), QcError> {
+        self.push(rec);
+        Ok(())
+    }
+
+    /// Close the current chunk as one gzip member; empty chunks emit no member.
     fn end_chunk(&mut self) -> Result<(), QcError> {
         if !self.buf.is_empty() {
             let mut enc = GzEncoder::new(Vec::new(), Compression::default());
@@ -807,111 +795,6 @@ impl GzChunkWriter {
         self.end_chunk()?;
         self.file.flush()?;
         Ok(())
-    }
-}
-
-/// Binary FASTQ writer. 16-byte header: `EBFQ` magic, version u8 = 1,
-/// 3 reserved zero bytes, read_count u64 LE (patched via seek on close).
-/// Each record: name_len u16 LE + name + seq_len u16 LE + seq + qual.
-/// All fields little-endian, no compression.
-struct BfqWriter {
-    w: BufWriter<File>,
-    count: u64,
-}
-
-impl BfqWriter {
-    fn create(path: &Path) -> Result<Self, QcError> {
-        let mut w = BufWriter::new(File::create(path)?);
-        w.write_all(b"EBFQ")?;
-        w.write_all(&[1, 0, 0, 0])?;
-        w.write_all(&0u64.to_le_bytes())?;
-        Ok(Self { w, count: 0 })
-    }
-
-    fn push(&mut self, rec: &Record) -> Result<(), QcError> {
-        let name_len = fit_u16(rec.name.len())?;
-        let seq_len = fit_u16(rec.seq.len())?;
-        self.w.write_all(&name_len.to_le_bytes())?;
-        self.w.write_all(&rec.name)?;
-        self.w.write_all(&seq_len.to_le_bytes())?;
-        self.w.write_all(&rec.seq)?;
-        self.w.write_all(&rec.qual)?;
-        self.count += 1;
-        Ok(())
-    }
-
-    /// Close WITHOUT patching the count (placeholder 0 remains) — mirrors the
-    /// reference tool's R2/unpaired sinks.
-    fn finish(mut self) -> Result<(), QcError> {
-        self.w.flush()?;
-        self.w.get_mut().flush()?;
-        Ok(())
-    }
-
-    /// Close patching `read_count = count` (R1/SE sink; see call site for the
-    /// bug-compat total-count note).
-    fn finish_with_count(mut self, count: u64) -> Result<(), QcError> {
-        self.w.flush()?;
-        let file = self.w.get_mut();
-        file.seek(SeekFrom::Start(8))?;
-        file.write_all(&count.to_le_bytes())?;
-        file.flush()?;
-        Ok(())
-    }
-}
-
-fn fit_u16(n: usize) -> Result<u16, QcError> {
-    n.try_into().map_err(|_| {
-        QcError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "bfq field longer than 65535 bytes",
-        ))
-    })
-}
-
-enum OutSink {
-    Fq(GzChunkWriter),
-    Bfq(BfqWriter),
-}
-
-impl OutSink {
-    fn create(fmt: OutFormat, path: &Path) -> Result<Self, QcError> {
-        Ok(match fmt {
-            OutFormat::Fqgz => OutSink::Fq(GzChunkWriter::create(path)?),
-            OutFormat::Bfq => OutSink::Bfq(BfqWriter::create(path)?),
-        })
-    }
-
-    fn write(&mut self, rec: &Record) -> Result<(), QcError> {
-        match self {
-            OutSink::Fq(w) => {
-                w.push(rec);
-                Ok(())
-            }
-            OutSink::Bfq(w) => w.push(rec),
-        }
-    }
-
-    fn end_chunk(&mut self) -> Result<(), QcError> {
-        match self {
-            OutSink::Fq(w) => w.end_chunk(),
-            OutSink::Bfq(_) => Ok(()),
-        }
-    }
-
-    fn finish(self) -> Result<(), QcError> {
-        match self {
-            OutSink::Fq(w) => w.finish(),
-            OutSink::Bfq(w) => w.finish(),
-        }
-    }
-
-    /// Bfq sinks only: close patching read_count (reference bug-compat).
-    fn finish_with_count(self, count: u64) -> Result<(), QcError> {
-        match self {
-            OutSink::Fq(w) => w.finish(),
-            OutSink::Bfq(w) => w.finish_with_count(count),
-        }
     }
 }
 
@@ -1192,7 +1075,7 @@ fn check_phred33(qual: &[u8], min_char: &mut u8) -> Result<(), QcError> {
 /// that read as G, so polyG Auto mode enables trimming for them. The
 /// instrument token is the first ':'-separated field of the header.
 fn detect_instrument(name: &[u8]) -> Option<String> {
-    // Ported from the reference tool: token = first ':' field of the header;
+    // Token = first ':' field of the header;
     // A0<digit>* => NovaSeq family, NS5*/NB5* => NextSeq family, or the FULL
     // header containing the case-sensitive literal "NextSeq"/"NovaSeq".
     let head = before_space(name);
@@ -1275,7 +1158,7 @@ fn stem_of(path: &Path) -> String {
 
 /// Run the full QC pipeline described by `params`.
 ///
-/// Writes `<stem>.clean.fq.gz` (or `.clean.bfq`) for R1 — plus
+/// Writes `<stem>.clean.fq.gz` for R1 — plus
 /// `<stem>.clean.2.fq.gz` for R2 in PE mode and `<stem>.unpaired1/2.*`
 /// when `keep_unpaired` is set — and `qc.json` / `qc.html` into `out_dir`.
 /// `stem` derives from the first R1 file name.
@@ -1342,10 +1225,7 @@ pub fn run(params: &QcParams) -> Result<(), QcError> {
     } else {
         stem.clone()
     };
-    let ext = match params.out_format {
-        OutFormat::Fqgz => "fq.gz",
-        OutFormat::Bfq => "bfq",
-    };
+    let ext = "fq.gz";
     // Reference naming: SE = <stem1>.clean; PE = <stem1>.clean_R1 +
     // <stem2>.clean_R2 (R2 uses ITS OWN file's stem).
     let r1_name = if paired {
@@ -1353,30 +1233,23 @@ pub fn run(params: &QcParams) -> Result<(), QcError> {
     } else {
         format!("{stem}.clean.{ext}")
     };
-    let mut sink1 = OutSink::create(params.out_format, &out_dir.join(r1_name))?;
+    let mut sink1 = GzChunkWriter::create(&out_dir.join(r1_name))?;
     let mut sink2 = if paired {
-        Some(OutSink::create(
-            params.out_format,
+        Some(GzChunkWriter::create(
             &out_dir.join(format!("{stem2}.clean_R2.{ext}")),
         )?)
     } else {
         None
     };
-    // Reference bug-compat: unpaired files are ALWAYS named `.fq.gz`, but in
-    // Bfq mode their CONTENT is still EBFQ (header + raw records, count never
-    // patched) — the old writer hardcoded the extension while the encoder
-    // followed the format flag.
     let mut sink_u1 = if paired && params.keep_unpaired {
-        Some(OutSink::create(
-            params.out_format,
+        Some(GzChunkWriter::create(
             &out_dir.join(format!("{stem}.unpaired_R1.fq.gz")),
         )?)
     } else {
         None
     };
     let mut sink_u2 = if paired && params.keep_unpaired {
-        Some(OutSink::create(
-            params.out_format,
+        Some(GzChunkWriter::create(
             &out_dir.join(format!("{stem2}.unpaired_R2.fq.gz")),
         )?)
     } else {
@@ -1615,12 +1488,7 @@ let mut before = Stats::default();
         }
     }
 
-    // --- close outputs (bfq read counts patched here) ---
-    // Reference-tool bug-compat: only the R1/SE sink is patched, with the
-    // TOTAL kept-read count (both mates in PE); the R2/unpaired sinks keep
-    // their placeholder 0 (the old writer moved them away before patching).
-    let total_kept = after.reads;
-    sink1.finish_with_count(total_kept)?;
+    sink1.finish()?;
     if let Some(s) = sink2 {
         s.finish()?;
     }

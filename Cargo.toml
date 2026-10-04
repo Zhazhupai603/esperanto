@@ -4,12 +4,9 @@ members = [
     "crates/tidx",
     "crates/txmap",
     "crates/qc",
-    "crates/pile",
     "crates/engine",
     "crates/bamio",
     "crates/map",
-"crates/scan",
-    "crates/verify",
     "crates/score",
     "crates/report",
     "crates/flow",
@@ -17,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.8"
+version = "1.1.0"
 edition = "2021"
 license = "MIT"
 
@@ -39,9 +36,6 @@ memmap2 = "0.9"
 bytemuck = "1"
 noodles = { version = "0.101", features = ["bam", "sam", "bgzf"] }
 noodles-bgzf = { version = "0.43", features = ["libdeflate"] }
-ndarray = "0.16"
-libm = "0.2"
-safetensors = "0.4"
 
 [profile.release]
 lto = "thin"

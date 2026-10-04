@@ -1,4 +1,4 @@
-//! `esperanto score` — RE_PROB scoring (→
+//! `esperanto score` — unified evidence scoring (→
 //! `esperanto_score::pipeline::score_sites_batched`).
 
 use std::fmt::Write as _;
@@ -21,7 +21,7 @@ pub struct ScoreArgs {
     /// Model bundle root (default: zero-config 5-level fallback).
     #[arg(long)]
     bundle: Option<PathBuf>,
-    /// Output TSV `chrom<TAB>pos<TAB>prob`.
+    /// Output TSV `chrom<TAB>pos<TAB>score`.
     #[arg(long)]
     out: PathBuf,
     /// Worker threads (0 = all cores).
@@ -40,19 +40,18 @@ pub fn run(a: ScoreArgs) -> anyhow::Result<()> {
     let fasta = crate::resolve::require_fasta(fasta)?;
     let text = std::fs::read_to_string(&a.sites)?;
     let sites = score_pipeline::parse_sites(&text)?;
-    let probs = score_pipeline::score_sites_batched(
+    let scores = score_pipeline::score_sites_batched(
         &a.bam,
         &fasta,
         &bundle,
         &sites,
         crate::resolve::threads(a.threads),
-        score_pipeline::ReferenceCheck::Guardrail,
     )?;
     let mut buf = String::new();
-    for ((chrom, pos), prob) in sites.iter().zip(&probs) {
-        let _ = writeln!(buf, "{chrom}\t{pos}\t{prob}");
+    for ((chrom, pos), score) in sites.iter().zip(&scores) {
+        let _ = writeln!(buf, "{chrom}\t{pos}\t{score}");
     }
     std::fs::write(&a.out, buf)?;
-    eprintln!("[score] {} sites", probs.len());
+    eprintln!("[score] {} sites", scores.len());
     Ok(())
 }

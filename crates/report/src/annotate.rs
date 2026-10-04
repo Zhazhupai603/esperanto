@@ -1,8 +1,7 @@
 //! GTF annotation (gene rows + transcript CDS rows) and the A-to-I
 //! recoding (amino-acid change) check.
 //!
-//! Semantics are ported verbatim from the validated reference
-//! implementation:
+//! CDS and recoding conventions:
 //!
 //! * CDS rows per transcript are ALWAYS sorted ascending by coordinate and
 //!   concatenated in that order; minus-strand transcripts are then built by
@@ -13,7 +12,7 @@
 //!   minus strand.
 //! * A site is recoding iff it lies inside a CDS, the transcript-frame base
 //!   is `A`, the A->G substitution changes the amino acid, and the site
-//!   probability is >= 0.2 (checked by the caller).
+//!   score is >= 0.2 (checked by the caller).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -206,8 +205,7 @@ impl Annotation {
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
-
-    }
+}
 
 /// Lazily-built transcript CDS sequences + the recoding check.
 pub struct Recoder<'a> {

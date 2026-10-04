@@ -770,13 +770,9 @@ fn parse_gtf(path: &Path) -> Result<Vec<TxRecord>> {
         .collect())
 }
 
-/// Parse a GTF attribute column into `key → value` pairs, tolerating both
-/// `key "value";` and `key=value;` styles; quotes are stripped.
-/// Reference attribute parser (ported byte-for-byte in behavior): pairs are
-/// `key "value";` — the value MUST be double-quoted; unquoted pairs are
-/// skipped entirely (a file whose transcript_id is unquoted therefore fails
-/// with missing-transcript_id, exactly like the oracle). Empty quoted values
-/// are legal. `key=value` (GFF style) is not recognized.
+/// Parse double-quoted GTF attributes of the form `key "value";`.
+/// Empty quoted values are valid. Unquoted pairs and GFF-style `key=value`
+/// attributes are ignored; a missing transcript_id is rejected by the caller.
 fn parse_attrs(field: &str) -> HashMap<&str, &str> {
     let b = field.as_bytes();
     let mut out = HashMap::new();
@@ -989,11 +985,9 @@ fn take<'a>(data: &'a [u8], off: &mut usize, len: u64, what: &str) -> Result<&'a
 
 /// Validate and parse a whole `.tidx` byte buffer.
 fn parse_index(data: &[u8]) -> Result<Tidx> {
-    // The parallel decode below uses par_chunks_exact on hundreds of millions
-    // of entries. Run it on a dedicated pool with large worker stacks: on the
-    // global pool (384 threads, 2 MiB stacks) rayon's work-stealing recursion
-    // was observed to overflow a worker stack and abort the process during
-    // L1 bundle load. 64 MiB is reserved address space only.
+    // Large indexes are decoded on a dedicated pool with 64 MiB worker
+    // stacks to accommodate recursive work stealing. Stack space is reserved
+    // virtually and committed as used.
     let pool = rayon::ThreadPoolBuilder::new()
         .stack_size(64 << 20)
         .build()

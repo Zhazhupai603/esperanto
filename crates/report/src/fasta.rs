@@ -2,8 +2,7 @@
 //! (name, length, offset, line-bases, line-width per contig).
 //!
 //! Sequences are fetched as uppercased bytes; positions are 0-based,
-//! half-open `[s, e)`, clamped to the contig length exactly like the
-//! reference implementation.
+//! half-open `[s, e)`, clamped to the contig length.
 
 use std::collections::HashMap;
 use std::fs::File;

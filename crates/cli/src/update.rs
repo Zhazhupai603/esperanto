@@ -6,8 +6,7 @@ use std::path::PathBuf;
 
 use clap::Args;
 
-const LATEST_API: &str =
-    "https://api.github.com/repos/Zhazhupai603/esperanto/releases/latest";
+const LATEST_API: &str = "https://api.github.com/repos/Zhazhupai603/esperanto/releases/latest";
 
 #[derive(Args)]
 pub struct UpdateArgs {
@@ -92,7 +91,10 @@ fn install_tarball(bytes: &[u8], tag: &str) -> anyhow::Result<()> {
     std::fs::rename(&staged, &exe)?;
     let new_bundle = pkg.join("bundle");
     if new_bundle.is_dir() {
-        let dest_parent = bundle_dir.parent().map(|p| p.to_path_buf()).unwrap_or(bundle_dir.clone());
+        let dest_parent = bundle_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or(bundle_dir.clone());
         std::fs::create_dir_all(&dest_parent)?;
         copy_tree(&new_bundle, &bundle_dir)?;
     }

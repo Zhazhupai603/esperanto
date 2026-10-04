@@ -9,8 +9,6 @@
 
 pub mod error;
 pub mod guard;
-pub mod hyper;
-pub mod manifest;
 pub mod params;
 pub mod resume;
 pub mod stages;

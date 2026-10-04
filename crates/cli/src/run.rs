@@ -4,7 +4,6 @@ use std::path::PathBuf;
 
 use clap::Args;
 
-
 #[derive(Args)]
 pub struct RunArgs {
     /// R1 FASTQ inputs (repeatable / comma-separated; FASTQ entry).
@@ -13,10 +12,7 @@ pub struct RunArgs {
     /// R2 FASTQ inputs (empty = single-end).
     #[arg(long, value_delimiter = ',')]
     r2: Vec<PathBuf>,
-    /// Also run the negative-control (A>C / T>G) rescue passes, count-only.
-    #[arg(long)]
-    rescue_control: bool,
-    /// Stop after this stage (qc|map|sort|scan|verify|hyper|score|vcf);
+    /// Stop after this stage (qc|map|sort|scan|score|vcf);
     /// the run directory stays resumable.
     #[arg(long)]
     stop_after: Option<String>,
@@ -35,9 +31,6 @@ pub struct RunArgs {
     /// Optional GTF (default: refs discovery).
     #[arg(long)]
     gtf: Option<PathBuf>,
-    // Known-SNP exclusion is an internal channel, not exposed (C1): the
-    // precision story is the in-caller scoring; silent refs-discovery dbSNP
-    // filtering contaminated benchmark protocols.
     /// Model bundle root (default: zero-config 5-level fallback).
     #[arg(long)]
     bundle: Option<PathBuf>,
@@ -45,44 +38,22 @@ pub struct RunArgs {
     #[arg(long)]
     l1_bundle: Option<PathBuf>,
     /// Output root directory.
-#[arg(long)]
+    #[arg(long)]
     out: PathBuf,
     /// Sample name for the run directory (default: derived from the R1/BAM file name).
     #[arg(long)]
     sample: Option<String>,
-    /// Knock-in mouse run: splice these human genes onto the mouse reference
-    /// (comma-separated symbols; bare --hybrid opens the interactive picker).
-    #[arg(long, num_args = 0..=1, default_missing_value = "")]
-    hybrid: Option<String>,
     /// Worker threads (0 = all cores).
     #[arg(long, default_value_t = 0)]
     threads: usize,
-    /// score batch size.
-    #[arg(long, default_value_t = 256)]
-    batch: usize,
 }
 
 pub fn run(a: RunArgs) -> anyhow::Result<()> {
     let sample = a.sample.clone().unwrap_or_else(|| derive_sample(&a));
-let bundle = crate::resolve::bundle(&a.bundle)?;
+    let bundle = crate::resolve::bundle(&a.bundle)?;
     let mut index = a.index;
     let mut fasta = a.fasta;
     let mut gtf = a.gtf;
-    let mut run_manifest: Option<esperanto_flow::manifest::SpeciesManifest> = None;
-    if let Some(h) = &a.hybrid {
-        let genes = if h.is_empty() {
-            None
-        } else {
-            Some(h.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
-        };
-        let dir = crate::hybrid::resolve(genes)?;
-        index = Some(dir.join("hybrid.paidx"));
-        fasta = Some(dir.join("hybrid.fa"));
-        let g = dir.join("hybrid.gtf");
-        gtf = g.is_file().then_some(g);
-        run_manifest = esperanto_flow::manifest::SpeciesManifest::read(&dir)?;
-    }
-    let snp: Option<PathBuf> = None;
     if index.is_none() || fasta.is_none() || gtf.is_none() {
         if let Some(refs) = crate::resolve::refs() {
             refs.fill_index(&mut index);
@@ -92,7 +63,8 @@ let bundle = crate::resolve::bundle(&a.bundle)?;
     }
     let l1_bundle = index
         .as_ref()
-        .and_then(|idx| crate::resolve::l1_bundle(&a.l1_bundle, idx));
+        .map(|idx| crate::resolve::l1_bundle(&a.l1_bundle, idx))
+        .transpose()?;
     let fasta = crate::resolve::require_fasta(fasta)?;
     let out_dir = a.out.join(&sample);
     if out_dir.join("run.json").exists() {
@@ -103,9 +75,6 @@ let bundle = crate::resolve::bundle(&a.bundle)?;
         );
     }
     std::fs::create_dir_all(&out_dir)?;
-    if let Some(m) = &run_manifest {
-        m.write(&out_dir)?; // preflight guardrail + report/score contig split read it here
-    }
     let params = esperanto_flow::RunParams {
         r1: a.r1,
         r2: a.r2,
@@ -114,13 +83,10 @@ let bundle = crate::resolve::bundle(&a.bundle)?;
         index,
         fasta,
         gtf,
-        snp,
         bundle,
         l1_bundle,
         out_dir: out_dir.clone(),
         threads: crate::resolve::threads(a.threads),
-        batch: a.batch,
-        rescue_control: a.rescue_control,
         stop_after: a.stop_after,
     };
     let _lock = esperanto_flow::resume::RunLock::acquire(&out_dir)?;
@@ -134,7 +100,9 @@ let bundle = crate::resolve::bundle(&a.bundle)?;
 /// suffixes, a trailing `.bam`, and a trailing mate marker (`_R1/_R2/_1/_2`).
 fn derive_sample(a: &RunArgs) -> String {
     let src = a.r1.first().or(a.bam.as_ref());
-    let Some(src) = src else { return "sample".to_string() };
+    let Some(src) = src else {
+        return "sample".to_string();
+    };
     let mut name = src
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -178,17 +146,17 @@ mod tests {
             l1_bundle: None,
             out: "out".into(),
             sample: None,
-            hybrid: None,
             threads: 0,
-            batch: 64,
-            rescue_control: false,
             stop_after: None,
         }
     }
 
     #[test]
     fn derive_sample_strips_formats_and_mate_markers() {
-        assert_eq!(derive_sample(&args("APOE4_070938_1_1.fq.gz")), "APOE4_070938_1");
+        assert_eq!(
+            derive_sample(&args("APOE4_070938_1_1.fq.gz")),
+            "APOE4_070938_1"
+        );
         assert_eq!(derive_sample(&args("sample_R1.fastq.gz")), "sample");
         assert_eq!(derive_sample(&args("lane.fq")), "lane");
         let mut b = args("x");

@@ -1,6 +1,6 @@
 # qc — RNA-seq FASTQ quality control
 
-FASTQ cleaning with fastp semantics: adapter trimming, optional quality trimming, polyG trimming, whole-read filtering, paired-end synchronization, before/after statistics. Streaming pipeline; memory independent of input size; byte-level deterministic output.
+FASTQ cleaning with fastp semantics: adapter trimming, optional quality trimming, polyG trimming, whole-read filtering, paired-end synchronization, before/after statistics. Streaming pipeline; memory independent of input size; deterministic read output. Timing fields in reports vary by run.
 
 ## Parameters and defaults
 
@@ -23,7 +23,6 @@ pub struct QcParams {
     pub q15_frac_max: f64,         // default 0.4
     pub keep_unpaired: bool,       // default false
     pub threads: usize,            // 0 = all cores
-    pub out_format: OutFormat,     // Fqgz (default) | Bfq
 }
 ```
 
@@ -59,7 +58,7 @@ Prescan: buffer the first N=5000 reads before streaming starts (bounded memory);
 Decision order:
 
 1. **Table hit rate**: if the built-in table's hit fraction on the 5000 reads is ≥1% → use the table (`adapter_source="table"`, do not output `detected_adapter_se`); no detection.
-2. **<1% triggers detection** (k-mer seed + anchored extension algorithm; scientific correction: the cross-read shared invariant under read-through is the adapter **5' prefix** — internal substrings drift with insert length — while the 3' suffix drifts with the insert and yields no stable shared suffix, so no suffix tree is used):
+2. **<1% triggers detection** using a k-mer seed and anchored extension:
    a. Count all 12-mers within each read's 3' tail window (the last min(rlen,36) bases) (2-bit encoding; skip 12-mers containing non-ACGT);
    b. The most frequent 12-mer becomes the seed (ties broken by the smallest 2-bit encoding, for determinism); count < max(20, N/200) → no candidate, `adapter_source="none"`, no trimming;
    c. Anchored extension: align each read at the seed's leftmost occurrence within its tail window; extend base by base toward 5' and 3' — continue at a position while the majority base count there is ≥ max(20, N/200) and covers ≥60% of the reads participating at that position (ties broken A<C<G<T<N), otherwise stop (the 60% relative threshold prevents over-extension into the insert's genomic region under high support); sequences diverge across reads at the insert boundary, so 5'-ward extension terminates naturally;
@@ -81,9 +80,8 @@ Decision order:
 
 ## Outputs
 
-- SE: `<stem>.clean.fq.gz` (or `.bfq`); PE: plus R2 and optional unpaired1/2; stem = R1 file name stripped of `.gz`/`.fastq`/`.fq`
+- SE: `<stem>.clean.fq.gz`; PE: `<stem1>.clean_R1.fq.gz` and `<stem2>.clean_R2.fq.gz`; optional unpaired outputs use `<stem1>.unpaired_R1.fq.gz` and `<stem2>.unpaired_R2.fq.gz`. Each stem is the input filename with one `.gz` and one `.fastq` or `.fq` suffix removed.
 - **Fqgz**: chunked processing; each chunk is an independent gzip member, concatenated in order (multi-member gzip is legal) → thread count does not affect the output bytes
-- **Bfq binary format**: 16-byte header (`EBFQ` + version u8=1 + 3 reserved + read_count u64); per read: name_len u16 + name + seq_len u16 + seq + qual; all little-endian, uncompressed; byte-identical to decompressed fq after conversion to text
 - `qc.json` + `qc.html` reports
 
 ## Statistics (all-integer accumulation; converted to ratios once at report time)
@@ -107,24 +105,12 @@ The reader thread chunks input into fixed blocks (2048 reads/block) → rayon wo
 - filtering: exactly 40% low quality is not dropped, >40% is dropped
 - overlap: 60nt insert + 93 read length read-through → offset<0, both ends cut to 60
 
-## Corrections from differential testing against the legacy binary
 
-1. Gapless scan upper bound: `pos < rlen-4` (shortest alignment 5 bases), not `<= rlen-4` (4-mer random-tail false positives).
-2. Gate before the indel variants: only attempt k-skip when "the first min(8,cmplen) bases gapless-align within the variant budget" (the legacy v12 fast path is intentional semantics, not a pure optimization).
-3. Indel k range: `1..cmplen` (the insertion/deletion must fall strictly inside the window; including either end equals shifting the window).
-4. Indel scan start: pos=0 (no negative starts); insertion-variant position bound `pos < rlen-5`, deletion `pos < rlen-4`.
-5. qc.json numbers are output at full precision (the legacy does no rounding); instrument_polyg is a bool; summary_before contains ratios only.
-6. Two-color instrument detection (aligned verbatim with the legacy): token = the header's first field before the colon; enabled when any of: `A0<digit>` prefix (NovaSeq), `NS5`/`NB5` prefix (NextSeq), or the **entire header** case-sensitively containing the literal `NextSeq`/`NovaSeq`. Fuzzy substring matching (NS*/NB*) is not used.
-7. PE overlap scan bounds (differential-testing correction): positive offsets `0..l1-30` (open interval), negative offsets `1..l2-30` (open interval); boundary positions where ol is exactly 30 are **not tried** (30-mer false overlaps from periodic adapter tails land exactly there). If either read is ≤30, directly no overlap.
-8. bfq legacy bug compatibility (differential-testing correction): (a) read_count is backfilled only for R1/SE files, with value = total kept reads of both ends (for PE = 2× the pair count); R2/unpaired files always have count 0. (b) unpaired file names are hardcoded `.fq.gz`, but in bfq mode their content is still EBFQ (header + raw records).
-9. Zero-record output files = 0 bytes (legacy semantics); no empty gzip member is written.
-10. PE overlap trimming is counted per end independently: each end increments adapter_reads += 1 only when it was itself truly trimmed (bases>0); when one end is already shorter than ol, that end is not counted.
+## Boundary and case rules
 
-## Corrections from differential testing against the legacy binary (round 3)
-
-11. PE output naming aligned with the legacy: `<stem1>.clean_R1.<ext>` + `<stem2>.clean_R2.<ext>` (R2 uses its own file's stem); unpaired = `<stem1>.unpaired_R1.fq.gz` / `<stem2>.unpaired_R2.fq.gz`; SE remains `<stem>.clean.<ext>`.
-12. params gains the `q15_frac_max` field.
-13. revcomp complements only uppercase ACGT; all other bytes pass through unchanged (including lowercase).
-14. stem stripping: strip one .gz, then one .fastq/.fq (stop at the first hit); no repeated stripping.
-15. Intentional deviations (recorded): the gzip compression backend and level differ (zlib-6 vs libdeflate-1), with decompressed content byte-identical; bfq fields >65535 error out (the legacy silently truncates, producing corrupt records); ≥64nt custom adapters panic in the legacy version but work in the new one; q15=NaN is rejected (the legacy silently disables low-quality filtering); run returns () (reporting goes through qc.json); html is a minimal rendering; the legacy bfq.rs conversion tool was not ported.
-16. **Case = scientific semantics (ruling)**: sequence letter case carries no information — lowercase acgt are the same bases as uppercase. Statistic buckets are case-insensitive (gc counts C/c/G/g; the N bucket takes only N/n plus other codes); polyG continues the tail on both g/G; adapter matching, PE overlap, and the indel gate all use `eq_ignore_ascii_case`; revcomp complements case-insensitively and preserves case; the N filter counts both N and n. **Intentional deviation from the legacy** (the legacy is byte-sensitive throughout: lowercase goes into the N bucket, lowercase g is not tail-trimmed) — rationale: qc output feeds our own aligner rather than a frozen model, so no model contract constrains it; standard Illumina data is all-uppercase, where behavior is byte-identical to the legacy (regression guarantee). Verification = case-equivariance invariant: after randomly changing the case of any data, the output clean sequences (ignoring case), qualities, kept set, and qc.json numbers must be exactly identical (20 datasets × 40% lowercased, 0 failures).
+- Adapter scans require at least five aligned bases. Insertion/deletion alternatives operate strictly inside the matching window.
+- Paired overlap search uses positive offsets `0..len1-30` and negative offsets `1..len2-30`; reads of at most 30 bases do not enter this search.
+- Empty read outputs contain no gzip members.
+- Sequence comparisons and base statistics are case-insensitive. Reverse complementation preserves base case.
+- Non-finite quality-fraction parameters are rejected.
+- Each trimmed mate contributes independently to trimming statistics.

@@ -25,7 +25,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-/// Format magic (frozen).
+/// Format magic.
 pub const PAIDX_MAGIC: &[u8; 8] = b"PAIDXfmt";
 /// Supported format version.
 pub const PAIDX_VERSION: u32 = 1;

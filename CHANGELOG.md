@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.1.0] - 2026-09-29
+
+### Changed
+
+- Candidate discovery and scoring use a unified reference-aware molecular evidence model on the CPU.
+- The model bundle contains `model.txt`, `freeze.json`, and `alu.bed`.
+- Discovery includes A-to-G and T-to-C observations with MAPQ at least 20 and base quality at least 13; the frozen classifier threshold determines the site filter.
+- VCF output reports `ESP_SCORE`, `VAF`, `DEPTH`, `AC`, and `STRAND`, with `PASS` or `LOW_SCORE`. Scores are classifier outputs, not calibrated probabilities.
+- Scientific result tables are deterministic across worker counts.
+- Resumable runs use metadata schema version 2 and require compatible cached artifacts.
+
 ## [1.0.8] - 2026-09-23
 
 ### Fixed

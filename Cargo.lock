@@ -86,12 +86,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
-name = "autocfg"
-version = "1.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
-
-[[package]]
 name = "base64"
 version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -526,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-bamio"
-version = "1.0.8"
+version = "1.1.0"
 dependencies = [
  "noodles",
  "noodles-bgzf",
@@ -536,7 +530,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-cli"
-version = "1.0.8"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -544,13 +538,10 @@ dependencies = [
  "esperanto-engine",
  "esperanto-flow",
  "esperanto-map",
- "esperanto-pile",
  "esperanto-qc",
  "esperanto-report",
- "esperanto-scan",
  "esperanto-score",
  "esperanto-tidx",
- "esperanto-verify",
  "flate2",
  "rust-htslib",
  "tar",
@@ -559,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-engine"
-version = "1.0.8"
+version = "1.1.0"
 dependencies = [
  "esperanto-tidx",
  "esperanto-txmap",
@@ -569,7 +560,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-flow"
-version = "1.0.8"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "esperanto-bamio",
@@ -577,9 +568,7 @@ dependencies = [
  "esperanto-map",
  "esperanto-qc",
  "esperanto-report",
- "esperanto-scan",
  "esperanto-score",
- "esperanto-verify",
  "flate2",
  "rayon",
  "rust-htslib",
@@ -590,7 +579,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-map"
-version = "1.0.8"
+version = "1.1.0"
 dependencies = [
  "bytemuck",
  "esperanto-bamio",
@@ -608,17 +597,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "esperanto-pile"
-version = "1.0.8"
-dependencies = [
- "esperanto-scan",
- "rust-htslib",
- "thiserror 2.0.20",
-]
-
-[[package]]
 name = "esperanto-qc"
-version = "1.0.8"
+version = "1.1.0"
 dependencies = [
  "flate2",
  "rayon",
@@ -629,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "esperanto-report"
-version = "1.0.8"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -637,34 +617,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "esperanto-scan"
-version = "1.0.8"
-dependencies = [
- "flate2",
- "rayon",
- "rust-htslib",
- "thiserror 2.0.20",
-]
-
-[[package]]
 name = "esperanto-score"
-version = "1.0.8"
+version = "1.1.0"
 dependencies = [
  "anyhow",
- "esperanto-bamio",
- "libm",
- "ndarray",
  "rayon",
  "rust-htslib",
- "safetensors",
- "serde",
  "serde_json",
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "esperanto-tidx"
-version = "1.0.8"
+version = "1.1.0"
 dependencies = [
  "blake3",
  "rayon",
@@ -673,20 +638,9 @@ dependencies = [
 
 [[package]]
 name = "esperanto-txmap"
-version = "1.0.8"
+version = "1.1.0"
 dependencies = [
  "blake3",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "esperanto-verify"
-version = "1.0.8"
-dependencies = [
- "esperanto-engine",
- "esperanto-map",
- "rayon",
- "rust-htslib",
  "thiserror 2.0.20",
 ]
 
@@ -1067,12 +1021,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "libm"
-version = "0.2.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
-
-[[package]]
 name = "libz-ng-sys"
 version = "1.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1146,16 +1094,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "matrixmultiply"
-version = "0.3.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f607c237553f086e7043417a51df26b2eb899d3caff94e6a67592ff992fedc7"
-dependencies = [
- "autocfg",
- "rawpointer",
-]
-
-[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1196,21 +1134,6 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "ndarray"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "882ed72dce9365842bf196bdeedf5055305f11fc8c03dee7bb0194a6cad34841"
-dependencies = [
- "matrixmultiply",
- "num-complex",
- "num-integer",
- "num-traits",
- "portable-atomic",
- "portable-atomic-util",
- "rawpointer",
 ]
 
 [[package]]
@@ -1309,33 +1232,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "num-complex"
-version = "0.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73f88a1307638156682bada9d7604135552957b7818057dcef22705b4d509495"
-dependencies = [
- "num-traits",
-]
-
-[[package]]
-name = "num-integer"
-version = "0.1.47"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ce2d95d4b3734dc35aa2f45e1aa22cd416814592a4f9d9205e11affd5b8e10b"
-dependencies = [
- "num-traits",
-]
-
-[[package]]
-name = "num-traits"
-version = "0.2.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
-dependencies = [
- "autocfg",
-]
-
-[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1405,21 +1301,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
-name = "portable-atomic"
-version = "1.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
-
-[[package]]
-name = "portable-atomic-util"
-version = "0.2.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2a106d1259c23fac8e543272398ae0e3c0b8d33c88ed73d0cc71b0f1d902618"
-dependencies = [
- "portable-atomic",
-]
-
-[[package]]
 name = "potential_utf"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1457,12 +1338,6 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
-
-[[package]]
-name = "rawpointer"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60a357793950651c4ed0f3f52338f53b2f809f32d83a07f72909fa13e4c6c1e3"
 
 [[package]]
 name = "rayon"
@@ -1635,16 +1510,6 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
-
-[[package]]
-name = "safetensors"
-version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44560c11236a6130a46ce36c836a62936dc81ebf8c36a37947423571be0e55b6"
-dependencies = [
- "serde",
- "serde_json",
-]
 
 [[package]]
 name = "scopeguard"

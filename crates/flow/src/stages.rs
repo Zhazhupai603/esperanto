@@ -11,11 +11,10 @@ use esperanto_map::align::AlignConfig;
 use esperanto_map::index::Index;
 use esperanto_map::pipeline::{run_pe_2pass, run_se_2pass, PipelineOut};
 use esperanto_map::{gtf, index_io};
-use esperanto_qc::{OutFormat, QcParams};
-use esperanto_scan::CallParams;
-use rust_htslib::bam::Read as _;
+use esperanto_qc::QcParams;
+use esperanto_score::load_primary_threshold;
 use esperanto_score::pipeline as score_pipeline;
-use esperanto_score::load_cmc_thresholds;
+use rust_htslib::bam::Read as _;
 
 use crate::params::{Entry, RunParams};
 use crate::{guard, vcf, FlowError};
@@ -50,10 +49,7 @@ pub fn run(params: &RunParams) -> Result<(), FlowError> {
 
 /// Entry + guardrail checks shared by fresh runs and resumes.
 pub fn preflight(params: &RunParams, entry: Entry) -> Result<(), FlowError> {
-    // Reference manifest copied into the run dir at run start (hybrid refs);
-    // absent → legacy hg38 heuristic.
-    let manifest = crate::manifest::SpeciesManifest::read(&params.out_dir)?;
-    guard::check_species(&params.fasta, manifest.as_ref())?;
+    guard::check_species(&params.fasta)?;
     match entry {
         Entry::FastqSe | Entry::FastqPe => {
             if params.index.is_none() {
@@ -86,7 +82,7 @@ pub fn run_from(
         .map(|s| {
             Stage::parse(s).ok_or_else(|| {
                 FlowError::Entry(format!(
-                    "bad --stop-after '{s}': expected qc|map|sort|scan|verify|hyper|score|vcf"
+                    "bad --stop-after '{s}': expected qc|map|sort|scan|score|vcf"
                 ))
             })
         })
@@ -98,9 +94,6 @@ pub fn run_from(
     }
     let map_dir = params.out_dir.join("map");
     let mut current_bam: PathBuf;
-    // When the map stage ran in this process, its (leaked) index and L1
-    // bundle are reused by the verify stage instead of a second 12 GB read.
-    let mut map_handles: Option<(&'static esperanto_map::index::Index, Option<Arc<esperanto_engine::L1Index>>)> = None;
     match entry {
         Entry::FastqSe | Entry::FastqPe => {
             let (clean1, clean2) = if start <= Stage::Qc {
@@ -114,9 +107,8 @@ pub fn run_from(
             }
             if start <= Stage::Map {
                 // map_stage runs the collapsed rescue before returning.
-                let (bam, index, l1) = stage_map(params, entry, &clean1, clean2.as_deref())?;
+                let (bam, _index, _l1) = stage_map(params, entry, &clean1, clean2.as_deref())?;
                 current_bam = bam;
-                map_handles = Some((index, l1));
             } else {
                 current_bam = map_dir.join("raw.bam");
                 if start == Stage::Rescue {
@@ -163,36 +155,22 @@ pub fn run_from(
                 eprintln!("[run] stop-after scan");
                 return Ok(());
             }
-            if start <= Stage::Verify {
-                stage_verify(params, &current_bam, &bed, map_handles)?;
-            }
-            if stop_at == Some(Stage::Verify) {
-                eprintln!("[run] stop-after verify");
-                return Ok(());
-            }
-            if start <= Stage::Hyper {
-                stage_hyper(params)?;
-            }
-            if stop_at == Some(Stage::Hyper) {
-                eprintln!("[run] stop-after hyper");
-                return Ok(());
-            }
             sites
         }
     };
 
     if start <= Stage::Vcf {
-        let (probs, hyper_probs, thresholds) = if start <= Stage::Score {
-            let out = stage_score(params, &current_bam, &sites)?;
+        let (scores, threshold) = if start <= Stage::Score {
+            let scores = stage_score(params, &current_bam, &sites)?;
             if stop_at == Some(Stage::Score) {
                 eprintln!("[run] stop-after score");
                 return Ok(());
             }
-            (out.probs, out.hyper_probs, out.thresholds)
+            scores
         } else {
-            load_score_state(params, &sites)?
+            load_score_state(params)?
         };
-        vcf::write_vcf(params, entry, &sites, &probs, &hyper_probs, &thresholds)?;
+        vcf::write_vcf(params, entry, &sites, &scores, threshold)?;
     }
     if stop_at == Some(Stage::Vcf) {
         eprintln!("[run] stop-after vcf");
@@ -202,11 +180,10 @@ pub fn run_from(
     Ok(())
 }
 
-/// scores.tsv → probs bridge for resumes that skip the score stage.
-/// `NA` marks unscored rows (hybrid runs: mouse-contig sites).
-fn load_scores(path: &Path) -> Result<Vec<Option<f64>>, FlowError> {
+/// scores.tsv → scores bridge for resumes that skip the score stage.
+fn load_scores(path: &Path) -> Result<Vec<f64>, FlowError> {
     let text = fs::read_to_string(path)?;
-    let mut probs = Vec::new();
+    let mut scores = Vec::new();
     for (i, line) in text.lines().enumerate() {
         if line.is_empty() {
             continue;
@@ -214,21 +191,15 @@ fn load_scores(path: &Path) -> Result<Vec<Option<f64>>, FlowError> {
         let p = line
             .split('\t')
             .nth(2)
-            .map(|v| {
-                if v == "NA" {
-                    Ok(None)
-                } else {
-                    v.parse::<f64>().map(Some).map_err(|_| ())
-                }
-            })
+            .map(|v| v.parse::<f64>())
             .and_then(|r| r.ok())
             .ok_or_else(|| FlowError::BedParse {
                 line: i + 1,
-                msg: "scores.tsv expects 'chrom<TAB>pos<TAB>prob' (or NA)".into(),
+                msg: "scores.tsv expects 'chrom<TAB>pos<TAB>score'".into(),
             })?;
-        probs.push(p);
+        scores.push(p);
     }
-    Ok(probs)
+    Ok(scores)
 }
 
 /// Report stage (best-effort): pack the finished run directory into a
@@ -290,7 +261,6 @@ fn stage_qc(params: &RunParams, entry: Entry) -> Result<(PathBuf, Option<PathBuf
         r1: params.r1.clone(),
         r2: params.r2.clone(),
         out_dir: dir.clone(),
-        out_format: OutFormat::Fqgz,
         threads: params.threads,
         ..Default::default()
     };
@@ -327,14 +297,20 @@ fn contig_id(index: &Index, name: &str) -> u32 {
 }
 
 /// (raw BAM, leaked shared alignment index, L1 bundle when present). The
-/// index handle is process-lifetime so `stage_verify` reuses it instead of
-/// re-reading 12 GB from disk.
+/// index handles remain process-lifetime for the alignment stage.
 fn stage_map(
     params: &RunParams,
     entry: Entry,
     clean1: &Path,
     clean2: Option<&Path>,
-) -> Result<(PathBuf, &'static esperanto_map::index::Index, Option<Arc<esperanto_engine::L1Index>>), FlowError> {
+) -> Result<
+    (
+        PathBuf,
+        &'static esperanto_map::index::Index,
+        Option<Arc<esperanto_engine::L1Index>>,
+    ),
+    FlowError,
+> {
     eprintln!("[map] running");
     let dir = params.out_dir.join("map");
     let paidx = match &params.index {
@@ -358,7 +334,6 @@ fn stage_map(
         r2,
         &dir,
         params.threads,
-        params.rescue_control,
     )
 }
 
@@ -376,18 +351,21 @@ pub fn map_stage(
     r2: Option<&Path>,
     out_dir: &Path,
     threads: usize,
-    rescue_control: bool,
-) -> Result<(PathBuf, &'static esperanto_map::index::Index, Option<Arc<L1Index>>), FlowError> {
+) -> Result<
+    (
+        PathBuf,
+        &'static esperanto_map::index::Index,
+        Option<Arc<L1Index>>,
+    ),
+    FlowError,
+> {
     let dir = out_dir;
     fs::create_dir_all(dir)?;
     let index: &'static esperanto_map::index::Index =
         Box::leak(Box::new(index_io::load(paidx).map_err(stage_err("map"))?));
-    // Tier 1 is strict four-letter: every substitution costs. Exempting an
-    // editing direction here would apply the cost to all 38M reads to benefit
-    // the hyperedited fraction, and exempting both would collapse the alphabet
-    // outright. Hyperediting is handled by the dedicated three-letter rescue
-    // passes below, on the reads Tier 1 refuses — the division of labour in
-    // Porath, Carmi & Levanon, Nat Commun 5:4726, 2014.
+    // Primary alignment uses all four bases. Hyperediting rescue uses
+    // separate three-letter transforms (Porath, Carmi & Levanon,
+    // Nat Commun 5:4726, 2014).
     let config = AlignConfig::rna_default();
     let jlib = match gtf_path {
         Some(g) => Some(Arc::new(
@@ -420,9 +398,7 @@ pub fn map_stage(
         index,
         config,
         jlib,
-        jkmer: None,
         l1: l1.clone(),
-        baln: Some(Box::new(File::create(dir.join("align.baln"))?)),
     };
     let n_annotated = out.jlib.as_ref().map_or(0, |l| l.junctions.len());
     let (stats, discoveries, _merged, n_annotated_replaced) = match r2 {
@@ -470,121 +446,36 @@ pub fn map_stage(
         }
         fs::write(dir.join("discovered_junctions.bed"), bed)?;
     }
-    if rescue_control {
-        let n = rescue_collapsed(paidx, Some(index.reference), dir, threads, &raw_bam, true)?;
-        let rescued = rescue_collapsed(paidx, Some(index.reference), dir, threads, &raw_bam, false)?;
-        let ratio = if rescued > 0 { n as f64 / rescued as f64 } else { 0.0 };
-        eprintln!("[rescue] control alphabet: {n} verified (ratio {ratio:.2})");
-    } else {
-        rescue_collapsed(paidx, Some(index.reference), dir, threads, &raw_bam, false)?;
-    }
+    rescue_collapsed(paidx, Some(index.reference), dir, threads, &raw_bam)?;
     Ok((raw_bam, index, l1))
 }
 
-// Three-letter hyperediting rescue of unmapped reads (Porath, Carmi &
-// Levanon, Nat Commun 5:4726, 2014). The unmapped set is re-aligned once per
-// editing direction, each against its own transformed index: reads and
-// reference both carry A->G for the plus-strand pass (`<stem>.ag.paidx`) and
-// both carry T->C for the minus-strand pass (`<stem>.tc.paidx`). Under the
-// matching transform an edit of that direction is an identity, so a
-// hyperedited read seeds and aligns normally, while the other three bases
-// stay distinct and keep separating paralogs.
-//
-// One direction per pass, never both: a single index merging A/G *and* T/C
-// leaves a two-letter alphabet, in which seeds stop being locators and the two
-// transitions — which is what A>G and T>C are — become free, making a
-// paralogous repeat copy indistinguishable from an edited sibling.
-//
-// Every placement is verified against the true (four-letter) reference: a
-// hyperedited read must carry at most `RESCUE_MAX_NON_EDIT_MM` mismatches
-// outside its own editing direction, plus a dense, high-quality,
-// direction-pure mismatch cluster with sane geometry and, for paired data, a
-// concordant mapped mate. A read that verifies under *both* directions is
-// direction-ambiguous — the signature of a paralog, not a transcript — and is
-// discarded, which is the same negative-control logic the reference method
-// applies to its five non-A>G transforms.
-//
-// Verified survivors are written back into raw.bam with MAPQ 0 and an
-// `RE:Z:collapsed` tag (repeat-family placement, never confident); everything
-// else stays unmapped, and unmapped.fq.gz is rewritten without the verified
-// reads only. No-op when neither transformed index exists.
-
-/// The rescue passes: `(read shows A>G?, index extension, transform from,
-/// transform to)`. Exactly one transform per pass.
-///
-/// Four passes, not two, because the transform and the reverse complement do
-/// not commute: `t_AG(revcomp(F))` sends a genomic A to T while
-/// `revcomp(t_AG(F))` sends it to C. Seeding is canonical — a minimizer is
-/// `min(kmer, revcomp(kmer))` (`esperanto_map::seed`) — so the orientation a
-/// read is found in is decided by which collapsed alphabet its k-mers live in,
-/// and the governing identity is
-///
-/// ```text
-/// revcomp( t_AG(revcomp(F)) ) == t_TC(F)
-/// ```
-///
-/// An A>G-edited read that is *antisense* to the genome therefore only seeds
-/// against the T>C index, and vice versa. Each transform consequently needs
-/// both indexes: the same-name pass finds the sense-oriented reads, the
-/// opposite-name pass the antisense ones. With only the two same-name passes
-/// every placement is plus-strand — measured on the simulated corpus, 7987 of
-/// 7987 — so one orientation of every transcript was unreachable, and since
-/// the two mates of a pair are always in opposite orientations, no hyperedited
-/// fragment could ever have both mates placed.
-///
-/// The cross passes are not a weaker test. A read is still collapsed under one
-/// transform only, so the alphabet stays three-letter and the negative-control
-/// logic is intact: a read that verifies under both the A>G and the T>C
-/// hypothesis is direction-ambiguous and is dropped.
-/// Rescue passes as (plus-frame expectation pair, index, read from, read to).
-/// `control = true` swaps the editing transforms for the negative-control
-/// alphabets (A>C, T>G): transforms no editing chemistry can produce.
-fn rescue_dirs(control: bool) -> [((u8, u8), &'static str, u8, u8); 4] {
-    if control {
-        [
-            ((b'A', b'C'), "ac.paidx", b'A', b'C'),
-            ((b'A', b'C'), "tg.paidx", b'A', b'C'),
-            ((b'T', b'G'), "tg.paidx", b'T', b'G'),
-            ((b'T', b'G'), "ac.paidx", b'T', b'G'),
-        ]
-    } else {
-        [
-            ((b'A', b'G'), "ag.paidx", b'A', b'G'),
-            ((b'A', b'G'), "tc.paidx", b'A', b'G'),
-            ((b'T', b'C'), "tc.paidx", b'T', b'C'),
-            ((b'T', b'C'), "ag.paidx", b'T', b'C'),
-        ]
-    }
+// Three-letter hyperediting rescue follows Porath, Carmi & Levanon,
+// Nat Commun 5:4726, 2014. Each pass collapses one editing direction.
+// Placements are checked against the four-letter reference; reads that
+// satisfy both editing directions are rejected as ambiguous. Accepted reads
+// receive RE:Z:collapsed and the mapping-quality cap in mapq_of.
+// Rescue is skipped when neither transformed index exists.
+/// Rescue passes: (editing direction, index extension, read from, read to).
+/// Both indexes are required for each direction because canonical seeding
+/// obeys revcomp(t_AG(revcomp(F))) == t_TC(F).
+fn rescue_dirs() -> [((u8, u8), &'static str, u8, u8); 4] {
+    [
+        ((b'A', b'G'), "ag.paidx", b'A', b'G'),
+        ((b'A', b'G'), "tc.paidx", b'A', b'G'),
+        ((b'T', b'C'), "tc.paidx", b'T', b'C'),
+        ((b'T', b'C'), "ag.paidx", b'T', b'C'),
+    ]
 }
 
 /// Maximum mismatches outside the pass's own editing direction tolerated in a
 /// verified placement — the transformed-space edit distance, since under the
 /// matching transform that direction's edits cost nothing.
-const RESCUE_MAX_NON_EDIT_MM: usize =
-    esperanto_map::mapq::HYPEREDIT_MAX_NON_EDIT_MM as usize;
-/// Gap penalty that makes the collapsed realignment gapless by construction.
-///
-/// Porath, Carmi & Levanon (Nat Commun 5:4726, 2014) realign hyperedited reads
-/// ungapped, and the reason is structural rather than stylistic: with A and G
-/// collapsed to one letter the dynamic program has many equal-scoring paths,
-/// so a gap that buys a match it would have had anyway opens for free. Leaving
-/// the gap penalties at their four-letter values and then refusing any output
-/// that contains a gap answers the wrong question -- it discards the candidate
-/// locus instead of asking what the best ungapped placement there is. On the
-/// real sample that refusal was 464,703 of 840,066 rejections, 55%, the
-/// channel's largest single loss, and the evidence offered for it was measured
-/// on the simulated corpus only. Charging the gap up front instead lets the
-/// same loci be scored and then policed by [`RESCUE_MAX_NON_EDIT_MM`]: a read
-/// that really does carry an indel goes out of register, accumulates ordinary
-/// mismatches and is refused on that evidence, while a read whose gap was an
-/// artifact of the reduced alphabet keeps its ungapped placement.
-///
-/// The extension is local, so soft-clipping always scores at least 0 and no
-/// gap can ever be on the optimal path once one costs more than the whole read
-/// can earn -- a few hundred bases at `match_score` 2. 400 is prohibitive by
-/// that measure and still small enough that `Acc for i16` never oversteps its
-/// `-30000` floor: every accumulator step moves by at most 400 against 2768
-/// bases of headroom, so the clamp in `add` is reached before the type is.
+const RESCUE_MAX_NON_EDIT_MM: usize = esperanto_map::mapq::HYPEREDIT_MAX_NON_EDIT_MM as usize;
+/// Gap penalty for ungapped collapsed realignment, as in Porath, Carmi &
+/// Levanon (Nat Commun 5:4726, 2014). Local extension can soft-clip instead
+/// of paying this penalty. The value stays within the i16 accumulator's
+/// saturating arithmetic; accepted placements must also pass the gap check.
 const RESCUE_GAP_PENALTY: i32 = 400;
 /// Reads at or below this length need a stricter editing purity.
 const RESCUE_SHORT_READ_MAX_LEN: usize = 60;
@@ -620,53 +511,17 @@ const RESCUE_CLUSTER_MAX_NT_FRAC: f64 = 0.60;
 /// this distance on the same contig, in the opposite orientation.
 const RESCUE_PE_MATE_WINDOW: i64 = 500_000;
 
-/// Collapsed rescue with the optional negative-control pass. The control
-/// runs FIRST, while unmapped.fq.gz and raw.bam are pristine; it counts only
-/// and never merges. The ratio line lands after the normal pass so both
-/// numbers are final.
-#[allow(clippy::too_many_arguments)]
-fn rescue_with_optional_control(
-    params: &RunParams,
-    paidx: &Path,
-    live_reference: Option<&'static esperanto_map::fasta::Reference>,
-    map_dir: &Path,
-    raw_bam: &Path,
-) -> Result<(), FlowError> {
-    let control_verified = if params.rescue_control {
-        Some(rescue_collapsed(
+fn stage_rescue_collapsed(params: &RunParams, raw_bam: &Path) -> Result<(), FlowError> {
+    if let Some(paidx) = &params.index {
+        rescue_collapsed(
             paidx,
-            live_reference,
-            map_dir,
+            None,
+            &params.out_dir.join("map"),
             params.threads,
             raw_bam,
-            true,
-        )?)
-    } else {
-        None
-    };
-    let rescued = rescue_collapsed(paidx, live_reference, map_dir, params.threads, raw_bam, false)?;
-    if let Some(n) = control_verified {
-        let ratio = if rescued > 0 {
-            n as f64 / rescued as f64
-        } else {
-            0.0
-        };
-        eprintln!("[rescue] control alphabet: {n} verified (ratio {ratio:.2})");
+        )?;
     }
     Ok(())
-}
-
-fn stage_rescue_collapsed(params: &RunParams, raw_bam: &Path) -> Result<(), FlowError> {
-    let Some(paidx) = params.index.clone() else {
-        return Ok(());
-    };
-    rescue_with_optional_control(
-        params,
-        &paidx,
-        None,
-        &params.out_dir.join("map"),
-        raw_bam,
-    )
 }
 
 fn rescue_collapsed(
@@ -675,15 +530,17 @@ fn rescue_collapsed(
     map_dir: &Path,
     threads: usize,
     raw_bam: &Path,
-    control: bool,
 ) -> Result<u64, FlowError> {
-    let dirs: Vec<((u8, u8), PathBuf, u8, u8)> = rescue_dirs(control)
-        .iter()
-        .map(|&(dir, ext, from, to)| (dir, paidx.with_extension(ext), from, to))
-        .filter(|(_, p, _, _)| p.is_file())
-        .collect();
-    if dirs.is_empty() {
-        return Ok(0);
+    let mut dirs: Vec<((u8, u8), PathBuf, u8, u8)> = Vec::new();
+    for &(dir, ext, from, to) in rescue_dirs().iter() {
+        let path = paidx.with_extension(ext);
+        if !path.is_file() {
+            return Err(FlowError::Entry(format!(
+                "rescue index {} not found; rebuild with `esperanto index` (it always builds the rescue indexes; the collapsed-rescue channel refuses to degrade silently)",
+                path.display()
+            )));
+        }
+        dirs.push((dir, path, from, to));
     }
     let unm_path = map_dir.join("unmapped.fq.gz");
     if !unm_path.is_file() {
@@ -713,12 +570,9 @@ fn rescue_collapsed(
         }
         out
     };
-    // Tier 1 almost never refuses a read outright — it soft-clips it, or
-    // places it whole with a mismatch spectrum it does not stand behind — so
-    // `unmapped.fq.gz` is the residue rather than the population this channel
-    // is looking for. [`collect_deferred`] adds the placements Tier 1 declines
-    // to explain; a deferred read's original record is replaced only if a
-    // direction verifies, so nothing is lost by trying.
+    // Include primary placements with insufficient aligned coverage or
+    // excessive unexplained mismatches. Replace a deferred placement only
+    // after a rescue direction passes all evidence checks.
     let n_unmapped = fq.len();
     fq.extend(collect_deferred(raw_bam)?);
     let dropped = dedup_pool(&mut fq);
@@ -743,20 +597,14 @@ fn rescue_collapsed(
         .collect();
     let prefiltered = (fq.len() - cand_idx.len()) as u64;
 
-    // Honest accounting into align_qc.json; the rescue runs after the
-    // stats document is written, so the keys are patched in here (the
-    // report stage treats absence as 0).
+    // Persist rescue counts after the mapping statistics have been written.
     let patch_stats = |verified: u64, rejected: u64| -> Result<(), FlowError> {
         let p = map_dir.join("align_qc.json");
         let mut stats: esperanto_map::stats::AlignStats =
             serde_json::from_str(&fs::read_to_string(&p)?).map_err(stage_err("map"))?;
-        if control {
-            stats.rescue_control_verified = Some(verified);
-        } else {
-            stats.rescued_collapsed = Some(verified);
-            stats.rescue_rejected_collapsed = Some(rejected);
-            stats.rescue_prefiltered_collapsed = Some(prefiltered);
-        }
+        stats.rescued_collapsed = Some(verified);
+        stats.rescue_rejected_collapsed = Some(rejected);
+        stats.rescue_prefiltered_collapsed = Some(prefiltered);
         let json = serde_json::to_string_pretty(&stats).map_err(stage_err("map"))?;
         fs::write(&p, format!("{json}\n"))?;
         Ok(())
@@ -801,11 +649,7 @@ fn rescue_collapsed(
     let mut ambiguous: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut placed_count = 0usize;
     let mut rejected = 0u64;
-    // Rejection attribution, keyed by (gate, placement was minus-strand). The
-    // strand dimension is not decoration: `apply_t13` presents a minus-strand
-    // placement in reference orientation, which relabels the pass's own
-    // editing direction, so a gate that closes only on one strand is a
-    // different defect from one that closes on both.
+    // Count rejection reasons separately by strand.
     let mut why: std::collections::BTreeMap<(&'static str, bool), u64> =
         std::collections::BTreeMap::new();
     for (dir, ipath, from, to) in &dirs {
@@ -919,7 +763,10 @@ fn rescue_collapsed(
             // written pointing at a record that was dropped.
             let (base, slot) = split_mate_marker(&fq[i].0);
             let key = base.as_bytes();
-            let four_letter = mates.as_ref().and_then(|m| m.get(key)).and_then(|s| s[slot]);
+            let four_letter = mates
+                .as_ref()
+                .and_then(|m| m.get(key))
+                .and_then(|s| s[slot]);
             if let Some(slots) = placed.get_mut(key) {
                 slots[slot] = four_letter;
             }
@@ -935,17 +782,6 @@ fn rescue_collapsed(
     let mut rescued_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut rescued_slots: std::collections::HashSet<(Vec<u8>, usize)> =
         std::collections::HashSet::new();
-    if control {
-        // Negative-control pass: count only. Nothing is merged, moved, or
-        // rewritten; the verified count is the whole product.
-        patch_stats(winner.len() as u64, rejected)?;
-        eprintln!(
-            "[rescue] control alphabet: {} verified ({} rejected)",
-            winner.len(),
-            rejected
-        );
-        return Ok(winner.len() as u64);
-    }
     #[allow(clippy::type_complexity)]
     let mut rescued: Vec<(
         String,
@@ -979,9 +815,7 @@ fn rescue_collapsed(
         rows.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
         let parts: Vec<String> = rows
             .iter()
-            .map(|((gate, minus), n)| {
-                format!("{gate}{}={n}", if *minus { "(-)" } else { "(+)" })
-            })
+            .map(|((gate, minus), n)| format!("{gate}{}={n}", if *minus { "(-)" } else { "(+)" }))
             .collect();
         eprintln!("[rescue] rejected by: {}", parts.join(" "));
     }
@@ -1013,9 +847,8 @@ fn rescue_collapsed(
         );
     }
 
-    // Per-read rescue record for the hyperedited-region caller: edit
-    // positions were computed by the verification walk and are reference
-    // 0-based.
+    // Persist reference-based edit positions and support for each rescued
+    // read. The resume validator checks this record against raw.bam.
     {
         let mut text = String::new();
         use std::fmt::Write as _;
@@ -1028,7 +861,11 @@ fn rescue_collapsed(
                 name,
                 true_ref.contigs[a.contig as usize].name,
                 a.pos,
-                if a.strand == esperanto_map::seed::Strand::Minus { '-' } else { '+' },
+                if a.strand == esperanto_map::seed::Strand::Minus {
+                    '-'
+                } else {
+                    '+'
+                },
                 dir.0 as char,
                 dir.1 as char,
                 proof.len(),
@@ -1063,12 +900,9 @@ fn rescue_collapsed(
     };
     let merged = raw_bam.with_extension("merged.bam");
     {
-        let mut w = rust_htslib::bam::Writer::from_path(
-            &merged,
-            &header,
-            rust_htslib::bam::Format::Bam,
-        )
-        .map_err(stage_err("map"))?;
+        let mut w =
+            rust_htslib::bam::Writer::from_path(&merged, &header, rust_htslib::bam::Format::Bam)
+                .map_err(stage_err("map"))?;
         {
             let mut rdr = rust_htslib::bam::Reader::from_path(raw_bam).map_err(stage_err("map"))?;
             for r in rdr.records() {
@@ -1102,28 +936,15 @@ fn rescue_collapsed(
             rec.set(qname, None, &s2, &esperanto_map::bam::phred_from_ascii(&q2));
             rec.set_tid(tid as i32);
             rec.set_pos(a.pos as i64);
-            // Not 0. `mapq_of` already caps a rescued placement at
-            // `PILEUP_GATE` because it was won in a reduced alphabet, and that
-            // cap is the whole policy; overwriting it with 0 put every rescued
-            // read below the caller's own `min_mapq`, so the channel could not
-            // contribute a call however strictly it had been verified. The
-            // margin term still applies underneath the cap, so a rescued
-            // placement with a near-tied runner-up stays low on its own.
+            // Preserve the transformed-index margin, capped by mapq_of at
+            // PILEUP_GATE for rescued placements.
             rec.set_mapq(esperanto_map::mapq::mapq_of(a));
             let mut flag = 0u16;
             if rev {
                 flag |= 0x10;
             }
-            // Paired input makes this record one segment of a template
-            // whatever became of its mate, so the pair flags follow `pe` and
-            // the read's own slot. Conditioning them on a *found* mate instead
-            // wrote both mates of an all-rescued fragment as unpaired
-            // single-end records: same qname, neither flagged read1 or read2,
-            // hence one `(qname, mate)` key for two primaries. That was
-            // unreachable while the rescue needed an already-mapped mate and
-            // appeared the moment phase 2 let both mates through — 418
-            // duplicate primaries on the simulated corpus, every one of them
-            // rescue-produced.
+            // Pair flags follow the input type and template slot even when
+            // the mate has no accepted placement.
             if pe {
                 flag |= 0x1 | if slot == 0 { 0x40 } else { 0x80 };
                 match placed
@@ -1169,11 +990,7 @@ fn rescue_collapsed(
                     }
                 })
                 .collect();
-            // The second set() must carry offset-free Phred like the first
-            // one (rust-htslib Record::set documents qual as "Phred-scaled
-            // quality values, without any offset"); passing the ASCII bytes
-            // here overwrote the converted values and stored every rescued
-            // read's quality inflated by +33.
+            // Record::set requires Phred values without the ASCII offset.
             rec.set(
                 qname,
                 Some(&rust_htslib::bam::record::CigarString(cigar)),
@@ -1184,36 +1001,6 @@ fn rescue_collapsed(
                 .map_err(stage_err("map"))?;
             w.write(&rec).map_err(stage_err("map"))?;
         }
-    }
-    // The SE fast channel (.baln) must carry the rescued records too —
-    // baln has no trailer, records append cleanly.
-    let baln_path = map_dir.join("align.baln");
-    if baln_path.is_file() {
-        let mut w = std::io::BufWriter::with_capacity(
-            8 << 20,
-            std::fs::OpenOptions::new()
-                .append(true)
-                .open(&baln_path)?,
-        );
-        for (name, seq, qual, a, _, _) in &rescued {
-            let mapq = esperanto_map::mapq::mapq_of(a);
-            let mut a2 = a.clone();
-            a2.rescued = false; // the RE tag below carries the provenance
-            let mut br = esperanto_map::bam::record_se(name.as_bytes(), seq, qual, Some(&a2));
-            // Same value the BAM record carries: `a2.rescued` was cleared to
-            // move the provenance into the RE tag, which also removes the cap
-            // `mapq_of` would apply, so take the number before clearing it.
-            br.mapq = mapq;
-            if let Some(view) = br.aln.as_mut() {
-                view.tags.push(esperanto_bamio::RawTag(
-                    *b"RE",
-                    esperanto_bamio::TagValue::Str("collapsed".into()),
-                ));
-            }
-            esperanto_map::baln::write_record(&mut w, &br).map_err(stage_err("map"))?;
-        }
-        use std::io::Write as _;
-        w.flush()?;
     }
     fs::rename(&merged, raw_bam)?;
 
@@ -1309,40 +1096,12 @@ const RESCUE_CLIPPED_COVERAGE: f64 = 0.7;
 /// shape so the passes below cannot tell them apart.
 type RescueRead = (String, Vec<u8>, Vec<u8>);
 
-/// Primary placements Tier 1 does not stand behind, offered to the rescue
-/// passes in the read's own orientation and named the way `unmapped.fq.gz`
-/// names its records, so both sources share one code path downstream.
-///
-/// `unmapped.fq.gz` alone is the wrong input pool for this channel, and not by
-/// a little. A local Smith-Waterman always finds a positive-scoring window in
-/// 3 Gb, so esperanto maps 98.9% of reads and its unmapped set is 1.1% of the
-/// library — the residue too degenerate to place at all. Porath, Carmi &
-/// Levanon (Nat Commun 5:4726, 2014) run the same realignment on the unmapped
-/// output of a *refusing* aligner, where the pool is 10-20% of the library and
-/// enriched for hyperediting precisely because the mismatch ceiling threw
-/// those reads out. Downstream of a permissive aligner the pool is instead
-/// anti-selected for what the channel looks for: the hyperedited reads were
-/// already placed, badly, and never arrive. That is measurable in the
-/// rejection attribution — 28.5% of real rejections are `no_edits`, reads with
-/// no editing signal at all at the locus offered.
-///
-/// So the pool is the two ways Tier 1 declines to explain a read:
-///
-///   - it aligned only part of the read, leaving more than
-///     `1 - RESCUE_CLIPPED_COVERAGE` soft-clipped; the clipped remainder is
-///     where a run of edits would sit.
-///   - it aligned the whole read but with a mismatch spectrum at or above
-///     [`esperanto_map::mapq::HYPEREDIT_MIN_DENSITY`] that A-to-I editing does
-///     not account for. That is the same threshold, read off the same `EK`
-///     field, that already capped the placement's MAPQ below the pileup gate,
-///     so these records contribute no call as they stand and a verified
-///     editing placement can only improve on them.
-///
-/// `EK` reports `mm` (ordinary mismatches) but sums the two editing
-/// directions, so the density here is `mm` over aligned columns — a lower
-/// bound on `ReadAlignment::unexplained_density`, which also charges the minor
-/// editing direction. The pool is therefore slightly under-inclusive relative
-/// to what the MAPQ cap distrusted, which is the safe direction.
+/// Return primary placements for rescue in their sequenced orientation.
+/// Eligible reads have aligned coverage below RESCUE_CLIPPED_COVERAGE or
+/// ordinary-mismatch density at least HYPEREDIT_MIN_DENSITY. Rescued records
+/// from an interrupted merge are included so the pass can be repeated.
+/// The EK ordinary-mismatch count excludes editing-class substitutions and
+/// is a lower bound on the unexplained density used by the MAPQ cap.
 fn collect_deferred(raw_bam: &Path) -> Result<Vec<RescueRead>, FlowError> {
     use rust_htslib::bam::record::Cigar;
     let mut rdr = rust_htslib::bam::Reader::from_path(raw_bam).map_err(stage_err("map"))?;
@@ -1384,7 +1143,10 @@ fn collect_deferred(raw_bam: &Path) -> Result<Vec<RescueRead>, FlowError> {
             .cigar()
             .iter()
             .filter_map(|op| match op {
-                Cigar::Match(n) | Cigar::Equal(n) | Cigar::Diff(n) | Cigar::Ins(n)
+                Cigar::Match(n)
+                | Cigar::Equal(n)
+                | Cigar::Diff(n)
+                | Cigar::Ins(n)
                 | Cigar::Del(n) => Some(*n),
                 _ => None,
             })
@@ -1407,14 +1169,9 @@ fn collect_deferred(raw_bam: &Path) -> Result<Vec<RescueRead>, FlowError> {
     Ok(out)
 }
 
-/// Drop duplicate pool entries by (template name, mate slot). A read sits in
-/// both halves of the pool when an earlier pass merged it into raw.bam but
-/// was killed before evicting it from unmapped.fq.gz; winner bookkeeping is
-/// keyed by pool index, so a duplicate would double the rescued set, the seal
-/// count and the merged records together — internally consistent and wrong.
-/// The first occurrence wins; the unmapped half always precedes the deferred
-/// half and its keys are unique by the writer contract, so the
-/// `fq[..n_unmapped]` eviction contract is unaffected.
+/// Keep the first pool entry per (template name, mate slot). Unmapped reads
+/// precede deferred reads, preserving the prefix used during FASTQ eviction.
+/// This also prevents duplicate records after an interrupted BAM merge.
 fn dedup_pool(fq: &mut Vec<RescueRead>) -> usize {
     let mut seen = std::collections::HashSet::new();
     let before = fq.len();
@@ -1534,39 +1291,24 @@ fn rescue_prefilter(seq: &[u8], qual: &[u8]) -> bool {
     let drop = len / 10;
     let kept = &qs[drop..];
     let mean = if kept.is_empty() {
-        qs.iter().map(|&q| (q.saturating_sub(33)) as f64).sum::<f64>() / len as f64
+        qs.iter()
+            .map(|&q| (q.saturating_sub(33)) as f64)
+            .sum::<f64>()
+            / len as f64
     } else {
-        kept.iter().map(|&q| (q.saturating_sub(33)) as f64).sum::<f64>() / kept.len() as f64
+        kept.iter()
+            .map(|&q| (q.saturating_sub(33)) as f64)
+            .sum::<f64>()
+            / kept.len() as f64
     };
     mean >= RESCUE_MIN_MEAN_PHRED
 }
 
-/// Post-placement verification against the true reference. A placement
-/// survives only when its mismatch pattern is that of a hyperedited read of
-/// the pass's own direction: a dense cluster of high-quality edits of *that
-/// one* direction dominating every other mismatch class, with sane cluster
-/// geometry.
-///
-/// `ag` is the direction the read showed *as sequenced*. The comparison here
-/// runs in reference orientation, and `apply_t13` reverse-complements a
-/// minus-strand placement to get there, which relabels the direction: an
-/// A>G-edited read placed on the minus strand presents as ref T/read C. The
-/// expected class is therefore `ag XOR minus`, not `ag`. Taking it from `ag`
-/// alone charged every edit of a minus-strand placement as an ordinary
-/// mismatch, so no such placement could ever clear
-/// [`RESCUE_MAX_NON_EDIT_MM`] — latent while the pass table produced only
-/// plus-strand placements, live now that it produces both (see
-/// [`rescue_dirs`]).
-///
-/// The opposite direction is not a second editing class here, it is an
-/// ordinary mismatch. Counting both would restore the two-letter collapse at
-/// the verification step and let a paralog that exploits transitions in both
-/// directions pass as an edited transcript.
-///
-/// `Err` carries the gate that refused the placement, so the stage can report
-/// *why* it rejected rather than only how many. A channel that rejects
-/// everything is indistinguishable from a channel that is switched off unless
-/// it says which gate closed.
+/// Verify a placement against the four-letter reference. Only the pass's
+/// editing direction is exempt from ordinary-mismatch counting. On the
+/// minus strand that direction is complemented to reference orientation.
+/// Accepted reads must satisfy the quality, purity, density, geometry,
+/// and ungapped-alignment conditions below. Errors name the rejection gate.
 fn verify_rescue_placement(
     aln: &esperanto_map::mapq::ReadAlignment,
     seq: &[u8],
@@ -1584,14 +1326,7 @@ fn verify_rescue_placement(
     let Some(contig) = true_ref.contigs.get(aln.contig as usize) else {
         return Err("bad_contig");
     };
-    // The collapsed realignment is gapless by construction, not by refusal:
-    // [`RESCUE_GAP_PENALTY`] prices a gap above what the whole read can earn,
-    // so a local extension soft-clips instead of opening one. This arm is the
-    // assertion that it did, kept as a returned gate rather than a panic so
-    // that a gap arriving from somewhere else — a future splice or chain path
-    // that does not consult the extension's penalties — shows up in the
-    // rejection attribution instead of aborting the run. It is expected to be
-    // zero; the walk below relies on it.
+    // Reject gaps before walking reference coordinates.
     let mut ref_span = 0u32;
     for op in &aln.cigar {
         match op {
@@ -1637,8 +1372,8 @@ fn verify_rescue_placement(
                         non_edit += 1;
                     } else if rb != fb {
                         total_mm += 1;
-                        let editing =
-                            fb == Base::from_ascii(expect_from) && rb == Base::from_ascii(expect_to);
+                        let editing = fb == Base::from_ascii(expect_from)
+                            && rb == Base::from_ascii(expect_to);
                         if !editing {
                             // Anything that is not this direction's edit is an
                             // ordinary mismatch, and the transformed-space edit
@@ -1723,16 +1458,9 @@ fn complement_base(b: u8) -> u8 {
     }
 }
 
-/// Paired-end concordance for a rescued placement: the mate must sit on the
-/// same contig within the insert window, in the opposite orientation.
-///
-/// `placed` must already include the placements the rescue itself produced,
-/// not only the four-letter mapped ones. Both mates of a hyperedited fragment
-/// are typically refused by Tier 1 together, so a gate that demands an
-/// already-mapped mate rejects exactly the fragments this channel exists to
-/// recover — measured on the simulated corpus, 2761 of 7987 placements passed
-/// every editing-signature gate and died here alone. Each mate's placement is
-/// evidence for the other, so the check runs once after all passes.
+/// Require the mate on the same contig within RESCUE_PE_MATE_WINDOW and
+/// in the opposite orientation. Check after all passes using both primary
+/// and rescued placements so two rescued mates can support each other.
 fn rescue_mate_gate(
     aln: &esperanto_map::mapq::ReadAlignment,
     name: &str,
@@ -1777,205 +1505,10 @@ fn stage_scan(params: &RunParams, bam: &Path) -> Result<PathBuf, FlowError> {
     let dir = params.out_dir.join("scan");
     fs::create_dir_all(&dir)?;
     let out = dir.join("candidates.bed");
-    let mut cp = CallParams::standard(bam.to_path_buf(), out.clone(), params.fasta.clone());
-    cp.snp = params.snp.clone();
-    cp.threads = params.threads;
-    let stats = esperanto_scan::run_call(&cp).map_err(stage_err("scan"))?;
-    eprintln!(
-        "[scan] {} candidates ({} below threshold, {} known SNPs removed)",
-        stats.candidates, stats.below_threshold, stats.snp_removed
-    );
-    let [e, c1, c2] = stats.channels;
-    let ctrl_mean = (c1.sites + c2.sites) as f64 / 2.0;
-    let (snr, fdr) = crate::stages::channel_snr_fdr(e.sites, ctrl_mean);
-    eprintln!("[scan] channel S/N {snr:.2}x (implied FDR {:.1}%)", fdr * 100.0);
+    let count = esperanto_score::unified::discover_sites(bam, &params.fasta, &out, params.threads)
+        .map_err(anyhow_stage_err("scan"))?;
+    eprintln!("[scan] {count} observation sites");
     Ok(out)
-}
-
-/// S/N and implied FDR from the three mismatch channels.
-pub fn channel_snr_fdr(editing: usize, control_mean: f64) -> (f64, f64) {
-    let snr = if control_mean > 0.0 {
-        editing as f64 / control_mean
-    } else {
-        f64::INFINITY
-    };
-    let fdr = if editing > 0 {
-        control_mean / editing as f64
-    } else {
-        0.0
-    };
-    (snr, fdr)
-}
-
-/// Supporting-read re-alignment (verify): withdraw votes whose exhaustive
-/// re-alignment prefers another placement. Writes `candidates.verified.bed`
-/// (input columns + alt_verified + withdrawn); sites are never dropped
-/// here, only annotated — the VCF stage turns low-verification sites into
-/// `FILTER=REALIGN` rows.
-fn stage_verify(
-    params: &RunParams,
-    bam: &Path,
-    bed: &Path,
-    map_handles: Option<(
-        &'static esperanto_map::index::Index,
-        Option<Arc<esperanto_engine::L1Index>>,
-    )>,
-) -> Result<PathBuf, FlowError> {
-    eprintln!("[verify] running");
-    let out = bed.with_extension("verified.bed");
-    let Some(index_path) = &params.index else {
-        // Honest refusal: without the alignment index there is nothing to
-        // re-align against, and a pass-through verified bed would be read as
-        // real evidence downstream.
-        return Err(FlowError::Entry(
-            "verify requires an alignment index; pass --index or run setup".into(),
-        ));
-    };
-    let vp = esperanto_verify::VerifyParams {
-        bam: bam.to_path_buf(),
-        candidates: bed.to_path_buf(),
-        index: index_path.clone(),
-        l1_bundle: params.l1_bundle.clone(),
-        out: out.clone(),
-        threads: params.threads,
-        ..Default::default()
-    };
-    let stats = match &map_handles {
-        // FASTQ entry this process: reuse the map stage's handles.
-        Some((index, l1)) => esperanto_verify::run_with_index(&vp, index, l1.clone()),
-        // BAM entry (no map stage ran here): load our own.
-        None => esperanto_verify::run(&vp),
-    }
-    .map_err(stage_err("verify"))?;
-    eprintln!(
-        "[verify] {} candidates, {} sites kept, {} votes withdrawn of {} reads",
-        stats.candidates, stats.sites_kept, stats.votes_withdrawn, stats.reads_examined
-    );
-    verify_control_channels(params, bam, bed, &out, map_handles)?;
-    Ok(out)
-}
-
-/// Verify-output rows passing the keep rule (alt_verified >= 2 and >= 1% of
-/// depth), counting filter-clean candidates only.
-fn verify_kept_count(path: &Path) -> Result<usize, FlowError> {
-    let text = fs::read_to_string(path)?;
-    let mut n = 0;
-    for line in text.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let raw: Vec<&str> = line.split('\t').collect();
-        if raw.len() < 12 || !raw[10].is_empty() {
-            continue;
-        }
-        let f: Vec<&str> = raw.into_iter().filter(|s| !s.is_empty()).collect();
-        let depth: f64 = f[4].parse().unwrap_or(0.0);
-        let altv: f64 = f[f.len() - 2].parse().unwrap_or(0.0);
-        if altv >= 2.0 && (depth == 0.0 || altv / depth >= 0.01) {
-            n += 1;
-        }
-    }
-    Ok(n)
-}
-
-/// Control channels through the same withdrawal machinery: C1/C2 candidates
-/// are verified with their own alternates, and only the implied-FDR
-/// bookkeeping consumes the results (plus the kept beds for audit).
-fn verify_control_channels(
-    params: &RunParams,
-    bam: &Path,
-    bed: &Path,
-    verified: &Path,
-    map_handles: Option<(
-        &'static esperanto_map::index::Index,
-        Option<Arc<esperanto_engine::L1Index>>,
-    )>,
-) -> Result<(), FlowError> {
-    let dir = bed.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
-    let control_bed = dir.join("control_candidates.bed");
-    let channels_path = dir.join("channels.json");
-    if !control_bed.exists() || !channels_path.exists() {
-        return Ok(());
-    }
-    let Some(index_path) = &params.index else {
-        return Ok(());
-    };
-    let text = fs::read_to_string(&control_bed)?;
-    let mut inputs = Vec::new();
-    for (name, tag, ch) in [
-        ("control_c1", "C1", esperanto_verify::Channel::Ctrl1),
-        ("control_c2", "C2", esperanto_verify::Channel::Ctrl2),
-    ] {
-        let mut body = String::new();
-        for line in text.lines() {
-            if line.ends_with(tag) {
-                body.push_str(line);
-                body.push('\n');
-            }
-        }
-        let inp = dir.join(format!("{name}.bed"));
-        fs::write(&inp, body)?;
-        inputs.push((inp, ch));
-    }
-    let mut kept = [verify_kept_count(verified)?, 0, 0];
-    for (i, (inp, ch)) in inputs.iter().enumerate() {
-        let vout = inp.with_extension("verified.bed");
-        let vp = esperanto_verify::VerifyParams {
-            bam: bam.to_path_buf(),
-            candidates: inp.clone(),
-            index: index_path.clone(),
-            l1_bundle: params.l1_bundle.clone(),
-            out: vout.clone(),
-            threads: params.threads,
-            channel: *ch,
-            ..Default::default()
-        };
-        match &map_handles {
-            Some((index, l1)) => esperanto_verify::run_with_index(&vp, index, l1.clone()),
-            None => esperanto_verify::run(&vp),
-        }
-        .map_err(stage_err("verify"))?;
-        kept[i + 1] = verify_kept_count(&vout)?;
-    }
-    let mut doc: serde_json::Value = serde_json::from_str(&fs::read_to_string(&channels_path)?)
-        .map_err(|e| FlowError::Json(e.to_string()))?;
-    let pre_fdr = doc["implied_fdr"].as_f64().unwrap_or(0.0);
-    let post_mean = (kept[1] + kept[2]) as f64 / 2.0;
-    let post_fdr = if kept[0] > 0 {
-        post_mean / kept[0] as f64
-    } else {
-        0.0
-    };
-    doc["editing_post"] = serde_json::json!(kept[0]);
-    doc["control_1_post"] = serde_json::json!(kept[1]);
-    doc["control_2_post"] = serde_json::json!(kept[2]);
-    doc["implied_fdr_post"] = serde_json::json!(post_fdr);
-    fs::write(&channels_path, serde_json::to_string_pretty(&doc).map_err(|e| FlowError::Json(e.to_string()))?)?;
-    let c1_pre = doc["control_1"]["sites"].as_u64().unwrap_or(0);
-    let c2_pre = doc["control_2"]["sites"].as_u64().unwrap_or(0);
-    eprintln!(
-        "[verify] control channels: C1 {} -> {} sites, C2 {} -> {} sites; implied FDR pre {:.1}% -> post {:.1}%",
-        c1_pre,
-        kept[1],
-        c2_pre,
-        kept[2],
-        pre_fdr * 100.0,
-        post_fdr * 100.0
-    );
-    Ok(())
-}
-
-/// Hyperedited-region caller over the collapsed-rescue record. FASTQ entries
-/// only: without map/rescued.tsv the stage is a no-op.
-fn stage_hyper(params: &RunParams) -> Result<(), FlowError> {
-    let map_dir = params.out_dir.join("map");
-    if !map_dir.join("rescued.tsv").is_file() {
-        return Ok(());
-    }
-    eprintln!("[hyper] running");
-    let (nr, ns) = crate::hyper::run(&map_dir, &params.out_dir, &params.fasta)?;
-    eprintln!("[hyper] {nr} regions, {ns} sites");
-    Ok(())
 }
 
 /// candidates.bed → sites bridge (spec: col 1 = chrom, col 3 = 1-based pos).
@@ -2029,230 +1562,46 @@ fn read_sites_file(path: &Path) -> Result<Vec<(String, i64)>, FlowError> {
     Ok(sites)
 }
 
-/// Score stage outcome: per-site probabilities (input order), Tier-2-only
-/// rescue-site probabilities (hyper row order) and the frozen thresholds.
-struct ScoreOutcome {
-    probs: Vec<Option<f64>>,
-    hyper_probs: Vec<Option<f64>>,
-    thresholds: vcf::ScoreThresholds,
-}
-
+/// Score sites in input order and persist the unified classifier output.
 fn stage_score(
     params: &RunParams,
     bam: &Path,
     sites: &[(String, i64)],
-) -> Result<ScoreOutcome, FlowError> {
+) -> Result<(Vec<f64>, f64), FlowError> {
     let dir = params.out_dir.join("score");
     fs::create_dir_all(&dir)?;
-    let (pass, hyper) = load_cmc_thresholds(&params.bundle)
+    let threshold = load_primary_threshold(&params.bundle)
         .map_err(|e| anyhow_stage_err("score")(anyhow::anyhow!("{e}")))?;
-    let thresholds = vcf::ScoreThresholds {
-        pass,
-        hyper: Some(hyper),
-    };
-    if sites.is_empty() {
-        // Empty candidates: empty scores.tsv + header-only VCF, exit 0.
-        fs::write(dir.join("scores.tsv"), "")?;
-        return Ok(ScoreOutcome {
-            probs: Vec::new(),
-            hyper_probs: Vec::new(),
-            thresholds,
-        });
-    }
-    eprintln!("[score] running");
-    // Hybrid runs: only human-locus sites are scored (scientific contract —
-    // there is no mouse model); mouse-contig sites reach the VCF marked
-    // UNSCORED with VAF/DEPTH kept.
-    let manifest = crate::manifest::SpeciesManifest::read(&params.out_dir)?;
-    let hybrid = manifest.as_ref().is_some_and(|m| m.kind == "hybrid");
-    let scored: Vec<Option<f64>> = if hybrid {
-        let m = manifest.as_ref().expect("hybrid checked");
-        let human_sites: Vec<(String, i64)> = sites
-            .iter()
-            .filter(|(c, _)| m.owner_of(c) == Some("human"))
-            .cloned()
-            .collect();
-        let mouse_n = sites.len() - human_sites.len();
-        let mut by_site: std::collections::HashMap<(String, i64), f64> =
-            std::collections::HashMap::with_capacity(sites.len());
-        if !human_sites.is_empty() {
-            let probs = score_pipeline::score_sites_batched(
-                bam,
-                &params.fasta,
-                &params.bundle,
-                &human_sites,
-                params.threads,
-                score_pipeline::ReferenceCheck::TrustedHybrid,
-            )
-            .map_err(anyhow_stage_err("score"))?;
-            for (s, p) in human_sites.iter().zip(probs) {
-                by_site.insert(s.clone(), p);
-            }
-        }
-        if mouse_n > 0 {
-            eprintln!(
-                "[score] hybrid: {mouse_n} mouse-contig sites marked UNSCORED (no mouse model installed)"
-            );
-        }
-        sites
-            .iter()
-            .map(|s| by_site.get(s).copied())
-            .collect::<Vec<Option<f64>>>()
+    let scores = if sites.is_empty() {
+        Vec::new()
     } else {
+        eprintln!("[score] running");
         score_pipeline::score_sites_batched(
             bam,
             &params.fasta,
             &params.bundle,
             sites,
             params.threads,
-            score_pipeline::ReferenceCheck::Guardrail,
         )
         .map_err(anyhow_stage_err("score"))?
-        .into_iter()
-        .map(Some)
-        .collect()
     };
-
-    let probs = scored;
     let mut text = String::new();
-    for ((chrom, pos), prob) in sites.iter().zip(&probs) {
+    for ((chrom, pos), score) in sites.iter().zip(&scores) {
         use std::fmt::Write as _;
-        match prob {
-            Some(p) => {
-                let _ = writeln!(text, "{chrom}\t{pos}\t{p}");
-            }
-            None => {
-                let _ = writeln!(text, "{chrom}\t{pos}\tNA");
-            }
-        }
+        let _ = writeln!(text, "{chrom}\t{pos}\t{score}");
     }
     fs::write(dir.join("scores.tsv"), text)?;
-    eprintln!("[score] {} sites", probs.len());
-
-    // Tier-2-only rescue sites: scored with the rescue model, never on mouse
-    // contigs (hybrid runs keep those unscored).
-    let (_, hyper_rows) = vcf::hyper_rows(params, sites)?;
-    let mut hyper_probs: Vec<Option<f64>> = vec![None; hyper_rows.len()];
-    if !hyper_rows.is_empty() {
-        let human_idx: Vec<usize> = (0..hyper_rows.len())
-            .filter(|&i| {
-                !manifest
-                    .as_ref()
-                    .is_some_and(|m| m.kind == "hybrid" && m.owner_of(&hyper_rows[i].key.0) == Some("mouse"))
-            })
-            .collect();
-        if !human_idx.is_empty() {
-            let site_list: Vec<(String, i64)> = human_idx
-                .iter()
-                .map(|&i| hyper_rows[i].key.clone())
-                .collect();
-            let check = if hybrid {
-                score_pipeline::ReferenceCheck::TrustedHybrid
-            } else {
-                score_pipeline::ReferenceCheck::Guardrail
-            };
-            let scored_h = score_pipeline::score_hyper_sites_batched(
-                bam,
-                &params.fasta,
-                &params.bundle,
-                &site_list,
-                params.threads,
-                check,
-            )
-            .map_err(anyhow_stage_err("score"))?;
-            for (k, &i) in human_idx.iter().enumerate() {
-                hyper_probs[i] = Some(scored_h[k]);
-            }
-            eprintln!(
-                "[score] {} tier-2-only rescue sites scored (rescue model)",
-                scored_h.len()
-            );
-        }
-    }
-    if !hyper_rows.is_empty() {
-        use std::fmt::Write as _;
-        let mut htext = String::new();
-        for (row, prob) in hyper_rows.iter().zip(&hyper_probs) {
-            match prob {
-                Some(p) => {
-                    let _ = writeln!(htext, "{}\t{}\t{p}", row.key.0, row.key.1);
-                }
-                None => {
-                    let _ = writeln!(htext, "{}\t{}\tNA", row.key.0, row.key.1);
-                }
-            }
-        }
-        fs::write(dir.join("hyper_scores.tsv"), htext)?;
-    }
-    Ok(ScoreOutcome {
-        probs,
-        hyper_probs,
-        thresholds,
-    })
+    eprintln!("[score] {} sites", scores.len());
+    Ok((scores, threshold))
 }
 
-/// Persisted score-stage state for resumes that skip the stage.
-type ScoreState = (
-    Vec<Option<f64>>,
-    Vec<Option<f64>>,
-    vcf::ScoreThresholds,
-);
-
-/// scores.tsv + hyper_scores.tsv -> probs bridge for resumes that skip the
-/// score stage. `NA` marks unscored rows (hybrid runs: mouse-contig sites).
-fn load_score_state(
-    params: &RunParams,
-    sites: &[(String, i64)],
-) -> Result<ScoreState, FlowError> {
-    let probs = load_scores(&params.out_dir.join("score").join("scores.tsv"))?;
-    let (pass, hyper) = load_cmc_thresholds(&params.bundle)
+/// Reload unified scores when resuming after the score stage.
+fn load_score_state(params: &RunParams) -> Result<(Vec<f64>, f64), FlowError> {
+    let scores = load_scores(&params.out_dir.join("score").join("scores.tsv"))?;
+    let threshold = load_primary_threshold(&params.bundle)
         .map_err(|e| anyhow_stage_err("score")(anyhow::anyhow!("{e}")))?;
-    let thresholds = vcf::ScoreThresholds {
-        pass,
-        hyper: Some(hyper),
-    };
-    let mut hyper_probs: Vec<Option<f64>> = Vec::new();
-    // Absent hyper_scores.tsv = a run without tier-2 scoring (legal); a
-    // present-but-unreadable one is a hard error, never a fake "no scores".
-    let hpath = params.out_dir.join("score").join("hyper_scores.tsv");
-    let htext = match fs::read_to_string(&hpath) {
-        Ok(text) => Some(text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => {
-            return Err(FlowError::BedParse {
-                line: 0,
-                msg: format!("cannot read {}: {e}", hpath.display()),
-            })
-        }
-    };
-    if let Some(text) = htext {
-        let mut by_key: std::collections::HashMap<(String, i64), Option<f64>> =
-            std::collections::HashMap::new();
-        for line in text.lines() {
-            if line.is_empty() {
-                continue;
-            }
-            let f: Vec<&str> = line.split('\t').collect();
-            if f.len() < 3 {
-                continue;
-            }
-            let Ok(pos) = f[1].parse::<i64>() else { continue };
-            let value = if f[2] == "NA" {
-                None
-            } else {
-                f[2].parse::<f64>().ok()
-            };
-            by_key.insert((f[0].to_string(), pos), value);
-        }
-        let (_, rows) = vcf::hyper_rows(params, sites)?;
-        hyper_probs = rows
-            .iter()
-            .map(|r| by_key.get(&r.key).copied().flatten())
-            .collect();
-    }
-    Ok((probs, hyper_probs, thresholds))
+    Ok((scores, threshold))
 }
-
 
 #[cfg(test)]
 mod rescue_tests {
@@ -2287,18 +1636,7 @@ mod rescue_tests {
 
     /// 150 bp read over `start` with every reference `A` inside read
     /// window [lo, hi] converted to `G`.
-    fn hyper_read(r: &esperanto_map::fasta::Reference, start: usize, lo: usize, hi: usize) -> Vec<u8> {
-        let mut seq = r.contigs[0].slice_ascii(start as u32, (start + 150) as u32);
-        for (qi, b) in seq.iter_mut().enumerate() {
-            if (lo..=hi).contains(&qi) && (start + qi).is_multiple_of(7) && *b == b'A' {
-                *b = b'G';
-            }
-        }
-        seq
-    }
-
-    /// Same fixture as `hyper_read` but A>C edits (the control alphabet).
-    fn control_read_ac(
+    fn hyper_read(
         r: &esperanto_map::fasta::Reference,
         start: usize,
         lo: usize,
@@ -2307,7 +1645,7 @@ mod rescue_tests {
         let mut seq = r.contigs[0].slice_ascii(start as u32, (start + 150) as u32);
         for (qi, b) in seq.iter_mut().enumerate() {
             if (lo..=hi).contains(&qi) && (start + qi).is_multiple_of(7) && *b == b'A' {
-                *b = b'C';
+                *b = b'G';
             }
         }
         seq
@@ -2333,7 +1671,9 @@ mod rescue_tests {
         let qual = vec![b'I'; 150];
         // Homopolymer run (25 A's, overall composition still balanced).
         let mut homo = vec![b'A'; 25];
-        homo.extend_from_slice(&b"CGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT".repeat(3)[..125]);
+        homo.extend_from_slice(
+            &b"CGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT".repeat(3)[..125],
+        );
         assert!(!rescue_prefilter(&homo, &qual));
         // Ambiguous bases: 20 Ns of 150.
         let mut nheavy = vec![b'N'; 20];
@@ -2382,19 +1722,6 @@ mod rescue_tests {
     }
 
     #[test]
-    fn verify_control_alphabet_accepts_ac_not_ag() {
-        // Same hyperedited-read fixture, but the edits are A>C: the control
-        // pair (A,C) must accept, the editing pair (A,G) must not.
-        let r = reference_with_period(7);
-        let seq = control_read_ac(r, 20, 20, 110);
-        assert!(seq.iter().filter(|&b| *b == b'C').count() >= 8);
-        let aln = alignment_at(20, 150);
-        let qual = vec![b'I'; 150];
-        assert!(verify_rescue_placement(&aln, &seq, &qual, r, (b'A', b'C')).is_ok());
-        assert!(verify_rescue_placement(&aln, &seq, &qual, r, (b'A', b'G')).is_err());
-    }
-
-    #[test]
     fn verify_rejects_random_mismatches() {
         let r = reference_with_period(7);
         let mut seq = r.contigs[0].slice_ascii(20, 170);
@@ -2413,10 +1740,7 @@ mod rescue_tests {
 
     #[test]
     fn verify_rejects_gapped_placement() {
-        // A gap disqualifies the placement, and re-testing it ungapped is not
-        // a way round that: measured on the simulated corpus, all 982
-        // pure-indel placements that could be re-tested that way went on to
-        // fail `non_edit_mm` (see the gate's own comment). The gap is real.
+        // Indel placements fail the ungapped-alignment requirement.
         let r = reference_with_period(7);
         let seq = hyper_read(r, 20, 20, 110);
         let mut aln = alignment_at(20, 0);
@@ -2589,7 +1913,12 @@ mod rescue_tests {
             &[
                 ("sealed", 0x1 | 0x40 | 0x10, vec![Cigar::Match(8)], true),
                 ("clean", 0, vec![Cigar::Match(8)], false),
-                ("clipped", 0, vec![Cigar::Match(2), Cigar::SoftClip(6)], false),
+                (
+                    "clipped",
+                    0,
+                    vec![Cigar::Match(2), Cigar::SoftClip(6)],
+                    false,
+                ),
             ],
         );
         let pool = collect_deferred(&bam).unwrap();
@@ -2734,7 +2063,6 @@ mod rescue_tests {
                 rescued_collapsed: sealed,
                 rescue_rejected_collapsed: None,
                 rescue_prefiltered_collapsed: None,
-                rescue_control_verified: None,
                 decoy_reads: 0,
                 elapsed_seconds: 0.0,
             };
@@ -2748,7 +2076,7 @@ mod rescue_tests {
         write_stats(None);
 
         // First pass: the read is rescued and the seal is written.
-        let n1 = rescue_collapsed(&paidx, Some(true_ref), &map_dir, 1, &raw_bam, false).unwrap();
+        let n1 = rescue_collapsed(&paidx, Some(true_ref), &map_dir, 1, &raw_bam).unwrap();
         assert_eq!(n1, 1);
         assert_eq!(re_count(&raw_bam), 1);
         assert_eq!(rescued_tsv_rows(&map_dir), 1);
@@ -2758,7 +2086,7 @@ mod rescue_tests {
         // rerun sees the read in unmapped.fq.gz AND as an RE record.
         write_unmapped(true);
         write_stats(None);
-        let n2 = rescue_collapsed(&paidx, Some(true_ref), &map_dir, 1, &raw_bam, false).unwrap();
+        let n2 = rescue_collapsed(&paidx, Some(true_ref), &map_dir, 1, &raw_bam).unwrap();
         assert_eq!(n2, 1);
         assert_eq!(re_count(&raw_bam), 1);
         assert_eq!(rescued_tsv_rows(&map_dir), 1);

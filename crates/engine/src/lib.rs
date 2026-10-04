@@ -23,7 +23,7 @@
 //! * Determinism: identical inputs produce identical outcomes; every sort
 //!   uses an explicit total-order key and no unsorted hash iteration
 //!   reaches any output.
-//! * Frozen production parameters live in [`EngineConfig::default`]; no
+//! * Default parameters live in [`EngineConfig::default`]; no
 //!   environment switches exist.
 //! * `k` comes from the index (`Tidx::k`, production 31), never from the
 //!   engine config.
@@ -279,8 +279,8 @@ impl Default for ReadStats {
     }
 }
 
-/// Engine configuration. Production defaults are frozen; there are no
-/// environment switches.
+/// Engine configuration. Defaults are explicit and independent of
+/// environment variables.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Flank added on both sides of the candidate window for verification.

@@ -1,7 +1,6 @@
 //! Alignment statistics (align_qc.json contract).
 //!
-//! Consumers ignore unknown keys; `elapsed_seconds` is the only value exempt
-//! from byte-level parity.
+//! Consumers ignore unknown keys. Elapsed time varies between runs.
 
 use crate::pair::InsertStats;
 use serde::{Deserialize, Serialize};
@@ -32,13 +31,13 @@ pub struct AlignStats {
     pub mapq_hist: Vec<u64>,
     /// Junctions reported (pass-2 library hits plus discoveries in use).
     pub junctions_total: u64,
-    /// Reads rescued (split/span/Track-2/anchor-rescue).
+    /// Reads rescued (split/span/anchor-rescue).
     pub rescued_total: u64,
     /// Failed rescue attempts.
     pub rescue_fail_total: u64,
     /// Reads placed by the collapsed-alphabet rescue (flow patches this
     /// key into align_qc.json after the rescue stage; `null`-absent before,
-    /// so legacy files without it remain valid).
+    /// so files without it remain valid).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rescued_collapsed: Option<u64>,
     /// Collapsed-rescue placements rejected by the hyperediting
@@ -49,15 +48,10 @@ pub struct AlignStats {
     /// pre-filters (flow patches this key after the rescue stage).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rescue_prefiltered_collapsed: Option<u64>,
-    /// Control-alphabet (A>C / T>G) rescue verifications — the negative
-    /// control for the collapsed channel (flow patches this key when
-    /// `--rescue-control` ran; absent otherwise).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rescue_control_verified: Option<u64>,
     /// Reads whose best placement sits on a decoy contig.
     #[serde(default)]
     pub decoy_reads: u64,
-    /// Wall-clock seconds (parity-exempt).
+    /// Wall-clock seconds.
     pub elapsed_seconds: f64,
 }
 
@@ -162,7 +156,6 @@ impl StatsAcc {
             rescued_collapsed: None,
             rescue_rejected_collapsed: None,
             rescue_prefiltered_collapsed: None,
-            rescue_control_verified: None,
             decoy_reads: self.decoy,
             elapsed_seconds,
         }
@@ -175,15 +168,15 @@ mod tests {
 
     #[test]
     fn rescued_collapsed_round_trip_and_back_compat() {
-        // Fresh stats never carry the key (byte-identical legacy output).
+        // Stats emitted before rescue omit the optional count.
         let mut acc = StatsAcc::new();
         acc.push_read(true, 60);
         let stats = acc.finalize("rna-se", false, 0.0);
         let fresh = serde_json::to_string(&stats).unwrap();
         assert!(!fresh.contains("rescued_collapsed"));
 
-        // Legacy align_qc.json without the key deserializes as None.
-        let legacy = serde_json::json!({
+        // Documents without the key deserialize it as None.
+        let without_rescue = serde_json::json!({
             "esperanto_map_version": "1.0.0",
             "mode": "rna-se",
             "total_reads": 10,
@@ -200,7 +193,7 @@ mod tests {
             "elapsed_seconds": 1.0,
         })
         .to_string();
-        let mut parsed: AlignStats = serde_json::from_str(&legacy).unwrap();
+        let mut parsed: AlignStats = serde_json::from_str(&without_rescue).unwrap();
         assert!(parsed.rescued_collapsed.is_none());
 
         // Patched stats serialize the key back.

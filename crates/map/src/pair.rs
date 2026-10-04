@@ -3,7 +3,7 @@
 use crate::extend::CigarOp;
 use crate::mapq::ReadAlignment;
 
-/// Maximum reference span for a proper pair (frozen: 1000).
+/// Maximum reference span for a proper pair ( 1000).
 pub const PROPER_SPAN_MAX: u32 = 1000;
 
 /// Relationship of two mates.

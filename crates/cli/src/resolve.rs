@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail};
 
-/// Bundle location relative to a layout root (v1.6.0 contract name).
-const BUNDLE_REL: &str = "bundle/human/esperanto-model-v1.7.0/rust";
+/// Unified model bundle location relative to a layout root.
+const BUNDLE_REL: &str = "bundle/human/esperanto-model-v1.1.0/rust";
 /// Preferred FASTA name inside a refs directory.
 const PREFERRED_FASTA: &str = "hg38.fa";
 
@@ -54,7 +54,7 @@ fn home_data_dir() -> Option<PathBuf> {
 }
 
 fn valid_bundle(p: &Path) -> bool {
-    p.join("norm.json").is_file() || p.join("net_main.safetensors").is_file()
+    p.join("model.txt").is_file() && p.join("freeze.json").is_file() && p.join("alu.bed").is_file()
 }
 
 /// Resolve the model bundle: explicit flag wins, else 5-level fallback.
@@ -88,7 +88,7 @@ pub fn bundle(explicit: &Option<PathBuf>) -> anyhow::Result<PathBuf> {
         }
     }
     bail!(
-        "model bundle not found (need norm.json); tried:\n  {}",
+        "unified model bundle not found (need model.txt, freeze.json, alu.bed); tried:\n  {}",
         tried
             .iter()
             .map(|p| p.display().to_string())
@@ -113,7 +113,15 @@ fn refs_in(dir: &Path) -> Option<Refs> {
             .ok()?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "paidx"))
+            .filter(|p| {
+                p.extension().is_some_and(|x| x == "paidx")
+                    && !p.file_name().is_some_and(|n| {
+                        let n = n.to_string_lossy();
+                        [".ag.paidx", ".tc.paidx"]
+                            .iter()
+                            .any(|suffix| n.ends_with(suffix))
+                    })
+            })
             .collect();
         v.sort();
         v.into_iter().next()
@@ -128,7 +136,11 @@ fn refs_in(dir: &Path) -> Option<Refs> {
     let fasta = names
         .iter()
         .find(|n| n.as_str() == PREFERRED_FASTA && has_fai(n))
-        .or_else(|| names.iter().find(|n| n.ends_with(".fa") && has_fai(n)))
+        .or_else(|| {
+            names
+                .iter()
+                .find(|n| (n.ends_with(".fa") || n.ends_with(".fasta")) && has_fai(n))
+        })
         .map(|n| dir.join(n))?; // a refs dir without a usable fasta is not a refs dir
     let gtf = names
         .iter()
@@ -194,56 +206,46 @@ pub fn require_fasta(fasta: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 
 /// Resolve the L1 engine bundle (default-on): explicit `--l1-bundle` wins,
 /// else `ESPERANTO_L1_BUNDLE`, else `<index stem>.bndl` next to the index.
-/// Returns None (with a stderr note) when nothing is found — the pipeline
-/// then runs the pure genomic (G) layer.
-pub fn l1_bundle(explicit: &Option<PathBuf>, index: &Path) -> Option<PathBuf> {
-    if let Some(b) = explicit {
-        return Some(b.clone());
-    }
-    if let Ok(env) = std::env::var("ESPERANTO_L1_BUNDLE") {
+/// The L1 engine is required: a missing `.bndl` or a `.bndl` without its
+/// `.tidx` sidecar is a hard error rather than a silent downgrade to the
+/// pure genomic (G) layer.
+pub fn l1_bundle(explicit: &Option<PathBuf>, index: &Path) -> anyhow::Result<PathBuf> {
+    let candidate = if let Some(b) = explicit {
+        b.clone()
+    } else if let Ok(env) = std::env::var("ESPERANTO_L1_BUNDLE") {
         let p = PathBuf::from(env);
         if p.is_file() {
-            return Some(p);
+            p
+        } else {
+            let sibling = index.with_extension("bndl");
+            if sibling.is_file() {
+                sibling
+            } else {
+                anyhow::bail!(
+                    "L1 bundle not found (tried ESPERANTO_L1_BUNDLE, {}); build it with `esperanto index --gtf <gtf>`",
+                    sibling.display()
+                );
+            }
         }
-    }
-    let sibling = index.with_extension("bndl");
-    if sibling.is_file() {
-        // The runtime needs the .tidx sidecar next to the .bndl.
-        if sibling.with_extension("tidx").is_file() {
-            return Some(sibling);
-        }
-        eprintln!(
-            "[resolve] {} has no .tidx sidecar; running pure G layer",
-            sibling.display()
-        );
-        return None;
-    }
-    eprintln!(
-        "[resolve] L1 bundle not found (tried ESPERANTO_L1_BUNDLE, {}); running pure G layer",
-        sibling.display()
-    );
-    None
-}
-
-/// Species tag from a file name; None when unrecognizable.
-pub fn species_of(name: &str) -> Option<&'static str> {
-    let n = name.to_ascii_lowercase();
-    let is_mouse = n.contains("grcm")
-        || n.contains("mm10")
-        || n.contains("mm39")
-        || n.contains("mouse")
-        || {
-            // GENCODE mouse annotation names (gencode.vM36...)
-            let b = n.as_bytes();
-            n.len() >= 3 && b.windows(3).any(|w| w[0] == b'v' && w[1] == b'm' && w[2].is_ascii_digit())
-        };
-    if is_mouse {
-        Some("mouse")
-    } else if n.contains("grch") || n.contains("hg38") || n.contains("hg19") || n.contains("human") {
-        Some("human")
     } else {
-        None
+        let sibling = index.with_extension("bndl");
+        if sibling.is_file() {
+            sibling
+        } else {
+            anyhow::bail!(
+                "L1 bundle not found (tried ESPERANTO_L1_BUNDLE, {}); build it with `esperanto index --gtf <gtf>`",
+                sibling.display()
+            );
+        }
+    };
+    let tidx = candidate.with_extension("tidx");
+    if !tidx.is_file() {
+        anyhow::bail!(
+            "{} has no .tidx sidecar; the L1 engine refuses to degrade to the pure G layer — rebuild with `esperanto index --gtf <gtf>`",
+            candidate.display()
+        );
     }
+    Ok(candidate)
 }
 
 /// All files in `dir` matching one of `exts` (sorted).
@@ -263,3 +265,28 @@ pub fn find_all(dir: &Path, exts: &[&str]) -> anyhow::Result<Vec<PathBuf>> {
     Ok(hits)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovery_selects_genomic_index_and_accepts_fasta_extension() {
+        let dir = std::env::temp_dir().join(format!("esperanto-refs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "reference.fasta",
+            "reference.fasta.fai",
+            "reference.paidx",
+            "reference.ag.paidx",
+            "reference.tc.paidx",
+        ] {
+            std::fs::write(dir.join(name), "").unwrap();
+        }
+        let refs = refs_in(&dir).unwrap();
+        assert_eq!(refs.index, Some(dir.join("reference.paidx")));
+        assert_eq!(refs.fasta, Some(dir.join("reference.fasta")));
+        std::fs::remove_file(dir.join("reference.paidx")).unwrap();
+        assert!(refs_in(&dir).unwrap().index.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
