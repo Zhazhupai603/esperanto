@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Updated the human model bundle. The classifier is retrained on an expanded, donor-partitioned panel (64 training, 16 calibration, and 20 held-out evaluation donors), and the decision threshold is recalibrated on the calibration donors. The 27-feature contract, input requirements, and output formats are unchanged.
+
 ### Fixed
 
 - Score-stage likelihood quadrature no longer stalls on ultra-high-coverage sites. Sites with more than 63 observations were integrated with an adaptive Simpson rule whose refinement cost grows unpredictably on the sharply peaked likelihoods produced by extreme coverage (millions of observations at a single position), leaving affected runs effectively stuck in the score stage. All sites now use fixed 32-point Gauss-Legendre quadrature, so per-site cost scales linearly with observation count and extreme-coverage sites finish in well under a second. Site scores and VCF output are bit-identical to 1.1.0 on full-depth human RNA-seq runs.

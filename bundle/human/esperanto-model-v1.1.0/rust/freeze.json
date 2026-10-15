@@ -44,7 +44,7 @@
     "force_col_wise": true,
     "verbosity": -1
   },
-  "threshold": 0.9399543771371561,
-  "model_sha256": "8f589b8e72ffa65bc576971f334d8000d5dcc17fd42f01f22d016c61b45221e7",
+  "threshold": 0.9173483910126397,
+  "model_sha256": "18899a8b21462528cd388e70cd096f1eba7705c48fefaf3be3c407a4a21245d7",
   "alu_sha256": "648ff9bf4f0ac1f1979d51bcb5cd2bca9325abe5be781b115ad5edb44e566593"
 }

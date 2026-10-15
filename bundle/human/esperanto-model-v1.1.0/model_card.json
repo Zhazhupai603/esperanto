@@ -5,7 +5,7 @@
   "task": "reference-aware RNA editing evidence classification",
   "features": 27,
   "trees": 400,
-  "threshold": 0.9399543771371561,
+  "threshold": 0.9173483910126397,
   "score_semantics": "classifier score; not a calibrated probability",
   "annotation": "Alu intervals from the GRCh38 RepeatMasker annotation",
   "limitations": [
